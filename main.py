@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import uuid
@@ -135,7 +136,7 @@ def upsert_chunks(doc_id: str, doc_type: str, chunks: List[str], embeddings: Lis
                         doc_type,
                         t,
                         emb,
-                        {"source": doc_type},
+                        json.dumps({"source": doc_type}),
                         now,
                     ),
                 )
@@ -241,3 +242,4 @@ PYTANIE:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
