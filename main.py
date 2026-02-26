@@ -87,17 +87,33 @@ def gemini_generate(prompt: str) -> str:
 
     url = f"https://generativelanguage.googleapis.com/v1beta/{GEN_MODEL}:generateContent"
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.6, "maxOutputTokens": 900},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.6,
+            "maxOutputTokens": 600,   # mniej, żeby nie waliło w limity
+        },
+        # wyłącz "thinking" jeżeli model je wspiera (część modeli to respektuje)
+        "safetySettings": [],
     }
+
     r = requests.post(f"{url}?key={GEMINI_API_KEY}", json=payload, timeout=60)
     if r.status_code != 200:
         raise RuntimeError(f"Gemini generate error: {r.status_code} {r.text}")
     data = r.json()
+
+    # 1) klasyczny przypadek
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        parts = data["candidates"][0]["content"]["parts"]
+        texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+        out = "\n".join([t for t in texts if t.strip()]).strip()
+        if out:
+            return out
     except Exception:
-        return str(data)
+        pass
+
+    # 2) fallback: czasem tekst jest gdzie indziej albo nie ma parts
+    # Zwróć całość, ale w czytelnej formie (diagnoza)
+    return str(data)
 
 
 def get_drive_service():
@@ -242,4 +258,5 @@ PYTANIE:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
