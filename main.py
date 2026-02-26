@@ -1,20 +1,18 @@
+import json
 import os
 import re
 import uuid
-import json
 from datetime import datetime, timezone
-from typing import List, Dict, Any
-from fastapi.responses import PlainTextResponse
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
+import google.auth
+import psycopg
 import requests
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-
-import psycopg
-from pgvector.psycopg import register_vector
-
+from fastapi.responses import PlainTextResponse
 from googleapiclient.discovery import build
-import google.auth
+from pgvector.psycopg import register_vector
+from pydantic import BaseModel, Field
 
 APP_NAME = "rpg-agent"
 app = FastAPI(title=APP_NAME)
@@ -38,35 +36,79 @@ GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-2.5-pro")
 REVISION = os.getenv("K_REVISION", "unknown")
 
 
+# -------------------------
+# Models (API)
+# -------------------------
+AskMode = Literal["auto", "campaign", "general"]
+
+
 class AskRequest(BaseModel):
-    question: str
-    top_k: int = 6
+    question: str = Field(..., min_length=1)
+    top_k: int = Field(default=6, ge=1, le=20)
+    include_sources: bool = False
+    mode: AskMode = "auto"
 
 
 class AskResponse(BaseModel):
     answer: str
-    sources: List[Dict[str, Any]]
+    sources: List[Dict[str, Any]] = []
+
+
+class ReindexRequest(BaseModel):
+    clean: bool = False
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def require_env(name: str, value: Optional[str]) -> str:
+    if not value:
+        raise HTTPException(status_code=400, detail=f"Missing env: {name}")
+    return value
 
 
 def chunk_text(text: str, max_chars: int = 2400, overlap: int = 400) -> List[str]:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not text:
         return []
-    chunks = []
+
+    chunks: List[str] = []
     i = 0
-    while i < len(text):
-        end = min(len(text), i + max_chars)
+    n = len(text)
+    while i < n:
+        end = min(n, i + max_chars)
         chunks.append(text[i:end])
-        if end == len(text):
+        if end >= n:
             break
         i = max(0, end - overlap)
     return chunks
 
 
+def chunk_threads(text: str) -> List[str]:
+    """
+    Thread Tracker zwykle jest liniowy/tabelkowy.
+    Lepsze jest chunkowanie po liniach, żeby nie ucinało wątku typu "T05 | ...".
+    """
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not text:
+        return []
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    # grupujemy po ~40 linii
+    out: List[str] = []
+    buf: List[str] = []
+    for ln in lines:
+        buf.append(ln)
+        if len(buf) >= 40:
+            out.append("\n".join(buf))
+            buf = []
+    if buf:
+        out.append("\n".join(buf))
+    return out
+
+
 def gemini_embed(texts: List[str]) -> List[List[float]]:
     """
-    Embeddings przez endpoint embedContent (pojedyncze) - kompatybilne i stabilne.
-    Wymiar embeddingów zależy od modelu, u ciebie to 3072 dla gemini-embedding-001.
+    Embeddings przez embedContent (pojedyncze).
     """
     if not GEMINI_API_KEY:
         raise RuntimeError("Brak GEMINI_API_KEY")
@@ -96,13 +138,13 @@ def gemini_generate(prompt: str) -> str:
             "responseMimeType": "text/plain",
         },
     }
-
     r = requests.post(f"{url}?key={GEMINI_API_KEY}", json=payload, timeout=90)
     if r.status_code != 200:
         raise RuntimeError(f"Gemini generate error: {r.status_code} {r.text}")
 
     data = r.json()
 
+    # normalny case: candidates[0].content.parts[].text
     try:
         parts = data["candidates"][0]["content"]["parts"]
         texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
@@ -126,11 +168,20 @@ def export_google_doc_as_text(drive, doc_id: str) -> str:
 
 
 def db_conn():
-    if not DB_URL:
-        raise RuntimeError("Brak DB_URL")
-    conn = psycopg.connect(DB_URL)
+    require_env("DB_URL", DB_URL)
+    conn = psycopg.connect(DB_URL)  # type: ignore[arg-type]
     register_vector(conn)
     return conn
+
+
+def delete_chunks_for_doc(doc_id: str):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "delete from chunks where campaign_id = %s and doc_id = %s",
+                (CAMPAIGN_ID, doc_id),
+            )
+        conn.commit()
 
 
 def upsert_chunks(doc_id: str, doc_type: str, chunks: List[str], embeddings: List[List[float]]):
@@ -138,14 +189,14 @@ def upsert_chunks(doc_id: str, doc_type: str, chunks: List[str], embeddings: Lis
     with db_conn() as conn:
         with conn.cursor() as cur:
             for t, emb in zip(chunks, embeddings):
-                cid = uuid.uuid4()
+                cid = str(uuid.uuid4())
                 cur.execute(
                     """
                     insert into chunks (id, campaign_id, doc_id, doc_type, chunk_text, embedding, metadata, updated_at)
                     values (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
-                        str(cid),
+                        cid,
                         CAMPAIGN_ID,
                         doc_id,
                         doc_type,
@@ -164,8 +215,7 @@ def vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                select doc_id, doc_type, chunk_text,
-                       (embedding <-> %s::vector) as distance
+                select doc_id, doc_type, chunk_text, (embedding <-> %s::vector) as distance
                 from chunks
                 where campaign_id = %s
                 order by embedding <-> %s::vector
@@ -174,52 +224,95 @@ def vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
                 (q_emb, CAMPAIGN_ID, q_emb, top_k),
             )
             rows = cur.fetchall()
+
     return [
         {"doc_id": d, "doc_type": t, "chunk_text": c, "distance": float(dist)}
         for (d, t, c, dist) in rows
     ]
 
 
+def is_campaign_question(text: str) -> bool:
+    t = text.lower()
+    keywords = [
+        "kampania",
+        "krew na gwiazdach",
+        "premis",
+        "wątk",
+        "thread",
+        "npc",
+        "mg",
+        "sesj",
+        "fabuł",
+        "scen",
+        "lokac",
+        "frakc",
+        "bible",
+        "glossary",
+        "rules",
+        "timeline",
+        "akt",
+        "prolog",
+    ]
+    return any(k in t for k in keywords)
+
+
+def looks_truncated(answer: str, question: str) -> bool:
+    s = (answer or "").strip()
+    if not s:
+        return True
+    if "brak w notatkach" in s.lower():
+        return False
+    # urwane w pół zdania + sensowna długość
+    if s[-1] not in ".!?\n":
+        return len(s) > 200 and len(question) > 40
+    return False
+
+
+# -------------------------
+# Endpoints
+# -------------------------
 @app.get("/health")
 def health():
     return {"ok": True, "campaign_id": CAMPAIGN_ID, "revision": REVISION}
 
 
 @app.post("/reindex")
-def reindex():
+def reindex(body: ReindexRequest = ReindexRequest()):
     try:
-        for name, val in [
-            ("BIBLE_DOC_ID", BIBLE_DOC_ID),
-            ("RULES_DOC_ID", RULES_DOC_ID),
-            ("GLOSSARY_DOC_ID", GLOSSARY_DOC_ID),
-            ("THREADS_DOC_ID", THREADS_DOC_ID),
-        ]:
-            if not val:
-                raise HTTPException(status_code=400, detail=f"Missing env: {name}")
+        require_env("BIBLE_DOC_ID", BIBLE_DOC_ID)
+        require_env("RULES_DOC_ID", RULES_DOC_ID)
+        require_env("GLOSSARY_DOC_ID", GLOSSARY_DOC_ID)
+        require_env("THREADS_DOC_ID", THREADS_DOC_ID)
 
         drive = get_drive_service()
-
-        docs = [
-            ("bible", BIBLE_DOC_ID),
-            ("rules", RULES_DOC_ID),
-            ("glossary", GLOSSARY_DOC_ID),
-            ("threads", THREADS_DOC_ID),
+        docs: List[Tuple[str, str]] = [
+            ("bible", BIBLE_DOC_ID),       # type: ignore[arg-type]
+            ("rules", RULES_DOC_ID),       # type: ignore[arg-type]
+            ("glossary", GLOSSARY_DOC_ID), # type: ignore[arg-type]
+            ("threads", THREADS_DOC_ID),   # type: ignore[arg-type]
         ]
 
-        # MVP: nie kasujemy starych chunków automatycznie, bo może chcesz porównać.
-        # Jak chcesz, dodamy w następnym kroku "czysty reindex" (delete by campaign/doc_id).
-
         total_chunks = 0
+
         for doc_type, doc_id in docs:
+            if body.clean:
+                delete_chunks_for_doc(doc_id)
+
             text = export_google_doc_as_text(drive, doc_id)
-            chunks = chunk_text(text)
+
+            if doc_type == "threads":
+                chunks = chunk_threads(text)
+            else:
+                chunks = chunk_text(text)
+
             if not chunks:
                 continue
+
             embs = gemini_embed(chunks)
             upsert_chunks(doc_id=doc_id, doc_type=doc_type, chunks=chunks, embeddings=embs)
             total_chunks += len(chunks)
 
-        return {"ok": True, "indexed_chunks": total_chunks}
+        return {"ok": True, "indexed_chunks": total_chunks, "clean": body.clean}
 
     except HTTPException:
         raise
@@ -230,27 +323,26 @@ def reindex():
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     try:
-        q = (req.question or "").strip()
+        q = req.question.strip()
 
-        def is_campaign_question(text: str) -> bool:
-            t = text.lower()
-            keywords = [
-                "kampania", "krew na gwiazdach", "premis", "wątk", "thread",
-                "npc", "mg", "sesj", "fabuł", "scen", "lokac", "frakc",
-                "bible", "glossary", "rules", "timeline", "akt", "prolog",
-            ]
-            return any(k in t for k in keywords)
+        # wybór trybu
+        if req.mode == "campaign":
+            campaign_mode = True
+        elif req.mode == "general":
+            campaign_mode = False
+        else:
+            campaign_mode = is_campaign_question(q)
 
-        campaign_mode = is_campaign_question(q)
-
-        hits = []
+        hits: List[Dict[str, Any]] = []
         context = ""
 
         if campaign_mode:
             hits = vector_search(q, req.top_k)
+            # 900 znaków na chunk to sensowny kompromis
             context = "\n\n".join(
                 [f"[{i+1}] ({h['doc_type']}) {h['chunk_text'][:900]}" for i, h in enumerate(hits)]
             )
+
             prompt = f"""
 Jesteś asystentem MG kampanii "Krew Na Gwiazdach". Odpowiadasz po polsku.
 
@@ -258,6 +350,7 @@ ZASADY:
 - Używaj tylko faktów z KONTEKSTU.
 - Jeśli czegoś nie ma w kontekście, napisz dosłownie: "brak w notatkach".
 - Odpowiedz dokładnie na PYTANIE użytkownika. Nie dodawaj sekcji, których nie wymaga pytanie.
+- Zwracaj odpowiedź w markdown (listy numerowane "1.", "2.", tabele markdown).
 - Jeśli odpowiedź się urywa, dokończ ją zamiast kończyć w pół zdania.
 
 KONTEKST:
@@ -269,9 +362,10 @@ PYTANIE:
 ODPOWIEDŹ:
 """.strip()
         else:
-            # Non-RAG: normalne pytania (np. testy liczb) - nie blokujemy się kontekstem.
+            # tryb ogólny: zero RAG, zero "brak w notatkach"
             prompt = f"""
-Odpowiedz po polsku dokładnie na pytanie użytkownika. Bez dodatkowych sekcji.
+Odpowiedz po polsku dokładnie na pytanie użytkownika.
+Nie dodawaj sekcji, których nie wymaga pytanie.
 
 PYTANIE:
 {q}
@@ -281,22 +375,12 @@ ODPOWIEDŹ:
 
         answer = gemini_generate(prompt).strip()
 
-        # Retry tylko jeśli to ma sens (urwane), i tylko w trybie kampanii.
-        def looks_truncated(s: str) -> bool:
-            if not s:
-                return True
-            if "brak w notatkach" in s.lower():
-                return False
-            # urwane w pół zdania / pół słowa
-            if s[-1] not in ".!?\n":
-                # ale nie retry dla bardzo krótkich odpowiedzi
-                return len(s) > 200
-            return False
-
-        if campaign_mode and looks_truncated(answer):
+        # retry tylko w campaign i tylko gdy wygląda na urwane
+        if campaign_mode and looks_truncated(answer, q):
             prompt2 = f"""
 Dokończ odpowiedź od miejsca, w którym się urwała. Nie powtarzaj wcześniejszych fragmentów.
 Nadal trzymaj się zasady: tylko fakty z KONTEKSTU, a jeśli czegoś brakuje - "brak w notatkach".
+Zwracaj odpowiedź w markdown.
 
 KONTEKST:
 {context}
@@ -310,10 +394,13 @@ KONTYNUACJA:
             if more:
                 answer = (answer + "\n" + more).strip()
 
-        return AskResponse(
-            answer=answer,
-            sources=[{"doc_type": h["doc_type"], "distance": h["distance"]} for h in hits],
+        sources = (
+            [{"doc_type": h["doc_type"], "distance": h["distance"]} for h in hits]
+            if req.include_sources
+            else []
         )
+
+        return AskResponse(answer=answer, sources=sources)
 
     except HTTPException:
         raise
@@ -321,10 +408,7 @@ KONTYNUACJA:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-from fastapi.responses import PlainTextResponse
-
-
 @app.post("/ask_text", response_class=PlainTextResponse)
 def ask_text(req: AskRequest):
-    resp = ask(req)  # reuse tej samej logiki co /ask
+    resp = ask(req)
     return resp.answer
