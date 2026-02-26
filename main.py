@@ -1,7 +1,7 @@
-import json
 import os
 import re
 import uuid
+import json
 from datetime import datetime, timezone
 from typing import List, Dict, Any
 
@@ -29,16 +29,17 @@ THREADS_DOC_ID = os.getenv("THREADS_DOC_ID")
 DB_URL = os.getenv("DB_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Embeddings + generation models
-# Embeddings: ustawimy domyślny kompatybilny model; możesz nadpisać env EMBED_MODEL
-EMBED_MODEL = os.getenv("EMBED_MODEL", "models/embedding-001")
-# Generation model: możesz nadpisać env GEN_MODEL
-GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-1.5-pro")
+# Models
+EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")
+GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-2.5-pro")
+
+# Debug/visibility
+REVISION = os.getenv("K_REVISION", "unknown")
 
 
 class AskRequest(BaseModel):
     question: str
-    top_k: int = 12
+    top_k: int = 6
 
 
 class AskResponse(BaseModel):
@@ -63,8 +64,8 @@ def chunk_text(text: str, max_chars: int = 2400, overlap: int = 400) -> List[str
 
 def gemini_embed(texts: List[str]) -> List[List[float]]:
     """
-    Embeddings przez endpoint embedContent (pojedyncze), bo bywa najbardziej kompatybilny.
-    Model ustawiasz w EMBED_MODEL, domyślnie models/embedding-001.
+    Embeddings przez endpoint embedContent (pojedyncze) - kompatybilne i stabilne.
+    Wymiar embeddingów zależy od modelu, u ciebie to 3072 dla gemini-embedding-001.
     """
     if not GEMINI_API_KEY:
         raise RuntimeError("Brak GEMINI_API_KEY")
@@ -82,6 +83,9 @@ def gemini_embed(texts: List[str]) -> List[List[float]]:
 
 
 def gemini_generate(prompt: str) -> str:
+    """
+    Wymuszamy tekstowy output. Dodatkowo próbujemy wyłączyć thinking (jak model wspiera).
+    """
     if not GEMINI_API_KEY:
         raise RuntimeError("Brak GEMINI_API_KEY")
 
@@ -90,18 +94,19 @@ def gemini_generate(prompt: str) -> str:
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.6,
-            "maxOutputTokens": 600,   # mniej, żeby nie waliło w limity
+            "maxOutputTokens": 800,
+            "responseMimeType": "text/plain",
         },
-        # wyłącz "thinking" jeżeli model je wspiera (część modeli to respektuje)
-        "safetySettings": [],
+        "thinkingConfig": {"thinking": False},
     }
 
-    r = requests.post(f"{url}?key={GEMINI_API_KEY}", json=payload, timeout=60)
+    r = requests.post(f"{url}?key={GEMINI_API_KEY}", json=payload, timeout=90)
     if r.status_code != 200:
         raise RuntimeError(f"Gemini generate error: {r.status_code} {r.text}")
+
     data = r.json()
 
-    # 1) klasyczny przypadek
+    # Prefer standard "parts[].text"
     try:
         parts = data["candidates"][0]["content"]["parts"]
         texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
@@ -111,8 +116,7 @@ def gemini_generate(prompt: str) -> str:
     except Exception:
         pass
 
-    # 2) fallback: czasem tekst jest gdzie indziej albo nie ma parts
-    # Zwróć całość, ale w czytelnej formie (diagnoza)
+    # Fallback: return raw payload for diagnosis
     return str(data)
 
 
@@ -183,7 +187,7 @@ def vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "campaign_id": CAMPAIGN_ID}
+    return {"ok": True, "campaign_id": CAMPAIGN_ID, "revision": REVISION}
 
 
 @app.post("/reindex")
@@ -207,6 +211,9 @@ def reindex():
             ("threads", THREADS_DOC_ID),
         ]
 
+        # MVP: nie kasujemy starych chunków automatycznie, bo może chcesz porównać.
+        # Jak chcesz, dodamy w następnym kroku "czysty reindex" (delete by campaign/doc_id).
+
         total_chunks = 0
         for doc_type, doc_id in docs:
             text = export_google_doc_as_text(drive, doc_id)
@@ -222,7 +229,6 @@ def reindex():
     except HTTPException:
         raise
     except Exception as e:
-        # ważne: pokazuje konkretny błąd w odpowiedzi, zamiast go gubić jako 500 bez treści
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -230,16 +236,20 @@ def reindex():
 def ask(req: AskRequest):
     try:
         hits = vector_search(req.question, req.top_k)
-        context = "\n\n".join([f"[{i+1}] ({h['doc_type']}) {h['chunk_text']}" for i, h in enumerate(hits)])
+
+        # Ucinamy kontekst, żeby nie dobijać tokenów
+        context = "\n\n".join(
+            [f"[{i+1}] ({h['doc_type']}) {h['chunk_text'][:1200]}" for i, h in enumerate(hits)]
+        )
 
         prompt = f"""
-Jesteś asystentem MG do kampanii "Krew Na Gwiazdach".
-ZASADA: Fakty bierz wyłącznie z KONTEKSTU. Jeśli czegoś nie ma, powiedz "brak w notatkach" i zaproponuj pytania.
-Odpowiedz po polsku w 4 sekcjach:
-1) Fakty z notatek
-2) Luki (czego brakuje)
-3) Sugestie (pomysły zgodne z faktami)
-4) Następne kroki (co dopisać / co przygotować)
+Jesteś asystentem MG kampanii "Krew Na Gwiazdach".
+Używaj tylko faktów z KONTEKSTU. Jeśli brak danych, napisz "brak w notatkach".
+
+Odpowiedz po polsku:
+1) Premisa: 6 punktów
+2) Wątki: Thread ID | nazwa | stawka
+3) Luki: 3 rzeczy do dopisania
 
 KONTEKST:
 {context}
@@ -249,6 +259,7 @@ PYTANIE:
 """.strip()
 
         answer = gemini_generate(prompt)
+
         return AskResponse(
             answer=answer,
             sources=[{"doc_type": h["doc_type"], "distance": h["distance"]} for h in hits],
@@ -258,5 +269,3 @@ PYTANIE:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
