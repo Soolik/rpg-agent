@@ -91,7 +91,7 @@ def gemini_generate(prompt: str) -> str:
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.6,
-            "maxOutputTokens": 800,
+            "maxOutputTokens": 1200,
             "responseMimeType": "text/plain",
         },
     }
@@ -263,4 +263,5 @@ PYTANIE:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
