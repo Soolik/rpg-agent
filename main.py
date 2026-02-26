@@ -229,30 +229,62 @@ def reindex():
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     try:
+        # 1) RAG hits
         hits = vector_search(req.question, req.top_k)
 
-        # Ucinamy kontekst, żeby nie dobijać tokenów
+        # 2) Kompaktowy kontekst (mniej tokenów, mniej śmieci)
+        #    800 znaków na chunk zwykle wystarcza i nie dusi promptu.
         context = "\n\n".join(
-            [f"[{i+1}] ({h['doc_type']}) {h['chunk_text'][:1200]}" for i, h in enumerate(hits)]
+            [f"[{i+1}] ({h['doc_type']}) {h['chunk_text'][:800]}" for i, h in enumerate(hits)]
         )
 
+        # 3) Prompt: odpowiada dokładnie na pytanie.
+        #    Jeśli pytanie prosi o strukturę, model ją zrobi.
+        #    Jeśli pytanie jest proste (np. liczby), nie wciskamy kampanii na siłę.
         prompt = f"""
-Jesteś asystentem MG kampanii "Krew Na Gwiazdach".
-Używaj tylko faktów z KONTEKSTU. Jeśli brak danych, napisz "brak w notatkach".
+Jesteś asystentem MG. Odpowiadasz po polsku.
 
-Odpowiedz po polsku:
-1) Premisa: 6 punktów
-2) Wątki: Thread ID | nazwa | stawka
-3) Luki: 3 rzeczy do dopisania
+ZASADY:
+- Używaj tylko faktów z KONTEKSTU.
+- Jeśli czegoś nie ma w kontekście, napisz dosłownie: "brak w notatkach".
+- Odpowiedz dokładnie na PYTANIE użytkownika. Nie dodawaj sekcji, których nie wymaga pytanie.
+- Jeśli odpowiedź mogłaby się urwać, dokończ ją w tym samym stylu, zamiast kończyć w pół zdania.
 
 KONTEKST:
 {context}
 
 PYTANIE:
 {req.question}
+
+ODPOWIEDŹ:
 """.strip()
 
-        answer = gemini_generate(prompt)
+        answer = gemini_generate(prompt).strip()
+
+        # 4) Prosty retry, jeśli wygląda na ucięte (heurystyka)
+        #    - urwane w połowie słowa/zdania
+        #    - bardzo krótka odpowiedź mimo złożonego pytania
+        def looks_truncated(s: str) -> bool:
+            if not s:
+                return True
+            if len(s) < 80 and len(req.question) > 80:
+                return True
+            return s[-1] not in ".!?\n"
+
+        if looks_truncated(answer):
+            prompt2 = f"""
+Kontynuuj odpowiedź. Nie powtarzaj tego, co już napisałeś, tylko dokończ od miejsca, w którym urwałeś.
+
+DOTYCHCZAS:
+{answer}
+""".strip()
+            more = gemini_generate(prompt2).strip()
+            if more:
+                # zabezpieczenie przed przypadkowym powtórzeniem
+                if more.startswith(answer[:80]):
+                    answer = more
+                else:
+                    answer = (answer + "\n" + more).strip()
 
         return AskResponse(
             answer=answer,
@@ -263,5 +295,3 @@ PYTANIE:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
