@@ -4,6 +4,7 @@ import uuid
 import json
 from datetime import datetime, timezone
 from typing import List, Dict, Any
+from fastapi.responses import PlainTextResponse
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -229,62 +230,85 @@ def reindex():
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     try:
-        # 1) RAG hits
-        hits = vector_search(req.question, req.top_k)
+        q = (req.question or "").strip()
 
-        # 2) Kompaktowy kontekst (mniej tokenów, mniej śmieci)
-        #    800 znaków na chunk zwykle wystarcza i nie dusi promptu.
-        context = "\n\n".join(
-            [f"[{i+1}] ({h['doc_type']}) {h['chunk_text'][:800]}" for i, h in enumerate(hits)]
-        )
+        def is_campaign_question(text: str) -> bool:
+            t = text.lower()
+            keywords = [
+                "kampania", "krew na gwiazdach", "premis", "wątk", "thread",
+                "npc", "mg", "sesj", "fabuł", "scen", "lokac", "frakc",
+                "bible", "glossary", "rules", "timeline", "akt", "prolog",
+            ]
+            return any(k in t for k in keywords)
 
-        # 3) Prompt: odpowiada dokładnie na pytanie.
-        #    Jeśli pytanie prosi o strukturę, model ją zrobi.
-        #    Jeśli pytanie jest proste (np. liczby), nie wciskamy kampanii na siłę.
-        prompt = f"""
-Jesteś asystentem MG. Odpowiadasz po polsku.
+        campaign_mode = is_campaign_question(q)
+
+        hits = []
+        context = ""
+
+        if campaign_mode:
+            hits = vector_search(q, req.top_k)
+            context = "\n\n".join(
+                [f"[{i+1}] ({h['doc_type']}) {h['chunk_text'][:900]}" for i, h in enumerate(hits)]
+            )
+            prompt = f"""
+Jesteś asystentem MG kampanii "Krew Na Gwiazdach". Odpowiadasz po polsku.
 
 ZASADY:
 - Używaj tylko faktów z KONTEKSTU.
 - Jeśli czegoś nie ma w kontekście, napisz dosłownie: "brak w notatkach".
 - Odpowiedz dokładnie na PYTANIE użytkownika. Nie dodawaj sekcji, których nie wymaga pytanie.
-- Jeśli odpowiedź mogłaby się urwać, dokończ ją w tym samym stylu, zamiast kończyć w pół zdania.
+- Jeśli odpowiedź się urywa, dokończ ją zamiast kończyć w pół zdania.
 
 KONTEKST:
 {context}
 
 PYTANIE:
-{req.question}
+{q}
+
+ODPOWIEDŹ:
+""".strip()
+        else:
+            # Non-RAG: normalne pytania (np. testy liczb) - nie blokujemy się kontekstem.
+            prompt = f"""
+Odpowiedz po polsku dokładnie na pytanie użytkownika. Bez dodatkowych sekcji.
+
+PYTANIE:
+{q}
 
 ODPOWIEDŹ:
 """.strip()
 
         answer = gemini_generate(prompt).strip()
 
-        # 4) Prosty retry, jeśli wygląda na ucięte (heurystyka)
-        #    - urwane w połowie słowa/zdania
-        #    - bardzo krótka odpowiedź mimo złożonego pytania
+        # Retry tylko jeśli to ma sens (urwane), i tylko w trybie kampanii.
         def looks_truncated(s: str) -> bool:
             if not s:
                 return True
-            if len(s) < 80 and len(req.question) > 80:
-                return True
-            return s[-1] not in ".!?\n"
+            if "brak w notatkach" in s.lower():
+                return False
+            # urwane w pół zdania / pół słowa
+            if s[-1] not in ".!?\n":
+                # ale nie retry dla bardzo krótkich odpowiedzi
+                return len(s) > 200
+            return False
 
-        if looks_truncated(answer):
+        if campaign_mode and looks_truncated(answer):
             prompt2 = f"""
-Kontynuuj odpowiedź. Nie powtarzaj tego, co już napisałeś, tylko dokończ od miejsca, w którym urwałeś.
+Dokończ odpowiedź od miejsca, w którym się urwała. Nie powtarzaj wcześniejszych fragmentów.
+Nadal trzymaj się zasady: tylko fakty z KONTEKSTU, a jeśli czegoś brakuje - "brak w notatkach".
+
+KONTEKST:
+{context}
 
 DOTYCHCZAS:
 {answer}
+
+KONTYNUACJA:
 """.strip()
             more = gemini_generate(prompt2).strip()
             if more:
-                # zabezpieczenie przed przypadkowym powtórzeniem
-                if more.startswith(answer[:80]):
-                    answer = more
-                else:
-                    answer = (answer + "\n" + more).strip()
+                answer = (answer + "\n" + more).strip()
 
         return AskResponse(
             answer=answer,
@@ -296,3 +320,11 @@ DOTYCHCZAS:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+from fastapi.responses import PlainTextResponse
+
+
+@app.post("/ask_text", response_class=PlainTextResponse)
+def ask_text(req: AskRequest):
+    resp = ask(req)  # reuse tej samej logiki co /ask
+    return resp.answer
