@@ -15,6 +15,7 @@ from fastapi.responses import PlainTextResponse
 from googleapiclient.discovery import build
 from pgvector.psycopg import register_vector
 from pydantic import BaseModel, Field, ValidationError
+from html import unescape
 
 APP_NAME = "rpg-agent"
 app = FastAPI(title=APP_NAME)
@@ -95,6 +96,33 @@ class CampaignOut(BaseModel):
 # -------------------------
 # Helpers
 # -------------------------
+
+def html_table_to_tsv(html: str) -> str:
+    """
+    Bardzo prosta konwersja HTML tabeli na tekst.
+    Nie jest piękna, ale robi robotę: wiersz -> newline, komórka -> ' | '.
+    """
+    if not html:
+        return ""
+
+    h = unescape(html)
+
+    # Zamień znaczniki tabeli na separatory
+    h = re.sub(r"(?is)</tr\s*>", "\n", h)
+    h = re.sub(r"(?is)</t[dh]\s*>", " | ", h)
+
+    # Wywal resztę tagów
+    h = re.sub(r"(?is)<[^>]+>", " ", h)
+
+    # Sprzątanie spacji i pustych linii
+    h = re.sub(r"[ \t]{2,}", " ", h)
+    lines = [ln.strip(" |") for ln in h.splitlines()]
+    lines = [ln for ln in lines if ln and len(ln) > 3]
+
+    # Zostaw tylko linie, które wyglądają jak wiersze tabeli (mają separator)
+    lines = [ln for ln in lines if " | " in ln]
+
+    return "\n".join(lines).strip()
 
 
 def require_env(name: str, value: Optional[str]) -> str:
@@ -238,6 +266,11 @@ def get_drive_service():
 
 def export_google_doc_as_text(drive, doc_id: str) -> str:
     data = drive.files().export(fileId=doc_id, mimeType="text/plain").execute()
+    return data.decode("utf-8", errors="ignore")
+
+
+def export_google_doc(drive, doc_id: str, mime_type: str) -> str:
+    data = drive.files().export(fileId=doc_id, mimeType=mime_type).execute()
     return data.decode("utf-8", errors="ignore")
 
 
@@ -436,7 +469,10 @@ def reindex(body: ReindexRequest = ReindexRequest()):
             if body.clean:
                 delete_chunks_for_doc(doc_id)
 
-            raw = export_google_doc_as_text(drive, doc_id)
+            raw = export_google_doc(drive, doc_id, "text/plain")
+            if doc_type == "threads":
+                raw_html = export_google_doc(drive, doc_id, "text/html")
+                raw = html_table_to_tsv(raw_html) or raw
             cleaned = sanitize_for_rag(raw)
 
             if doc_type == "threads":
@@ -593,3 +629,4 @@ def apply_patch(_: SessionPatch):
     Ten endpoint to placeholder pod przyszły, świadomy apply.
     """
     return {"ok": True, "applied": False, "reason": "not implemented (manual approval flow first)"}
+
