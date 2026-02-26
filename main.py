@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -12,19 +14,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from googleapiclient.discovery import build
 from pgvector.psycopg import register_vector
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 APP_NAME = "rpg-agent"
 app = FastAPI(title=APP_NAME)
 
 # ---- env ----
 CAMPAIGN_ID = os.getenv("CAMPAIGN_ID", "kng")
-
 BIBLE_DOC_ID = os.getenv("BIBLE_DOC_ID")
 RULES_DOC_ID = os.getenv("RULES_DOC_ID")
 GLOSSARY_DOC_ID = os.getenv("GLOSSARY_DOC_ID")
 THREADS_DOC_ID = os.getenv("THREADS_DOC_ID")
-
 DB_URL = os.getenv("DB_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -35,10 +35,10 @@ GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-2.5-pro")
 # Debug/visibility
 REVISION = os.getenv("K_REVISION", "unknown")
 
-
 # -------------------------
 # Models (API)
 # -------------------------
+
 AskMode = Literal["auto", "campaign", "general"]
 
 
@@ -58,20 +58,96 @@ class ReindexRequest(BaseModel):
     clean: bool = False
 
 
+class IngestSessionRequest(BaseModel):
+    raw_notes: str = Field(..., min_length=1)
+    campaign_id: Optional[str] = None
+
+
+class ThreadPatch(BaseModel):
+    thread_id: Optional[str] = None
+    title: str
+    status: Optional[str] = None
+    change: str
+
+
+class EntityPatch(BaseModel):
+    kind: Literal["npc", "location", "faction", "item", "other"] = "other"
+    name: str
+    description: str
+    tags: List[str] = []
+
+
+class SessionPatch(BaseModel):
+    session_summary: str
+    thread_tracker_patch: List[ThreadPatch] = []
+    entities_patch: List[EntityPatch] = []
+    rag_additions: List[str] = []
+
+
+class CampaignOut(BaseModel):
+    # twardy output dla trybu kampanii (zero dopowiedzeń)
+    format: Literal["bullets", "table"] = "bullets"
+    bullets: List[str] = []
+    table: Optional[Dict[str, Any]] = None
+    used_context: List[int] = []
+
+
 # -------------------------
 # Helpers
 # -------------------------
+
+
 def require_env(name: str, value: Optional[str]) -> str:
     if not value:
         raise HTTPException(status_code=400, detail=f"Missing env: {name}")
     return value
 
 
+def sanitize_for_rag(text: str) -> str:
+    """
+    Wywala oczywiste śmieci z terminala i logów.
+    Cel: żeby "cat > rpg.sh", prompty, gcloud itp. nie miały szans wejść do embeddingów.
+    """
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    out: List[str] = []
+
+    bad_prefix = (
+        "$ ",
+        "gcloud ",
+        "curl ",
+        "cat >",
+        "cat <<",
+        "EOF",
+        "kubectl ",
+        "docker ",
+        "pip ",
+        "python ",
+        "export ",
+    )
+
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            out.append("")
+            continue
+        if any(s.startswith(p) for p in bad_prefix):
+            continue
+        if s.endswith("$") and len(s) <= 80:
+            continue
+        out.append(ln)
+
+    cleaned = "\n".join(out)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
 def chunk_text(text: str, max_chars: int = 2400, overlap: int = 400) -> List[str]:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not text:
         return []
-
     chunks: List[str] = []
     i = 0
     n = len(text)
@@ -87,13 +163,12 @@ def chunk_text(text: str, max_chars: int = 2400, overlap: int = 400) -> List[str
 def chunk_threads(text: str) -> List[str]:
     """
     Thread Tracker zwykle jest liniowy/tabelkowy.
-    Lepsze jest chunkowanie po liniach, żeby nie ucinało wątku typu "T05 | ...".
+    Chunkowanie po liniach, żeby nie ucinało wątku typu "T05 | ...".
     """
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not text:
         return []
     lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
-    # grupujemy po ~40 linii
     out: List[str] = []
     buf: List[str] = []
     for ln in lines:
@@ -107,12 +182,8 @@ def chunk_threads(text: str) -> List[str]:
 
 
 def gemini_embed(texts: List[str]) -> List[List[float]]:
-    """
-    Embeddings przez embedContent (pojedyncze).
-    """
     if not GEMINI_API_KEY:
         raise RuntimeError("Brak GEMINI_API_KEY")
-
     out: List[List[float]] = []
     for t in texts:
         url = f"https://generativelanguage.googleapis.com/v1beta/{EMBED_MODEL}:embedContent"
@@ -125,7 +196,13 @@ def gemini_embed(texts: List[str]) -> List[List[float]]:
     return out
 
 
-def gemini_generate(prompt: str) -> str:
+def gemini_generate(
+    prompt: str,
+    *,
+    response_mime_type: str = "text/plain",
+    temperature: float = 0.6,
+    max_output_tokens: int = 2500,
+) -> str:
     if not GEMINI_API_KEY:
         raise RuntimeError("Brak GEMINI_API_KEY")
 
@@ -133,18 +210,16 @@ def gemini_generate(prompt: str) -> str:
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.6,
-            "maxOutputTokens": 2500,
-            "responseMimeType": "text/plain",
+            "temperature": temperature,
+            "maxOutputTokens": max_output_tokens,
+            "responseMimeType": response_mime_type,
         },
     }
     r = requests.post(f"{url}?key={GEMINI_API_KEY}", json=payload, timeout=90)
     if r.status_code != 200:
         raise RuntimeError(f"Gemini generate error: {r.status_code} {r.text}")
-
     data = r.json()
 
-    # normalny case: candidates[0].content.parts[].text
     try:
         parts = data["candidates"][0]["content"]["parts"]
         texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
@@ -153,7 +228,6 @@ def gemini_generate(prompt: str) -> str:
             return out
     except Exception:
         pass
-
     return str(data)
 
 
@@ -185,6 +259,10 @@ def delete_chunks_for_doc(doc_id: str):
 
 
 def upsert_chunks(doc_id: str, doc_type: str, chunks: List[str], embeddings: List[List[float]]):
+    """
+    Insert-only (tak jak wcześniej). Dla MVP OK.
+    Przy reindex warto używać clean=true.
+    """
     now = datetime.now(timezone.utc)
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -215,7 +293,7 @@ def vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                select doc_id, doc_type, chunk_text, (embedding <-> %s::vector) as distance
+                select id, doc_id, doc_type, chunk_text, (embedding <-> %s::vector) as distance
                 from chunks
                 where campaign_id = %s
                 order by embedding <-> %s::vector
@@ -224,10 +302,9 @@ def vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
                 (q_emb, CAMPAIGN_ID, q_emb, top_k),
             )
             rows = cur.fetchall()
-
     return [
-        {"doc_id": d, "doc_type": t, "chunk_text": c, "distance": float(dist)}
-        for (d, t, c, dist) in rows
+        {"chunk_id": cid, "doc_id": d, "doc_type": t, "chunk_text": c, "distance": float(dist)}
+        for (cid, d, t, c, dist) in rows
     ]
 
 
@@ -256,21 +333,83 @@ def is_campaign_question(text: str) -> bool:
     return any(k in t for k in keywords)
 
 
-def looks_truncated(answer: str, question: str) -> bool:
-    s = (answer or "").strip()
-    if not s:
-        return True
-    if "brak w notatkach" in s.lower():
-        return False
-    # urwane w pół zdania + sensowna długość
-    if s[-1] not in ".!?\n":
-        return len(s) > 200 and len(question) > 40
-    return False
+def extract_json_object(text: str) -> str:
+    """
+    Gemini czasem dorzuci coś dookoła. Wyciągamy pierwsze sensowne {...}.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    return m.group(0).strip() if m else ""
+
+
+def render_campaign_out(out: CampaignOut) -> str:
+    if out.format == "table" and out.table:
+        cols = out.table.get("columns") or []
+        rows = out.table.get("rows") or []
+        if not cols or not isinstance(cols, list):
+            return "brak w notatkach"
+        header = "| " + " | ".join(str(c) for c in cols) + " |"
+        sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+        body_lines = []
+        for r in rows:
+            if isinstance(r, list):
+                body_lines.append("| " + " | ".join(str(x) for x in r) + " |")
+        md = "\n".join([header, sep] + body_lines).strip()
+        return md or "brak w notatkach"
+
+    bullets = [b.strip() for b in (out.bullets or []) if b and b.strip()]
+    if not bullets:
+        return "brak w notatkach"
+    return "\n".join([f"1. {b}" for b in bullets])
+
+
+def build_campaign_prompt(question: str, context: str) -> str:
+    return f"""
+Jesteś asystentem MG kampanii "Krew Na Gwiazdach". Odpowiadasz po polsku.
+
+ZASADY (twarde):
+1) Używaj wyłącznie faktów z KONTEKSTU.
+2) Jeśli czegoś nie ma w kontekście, zwróć JSON z format="bullets" i bullets=["brak w notatkach"].
+3) Nie dopowiadaj, nie spekuluj, nie twórz "trzeciej drogi", nie dodawaj żadnych sekcji ponad to co trzeba.
+4) Zwróć wyłącznie JSON. Żadnego markdown, żadnego tekstu dookoła.
+
+Dozwolony JSON (dokładnie te pola):
+{{
+  "format": "bullets" | "table",
+  "bullets": ["..."],
+  "table": {{"columns": ["..."], "rows": [["..."]]}},
+  "used_context": [1,2,3]
+}}
+
+KONTEKST:
+{context}
+
+PYTANIE:
+{question}
+
+ODPOWIEDŹ (tylko JSON):
+""".strip()
+
+
+def build_general_prompt(question: str) -> str:
+    return f"""
+Odpowiedz po polsku dokładnie na pytanie użytkownika.
+Nie dodawaj sekcji, których nie wymaga pytanie.
+
+PYTANIE:
+{question}
+
+ODPOWIEDŹ:
+""".strip()
 
 
 # -------------------------
 # Endpoints
 # -------------------------
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "campaign_id": CAMPAIGN_ID, "revision": REVISION}
@@ -286,24 +425,24 @@ def reindex(body: ReindexRequest = ReindexRequest()):
 
         drive = get_drive_service()
         docs: List[Tuple[str, str]] = [
-            ("bible", BIBLE_DOC_ID),       # type: ignore[arg-type]
-            ("rules", RULES_DOC_ID),       # type: ignore[arg-type]
-            ("glossary", GLOSSARY_DOC_ID), # type: ignore[arg-type]
-            ("threads", THREADS_DOC_ID),   # type: ignore[arg-type]
+            ("bible", BIBLE_DOC_ID),  # type: ignore[arg-type]
+            ("rules", RULES_DOC_ID),  # type: ignore[arg-type]
+            ("glossary", GLOSSARY_DOC_ID),  # type: ignore[arg-type]
+            ("threads", THREADS_DOC_ID),  # type: ignore[arg-type]
         ]
 
         total_chunks = 0
-
         for doc_type, doc_id in docs:
             if body.clean:
                 delete_chunks_for_doc(doc_id)
 
-            text = export_google_doc_as_text(drive, doc_id)
+            raw = export_google_doc_as_text(drive, doc_id)
+            cleaned = sanitize_for_rag(raw)
 
             if doc_type == "threads":
-                chunks = chunk_threads(text)
+                chunks = chunk_threads(cleaned)
             else:
-                chunks = chunk_text(text)
+                chunks = chunk_text(cleaned)
 
             if not chunks:
                 continue
@@ -313,7 +452,6 @@ def reindex(body: ReindexRequest = ReindexRequest()):
             total_chunks += len(chunks)
 
         return {"ok": True, "indexed_chunks": total_chunks, "clean": body.clean}
-
     except HTTPException:
         raise
     except Exception as e:
@@ -325,7 +463,6 @@ def ask(req: AskRequest):
     try:
         q = req.question.strip()
 
-        # wybór trybu
         if req.mode == "campaign":
             campaign_mode = True
         elif req.mode == "general":
@@ -333,75 +470,62 @@ def ask(req: AskRequest):
         else:
             campaign_mode = is_campaign_question(q)
 
-        hits: List[Dict[str, Any]] = []
-        context = ""
+        if not campaign_mode:
+            answer = gemini_generate(build_general_prompt(q)).strip()
+            return AskResponse(answer=answer, sources=[])
 
-        if campaign_mode:
-            hits = vector_search(q, req.top_k)
-            # 900 znaków na chunk to sensowny kompromis
-            context = "\n\n".join(
-                [f"[{i+1}] ({h['doc_type']}) {h['chunk_text'][:900]}" for i, h in enumerate(hits)]
-            )
+        hits = vector_search(q, req.top_k)
+        context = "\n\n".join([f"[{i+1}] ({h['doc_type']}) {h['chunk_text'][:900]}" for i, h in enumerate(hits)])
+        prompt = build_campaign_prompt(q, context)
 
-            prompt = f"""
-Jesteś asystentem MG kampanii "Krew Na Gwiazdach". Odpowiadasz po polsku.
+        raw = gemini_generate(
+            prompt,
+            response_mime_type="application/json",
+            temperature=0.2,
+            max_output_tokens=2000,
+        ).strip()
 
-ZASADY:
-- Używaj tylko faktów z KONTEKSTU.
-- Jeśli czegoś nie ma w kontekście, napisz dosłownie: "brak w notatkach".
-- Odpowiedz dokładnie na PYTANIE użytkownika. Nie dodawaj sekcji, których nie wymaga pytanie.
-- Zwracaj odpowiedź w markdown (listy numerowane "1.", "2.", tabele markdown).
-- Jeśli odpowiedź się urywa, dokończ ją zamiast kończyć w pół zdania.
+        parsed: Optional[CampaignOut] = None
+        try:
+            obj = json.loads(extract_json_object(raw))
+            parsed = CampaignOut.model_validate(obj)
+        except Exception:
+            fix = f"""
+Napraw output. Masz zwrócić wyłącznie JSON zgodny z tym schematem i nic więcej.
+Jeśli brak danych: format="bullets", bullets=["brak w notatkach"].
 
-KONTEKST:
-{context}
+ZŁY OUTPUT:
+{raw}
 
-PYTANIE:
-{q}
-
-ODPOWIEDŹ:
+POPRAWNY OUTPUT (tylko JSON):
 """.strip()
-        else:
-            # tryb ogólny: zero RAG, zero "brak w notatkach"
-            prompt = f"""
-Odpowiedz po polsku dokładnie na pytanie użytkownika.
-Nie dodawaj sekcji, których nie wymaga pytanie.
+            raw2 = gemini_generate(
+                fix,
+                response_mime_type="application/json",
+                temperature=0.0,
+                max_output_tokens=1500,
+            ).strip()
+            obj2 = json.loads(extract_json_object(raw2))
+            parsed = CampaignOut.model_validate(obj2)
 
-PYTANIE:
-{q}
+        answer = render_campaign_out(parsed)
 
-ODPOWIEDŹ:
-""".strip()
-
-        answer = gemini_generate(prompt).strip()
-
-        # retry tylko w campaign i tylko gdy wygląda na urwane
-        if campaign_mode and looks_truncated(answer, q):
-            prompt2 = f"""
-Dokończ odpowiedź od miejsca, w którym się urwała. Nie powtarzaj wcześniejszych fragmentów.
-Nadal trzymaj się zasady: tylko fakty z KONTEKSTU, a jeśli czegoś brakuje - "brak w notatkach".
-Zwracaj odpowiedź w markdown.
-
-KONTEKST:
-{context}
-
-DOTYCHCZAS:
-{answer}
-
-KONTYNUACJA:
-""".strip()
-            more = gemini_generate(prompt2).strip()
-            if more:
-                answer = (answer + "\n" + more).strip()
-
-        sources = (
-            [{"doc_type": h["doc_type"], "distance": h["distance"]} for h in hits]
-            if req.include_sources
-            else []
-        )
+        sources: List[Dict[str, Any]] = []
+        if req.include_sources:
+            sources = [
+                {
+                    "doc_type": h["doc_type"],
+                    "doc_id": h["doc_id"],
+                    "chunk_id": h["chunk_id"],
+                    "distance": h["distance"],
+                }
+                for h in hits
+            ]
 
         return AskResponse(answer=answer, sources=sources)
 
+    except ValidationError as e:
+        raise HTTPException(status_code=500, detail=f"Output validation error: {e}")
     except HTTPException:
         raise
     except Exception as e:
@@ -411,4 +535,61 @@ KONTYNUACJA:
 @app.post("/ask_text", response_class=PlainTextResponse)
 def ask_text(req: AskRequest):
     resp = ask(req)
-    return resp.answer
+    return resp.answer + "\n"
+
+
+@app.post("/ingest_session", response_model=SessionPatch)
+def ingest_session(req: IngestSessionRequest):
+    """
+    Wklejasz surowe notatki z sesji -> agent generuje patch.
+    Niczego nie zapisujemy do Google Docs automatem.
+    """
+    try:
+        raw_notes = req.raw_notes.strip()
+        if not raw_notes:
+            raise HTTPException(status_code=400, detail="raw_notes is empty")
+
+        notes = sanitize_for_rag(raw_notes)
+
+        prompt = f"""
+Jesteś asystentem MG kampanii "Krew Na Gwiazdach".
+Masz z surowych notatek wygenerować PATCH do dokumentów kampanii.
+Nie zmyślaj. Jeśli czegoś nie ma w notatkach, pomiń to.
+Zwróć wyłącznie JSON zgodny z tym schematem:
+{{
+  "session_summary": "krótkie podsumowanie (max 8 zdań)",
+  "thread_tracker_patch": [{{"thread_id": "Txx (opcjonalnie)", "title": "...", "status": "...", "change": "co dopisać/zmienić"}}],
+  "entities_patch": [{{"kind": "npc|location|faction|item|other", "name": "...", "description": "...", "tags": ["..."]}}],
+  "rag_additions": ["krótkie fakty warte wejścia do indeksu, bez śmieci z terminala"]
+}}
+
+NOTATKI:
+{notes}
+
+PATCH (tylko JSON):
+""".strip()
+
+        raw = gemini_generate(
+            prompt,
+            response_mime_type="application/json",
+            temperature=0.2,
+            max_output_tokens=2500,
+        ).strip()
+
+        obj = json.loads(extract_json_object(raw))
+        patch = SessionPatch.model_validate(obj)
+        return patch
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/apply_patch")
+def apply_patch(_: SessionPatch):
+    """
+    Na start: celowo NIE zapisujemy automatem do Google Docs.
+    Ten endpoint to placeholder pod przyszły, świadomy apply.
+    """
+    return {"ok": True, "applied": False, "reason": "not implemented (manual approval flow first)"}
