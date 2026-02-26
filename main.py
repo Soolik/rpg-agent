@@ -83,9 +83,6 @@ def gemini_embed(texts: List[str]) -> List[List[float]]:
 
 
 def gemini_generate(prompt: str) -> str:
-    """
-    Wymuszamy tekstowy output. Dodatkowo próbujemy wyłączyć thinking (jak model wspiera).
-    """
     if not GEMINI_API_KEY:
         raise RuntimeError("Brak GEMINI_API_KEY")
 
@@ -97,7 +94,6 @@ def gemini_generate(prompt: str) -> str:
             "maxOutputTokens": 800,
             "responseMimeType": "text/plain",
         },
-        "thinkingConfig": {"thinking": False},
     }
 
     r = requests.post(f"{url}?key={GEMINI_API_KEY}", json=payload, timeout=90)
@@ -106,7 +102,6 @@ def gemini_generate(prompt: str) -> str:
 
     data = r.json()
 
-    # Prefer standard "parts[].text"
     try:
         parts = data["candidates"][0]["content"]["parts"]
         texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
@@ -116,7 +111,6 @@ def gemini_generate(prompt: str) -> str:
     except Exception:
         pass
 
-    # Fallback: return raw payload for diagnosis
     return str(data)
 
 
@@ -269,3 +263,4 @@ PYTANIE:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
