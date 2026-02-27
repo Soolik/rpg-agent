@@ -43,7 +43,7 @@ REVISION = os.getenv("K_REVISION", "unknown")
 # Models (API)
 # -------------------------
 
-AskMode = Literal["auto", "campaign", "general"]
+AskMode = Literal["auto", "campaign", "general", "scene"]
 
 
 class AskRequest(BaseModel):
@@ -94,13 +94,6 @@ class CampaignOut(BaseModel):
     bullets: List[str] = []
     table: Optional[Dict[str, Any]] = None
     used_context: List[int] = []
-
-
-class AskRequest(BaseModel):
-    question: str
-    mode: Literal["auto", "campaign", "general", "scene"] = "auto"
-    include_sources: bool = False
-    top_k: int = 6
 
 
 # -------------------------
@@ -602,7 +595,7 @@ def ask(req: AskRequest):
     try:
         q = req.question.strip()
 
-        if req.mode == "campaign":
+        if req.mode in ("campaign", "scene"):
             campaign_mode = True
         elif req.mode == "general":
             campaign_mode = False
