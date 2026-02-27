@@ -1,15 +1,14 @@
-from __future__ import annotations
-
 import json
 import os
 import re
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Tuple
-
 import google.auth
 import psycopg
 import requests
+
+from __future__ import annotations
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from googleapiclient.discovery import build
@@ -98,31 +97,35 @@ class CampaignOut(BaseModel):
 # -------------------------
 
 def html_table_to_tsv(html: str) -> str:
-    """
-    Bardzo prosta konwersja HTML tabeli na tekst.
-    Nie jest piękna, ale robi robotę: wiersz -> newline, komórka -> ' | '.
-    """
     if not html:
         return ""
 
     h = unescape(html)
 
-    # Zamień znaczniki tabeli na separatory
+    # wiersze i komórki
     h = re.sub(r"(?is)</tr\s*>", "\n", h)
     h = re.sub(r"(?is)</t[dh]\s*>", " | ", h)
 
-    # Wywal resztę tagów
+    # usuń tagi
     h = re.sub(r"(?is)<[^>]+>", " ", h)
 
-    # Sprzątanie spacji i pustych linii
+    # normalizacja whitespace
     h = re.sub(r"[ \t]{2,}", " ", h)
-    lines = [ln.strip(" |") for ln in h.splitlines()]
-    lines = [ln for ln in lines if ln and len(ln) > 3]
 
-    # Zostaw tylko linie, które wyglądają jak wiersze tabeli (mają separator)
-    lines = [ln for ln in lines if " | " in ln]
+    lines = [ln.strip() for ln in h.splitlines()]
+    lines = [ln.strip(" |") for ln in lines if ln and len(ln) > 3]
 
-    return "\n".join(lines).strip()
+    norm = []
+    for ln in lines:
+        ln = ln.replace("\t", " | ")
+        ln = re.sub(r"\s*\|\s*", " | ", ln)
+        ln = re.sub(r"[ \t]{2,}", " ", ln).strip()
+
+        # wiersz tabeli = co najmniej 3 kolumny (2 kreski)
+        if ln.count("|") >= 2:
+            norm.append(ln)
+
+    return "\n".join(norm).strip()
 
 
 def require_env(name: str, value: Optional[str]) -> str:
@@ -469,19 +472,27 @@ def reindex(body: ReindexRequest = ReindexRequest()):
             if body.clean:
                 delete_chunks_for_doc(doc_id)
 
-            raw = export_google_doc(drive, doc_id, "text/plain")
             if doc_type == "threads":
+                # Prefer HTML export for tables. Fallback to plain text if HTML parse yields nothing.
                 raw_html = export_google_doc(drive, doc_id, "text/html")
-                raw = html_table_to_tsv(raw_html) or raw
-            cleaned = sanitize_for_rag(raw)
+                raw = html_table_to_tsv(raw_html)
+                if not raw.strip():
+                    raw = export_google_doc(drive, doc_id, "text/plain")
 
-            if doc_type == "threads":
+                # IMPORTANT: do not over-sanitize threads, keep row structure for quoting
+                cleaned = raw.strip()
                 chunks = chunk_threads(cleaned)
+
+                # Optional guard: avoid indexing empty/near-empty threads
+                if len(cleaned) < 50 or not chunks:
+                    continue
             else:
+                raw = export_google_doc(drive, doc_id, "text/plain")
+                cleaned = sanitize_for_rag(raw)
                 chunks = chunk_text(cleaned)
 
-            if not chunks:
-                continue
+                if not chunks:
+                    continue
 
             embs = gemini_embed(chunks)
             upsert_chunks(doc_id=doc_id, doc_type=doc_type, chunks=chunks, embeddings=embs)
@@ -630,3 +641,17 @@ def apply_patch(_: SessionPatch):
     """
     return {"ok": True, "applied": False, "reason": "not implemented (manual approval flow first)"}
 
+
+@app.get("/debug_threads_preview", response_class=PlainTextResponse)
+def debug_threads_preview():
+    require_env("THREADS_DOC_ID", THREADS_DOC_ID)
+    drive = get_drive_service()
+
+    raw_html = export_google_doc(drive, THREADS_DOC_ID, "text/html")
+    tsv = html_table_to_tsv(raw_html)
+    cleaned = tsv.strip()
+
+    if not cleaned:
+        return "EMPTY\n"
+
+    return cleaned[:8000] + "\n"
