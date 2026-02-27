@@ -446,6 +446,19 @@ ODPOWIEDŹ:
 # Endpoints
 # -------------------------
 
+@app.get("/debug_env", response_class=PlainTextResponse)
+def debug_env():
+    keys = [
+        "GITHUB_APP_ID",
+        "GITHUB_INSTALLATION_ID",
+        "GITHUB_PRIVATE_KEY_PEM",
+    ]
+    out = []
+    for k in keys:
+        v = os.getenv(k)
+        out.append(f"{k}={'SET' if v else 'MISSING'} len={len(v) if v else 0}")
+    return "\n".join(out) + "\n"
+
 
 @app.get("/health")
 def health():
@@ -656,4 +669,5 @@ def debug_threads_preview():
         return "EMPTY\n"
 
     return cleaned[:8000] + "\n"
+
 
