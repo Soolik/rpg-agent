@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -6,7 +8,6 @@ import google.auth
 import psycopg
 import requests
 
-from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from fastapi import FastAPI, HTTPException
@@ -655,3 +656,4 @@ def debug_threads_preview():
         return "EMPTY\n"
 
     return cleaned[:8000] + "\n"
+
