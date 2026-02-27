@@ -7,7 +7,10 @@ import uuid
 import google.auth
 import psycopg
 import requests
+import time
+import jwt
 
+from cryptography.hazmat.primitives import serialization
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from fastapi import FastAPI, HTTPException
@@ -103,6 +106,10 @@ def html_table_to_tsv(html: str) -> str:
 
     h = unescape(html)
 
+    # wytnij style/script zanim zrobimy strip tagów (CSS to był wasz problem)
+    h = re.sub(r"(?is)<style.*?</style>", " ", h)
+    h = re.sub(r"(?is)<script.*?</script>", " ", h)
+
     # wiersze i komórki
     h = re.sub(r"(?is)</tr\s*>", "\n", h)
     h = re.sub(r"(?is)</t[dh]\s*>", " | ", h)
@@ -116,15 +123,27 @@ def html_table_to_tsv(html: str) -> str:
     lines = [ln.strip() for ln in h.splitlines()]
     lines = [ln.strip(" |") for ln in lines if ln and len(ln) > 3]
 
-    norm = []
+    norm: List[str] = []
     for ln in lines:
         ln = ln.replace("\t", " | ")
         ln = re.sub(r"\s*\|\s*", " | ", ln)
         ln = re.sub(r"[ \t]{2,}", " ", ln).strip()
 
-        # wiersz tabeli = co najmniej 3 kolumny (2 kreski)
+        # wiersz tabeli = co najmniej 3 kolumny
         if ln.count("|") >= 2:
             norm.append(ln)
+
+    # startuj od nagłówka tabeli jeśli istnieje
+    for i, ln in enumerate(norm):
+        if "Thread ID" in ln and "|" in ln:
+            norm = norm[i:]
+            break
+
+    # jak nie ma nagłówka, to od pierwszego Txx |
+    for i, ln in enumerate(norm):
+        if re.match(r"^T\d+\s*\|", ln):
+            norm = norm[i:]
+            break
 
     return "\n".join(norm).strip()
 
@@ -442,6 +461,53 @@ ODPOWIEDŹ:
 """.strip()
 
 
+GITHUB_API = "https://api.github.com"
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "Soolik")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "rpg-agent")
+
+
+def github_installation_token() -> str:
+    app_id = require_env("GITHUB_APP_ID", os.getenv("GITHUB_APP_ID"))
+    installation_id = require_env("GITHUB_INSTALLATION_ID", os.getenv("GITHUB_INSTALLATION_ID"))
+    private_key_pem = require_env("GITHUB_PRIVATE_KEY_PEM", os.getenv("GITHUB_PRIVATE_KEY_PEM")).encode("utf-8")
+
+    private_key = serialization.load_pem_private_key(private_key_pem, password=None)
+
+    now = int(time.time())
+    payload = {"iat": now - 30, "exp": now + 9 * 60, "iss": app_id}
+    jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
+
+    r = requests.post(
+        f"{GITHUB_API}/app/installations/{installation_id}/access_tokens",
+        headers={"Authorization": f"Bearer {jwt_token}", "Accept": "application/vnd.github+json"},
+        timeout=30,
+    )
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub access_tokens error: {r.status_code} {r.text}")
+    return r.json()["token"]
+
+
+def gh_headers(token: str) -> Dict[str, str]:
+    return {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+
+
+@app.get("/debug_github_auth", response_class=PlainTextResponse)
+def debug_github_auth():
+    try:
+        token = github_installation_token()
+        r = requests.get(
+            f"{GITHUB_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}",
+            headers=gh_headers(token),
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return f"ERR repo_read {r.status_code}: {r.text}\n"
+        data = r.json()
+        return f"OK token_len={len(token)} repo={data.get('full_name')} default_branch={data.get('default_branch')}\n"
+    except Exception as e:
+        return f"ERR {type(e).__name__}: {e}\n"
+
+
 # -------------------------
 # Endpoints
 # -------------------------
@@ -518,6 +584,11 @@ def reindex(body: ReindexRequest = ReindexRequest()):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def ctx_slice(h: Dict[str, Any]) -> str:
+    doc_type = h.get("doc_type", "")
+    text = h.get("chunk_text", "") or ""
+    limit = 2400 if doc_type == "threads" else 900
+    return text[:limit]
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
@@ -536,7 +607,7 @@ def ask(req: AskRequest):
             return AskResponse(answer=answer, sources=[])
 
         hits = vector_search(q, req.top_k)
-        context = "\n\n".join([f"[{i+1}] ({h['doc_type']}) {h['chunk_text'][:900]}" for i, h in enumerate(hits)])
+        context = "\n\n".join([f"[{i+1}] ({h['doc_type']}) {ctx_slice(h)}" for i, h in enumerate(hits)])
         prompt = build_campaign_prompt(q, context)
 
         raw = gemini_generate(
@@ -669,5 +740,6 @@ def debug_threads_preview():
         return "EMPTY\n"
 
     return cleaned[:8000] + "\n"
+
 
 
