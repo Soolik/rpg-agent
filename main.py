@@ -96,6 +96,13 @@ class CampaignOut(BaseModel):
     used_context: List[int] = []
 
 
+class AskRequest(BaseModel):
+    question: str
+    mode: Literal["auto", "campaign", "general", "scene"] = "auto"
+    include_sources: bool = False
+    top_k: int = 6
+
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -740,6 +747,3 @@ def debug_threads_preview():
         return "EMPTY\n"
 
     return cleaned[:8000] + "\n"
-
-
-
