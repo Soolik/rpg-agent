@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from textwrap import dedent
 from typing import Callable, List, Optional
 
@@ -116,21 +117,106 @@ class PlannerService:
         }}
         """).strip()
 
+    def _extract_json_object(self, raw: str) -> str:
+        text = (raw or "").strip()
+        if not text:
+            return ""
+
+        fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.DOTALL)
+        if fenced:
+            return fenced.group(1).strip()
+
+        start = text.find("{")
+        if start == -1:
+            return ""
+
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1].strip()
+
+        return ""
+
+    def _validate_json_candidate(self, raw: str) -> ChangeProposal:
+        data = json.loads(raw)
+        return ChangeProposal.model_validate(data)
+
+    def _repair_prompt(self, raw: str, request: ProposeChangesRequest) -> str:
+        return dedent(f"""
+        Repair the invalid planner output and return JSON only.
+
+        Rules:
+        - Return exactly one valid JSON object.
+        - Keep the same intent as the original user request.
+        - Use only allowed action_type values from the original planner contract.
+        - Always include: summary, user_goal, assumptions, impacted_docs, actions, needs_confirmation.
+        - `needs_confirmation` must be true.
+
+        User request:
+        {request.instruction}
+
+        Invalid output:
+        {raw}
+        """).strip()
+
     def _parse_or_fallback(self, raw: str, request: ProposeChangesRequest) -> ChangeProposal:
-        try:
-            data = json.loads(raw)
-            return ChangeProposal.model_validate(data)
-        except Exception:
-            return ChangeProposal(
-                summary="Fallback proposal generated because planner did not return valid JSON.",
-                user_goal=request.instruction,
-                assumptions=["Planner output was not valid JSON and needs manual review."],
-                impacted_docs=[],
-                actions=[
-                    DocumentAction(
-                        action_type="reindex",  # type: ignore[arg-type]
-                        reason="Fallback no-op action",
-                    )
-                ],
-                needs_confirmation=True,
-            )
+        candidates = []
+        if raw:
+            candidates.append(raw)
+            extracted = self._extract_json_object(raw)
+            if extracted and extracted != raw:
+                candidates.append(extracted)
+
+        for candidate in candidates:
+            try:
+                return self._validate_json_candidate(candidate)
+            except Exception:
+                continue
+
+        if raw:
+            try:
+                repaired = self.generate_text_fn(self._repair_prompt(raw, request))
+                repaired_candidates = [repaired]
+                extracted = self._extract_json_object(repaired)
+                if extracted and extracted != repaired:
+                    repaired_candidates.append(extracted)
+
+                for candidate in repaired_candidates:
+                    try:
+                        return self._validate_json_candidate(candidate)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        return ChangeProposal(
+            summary="Fallback proposal generated because planner did not return valid JSON.",
+            user_goal=request.instruction,
+            assumptions=["Planner output was not valid JSON and needs manual review."],
+            impacted_docs=[],
+            actions=[
+                DocumentAction(
+                    action_type="reindex",  # type: ignore[arg-type]
+                    reason="Fallback no-op action",
+                )
+            ],
+            needs_confirmation=True,
+        )
