@@ -653,7 +653,7 @@ Dozwolony JSON:
 {{
   "format": "bullets" | "table",
   "bullets": ["..."],
-  "table": {{"columns": ["..."], "rows": [["..."]]}}},
+  "table": {{"columns": ["..."], "rows": [["..."]]}},
   "used_context": [1,2,3]
 }}
 
