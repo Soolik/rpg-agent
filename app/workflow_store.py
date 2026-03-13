@@ -22,7 +22,6 @@ class WorkflowStore:
     connection_factory: Callable[[], object]
 
     def save_proposal(self, request: ProposeChangesRequest, proposal: ChangeProposal) -> int:
-        payload = proposal.model_dump(mode="json")
         with self.connection_factory() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -44,14 +43,32 @@ class WorkflowStore:
                         proposal.summary,
                         proposal.user_goal,
                         json.dumps(request.model_dump(mode="json")),
-                        json.dumps(payload),
+                        json.dumps(proposal.model_dump(mode="json")),
                         False,
                         None,
                     ),
                 )
                 row = cur.fetchone()
+                proposal_id = int(row[0])
+                payload = {
+                    **proposal.model_dump(mode="json"),
+                    "proposal_id": proposal_id,
+                }
+                cur.execute(
+                    """
+                    update proposals
+                    set proposal_json = %s::jsonb,
+                        updated_at = now()
+                    where campaign_id = %s and id = %s
+                    """,
+                    (
+                        json.dumps(payload),
+                        self.campaign_id,
+                        proposal_id,
+                    ),
+                )
             conn.commit()
-        return int(row[0])
+        return proposal_id
 
     def save_apply_run(
         self,
@@ -190,7 +207,10 @@ class WorkflowStore:
             created_at=row[6].isoformat(),
             updated_at=row[7].isoformat(),
             request=row[8] or {},
-            proposal=row[9] or {},
+            proposal={
+                **(row[9] or {}),
+                "proposal_id": (row[9] or {}).get("proposal_id") or row[0],
+            },
         )
 
     def get_apply_run(self, apply_run_id: int) -> Optional[ApplyRunDetail]:

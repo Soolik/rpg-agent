@@ -4,6 +4,7 @@ import json
 from textwrap import dedent
 from typing import Callable, List, Optional
 
+from .templates import FACTION_TEMPLATE, LOCATION_TEMPLATE, NPC_TEMPLATE, SECRET_TEMPLATE, THREAD_TEMPLATE
 from .models_v2 import (
     ChangeProposal,
     DocumentAction,
@@ -42,6 +43,7 @@ class PlannerService:
 
     def _build_prompt(self, request: ProposeChangesRequest, world_docs: List[WorldDocInfo], world_context: str) -> str:
         docs_preview = "\n".join(f"- {d.folder}/{d.title}" for d in world_docs[:100]) or "- No docs found"
+        allowed_folders = ", ".join(sorted({d.folder for d in world_docs if d.folder})) or "00 Admin, 01 Bible, 02 Sessions, 03 NPC, 04 Locations, 05 Factions, 06 Threads, 07 Secrets, 08 Outputs"
         return dedent(f"""
         You are a zero-touch worldbuilding planner for an RPG campaign.
         Your job is to convert a user instruction into a structured JSON change proposal.
@@ -54,6 +56,12 @@ class PlannerService:
         - Update Thread Tracker only for plot-level changes.
         - Do not invent certainty where there is not enough context. Put assumptions into `assumptions`.
         - Always set `needs_confirmation` to true.
+        - Use only exact logical folder names from this allowed list: {allowed_folders}
+        - Never invent folder names such as "03 NPCs". Use exact names like "03 NPC".
+        - If a target document already exists in Existing world docs, reuse its exact title and folder.
+        - If a target document does not exist, create it in the exact canonical folder name.
+        - Keep proposed document content in Polish.
+        - Prefer human-readable titles like "Captain Mira", unless existing docs clearly use another naming convention.
 
         Allowed action_type values:
         - create_doc
@@ -72,6 +80,22 @@ class PlannerService:
 
         World context:
         {world_context}
+
+        Recommended document templates:
+        NPC:
+        {NPC_TEMPLATE}
+
+        Location:
+        {LOCATION_TEMPLATE}
+
+        Faction:
+        {FACTION_TEMPLATE}
+
+        Thread:
+        {THREAD_TEMPLATE}
+
+        Secret:
+        {SECRET_TEMPLATE}
 
         Return JSON only matching this rough structure:
         {{

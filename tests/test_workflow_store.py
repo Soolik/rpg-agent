@@ -58,6 +58,8 @@ class WorkflowStoreTest(unittest.TestCase):
         self.assertEqual(proposal_id, 17)
         self.assertEqual(connection.commit_called, 1)
         self.assertIn("insert into proposals", cursor.statements[0][0].lower())
+        self.assertIn("update proposals", cursor.statements[1][0].lower())
+        self.assertIn('"proposal_id": 17', cursor.statements[1][1][0])
 
     def test_save_apply_run_updates_linked_proposal(self):
         cursor = FakeCursor(fetchone_values=[(31,)])

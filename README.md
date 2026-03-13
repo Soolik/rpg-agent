@@ -33,6 +33,10 @@ python -m pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
+## Testowanie
+
+Praktyczna instrukcja testow automatycznych, smoke testow i scenariuszy end-to-end jest w `docs/TESTING.md`.
+
 ## Baza danych
 
 Początkowy schemat jest w `sql/001_initial_schema.sql`.
