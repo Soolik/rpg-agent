@@ -4,6 +4,7 @@ import json
 import os
 import re
 import uuid
+import hashlib
 import google.auth
 import psycopg
 import requests
@@ -12,13 +13,15 @@ import jwt
 
 from cryptography.hazmat.primitives import serialization
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from app.drive_store import DriveStore
+from app.models_v2 import DocumentRef, WorldDocInfo
 from app.planner import PlannerService
 from app.routes_v2 import build_v2_router
+from app.workflow_store import WorkflowStore
 from googleapiclient.discovery import build
 from pgvector.psycopg import register_vector
 from pydantic import BaseModel, Field, ValidationError
@@ -337,6 +340,95 @@ def delete_chunks_for_doc(doc_id: str):
         conn.commit()
 
 
+def delete_all_chunks_for_campaign():
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("delete from chunks where campaign_id = %s", (CAMPAIGN_ID,))
+        conn.commit()
+
+
+def content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def sync_world_doc_state(
+    doc: WorldDocInfo,
+    *,
+    doc_type: str,
+    raw_content: str,
+    chunk_count: int,
+) -> bool:
+    if not doc.doc_id:
+        return False
+
+    doc_hash = content_hash(raw_content)
+    entity_type = getattr(doc.entity_type, "value", str(doc.entity_type))
+    metadata = json.dumps(
+        {
+            "path_hint": doc.path_hint,
+            "doc_type": doc_type,
+            "chunk_count": chunk_count,
+        }
+    )
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into world_docs (
+                    campaign_id,
+                    doc_id,
+                    folder,
+                    title,
+                    entity_type,
+                    content_hash,
+                    last_synced_at,
+                    metadata
+                )
+                values (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                on conflict (campaign_id, doc_id)
+                do update set
+                    folder = excluded.folder,
+                    title = excluded.title,
+                    entity_type = excluded.entity_type,
+                    content_hash = excluded.content_hash,
+                    last_synced_at = excluded.last_synced_at,
+                    metadata = excluded.metadata
+                """,
+                (
+                    CAMPAIGN_ID,
+                    doc.doc_id,
+                    doc.folder,
+                    doc.title,
+                    entity_type or "other",
+                    doc_hash,
+                    datetime.now(timezone.utc),
+                    metadata,
+                ),
+            )
+            cur.execute(
+                """
+                select 1
+                from doc_snapshots
+                where campaign_id = %s and doc_id = %s and content_hash = %s
+                limit 1
+                """,
+                (CAMPAIGN_ID, doc.doc_id, doc_hash),
+            )
+            exists = cur.fetchone() is not None
+            if not exists:
+                cur.execute(
+                    """
+                    insert into doc_snapshots (campaign_id, doc_id, content_hash, content_text)
+                    values (%s, %s, %s, %s)
+                    """,
+                    (CAMPAIGN_ID, doc.doc_id, doc_hash, raw_content),
+                )
+        conn.commit()
+
+    return not exists
+
+
 def upsert_chunks(doc_id: str, doc_type: str, chunks: List[str], embeddings: List[List[float]]):
     """
     Insert-only (tak jak wcześniej). Dla MVP OK.
@@ -345,6 +437,10 @@ def upsert_chunks(doc_id: str, doc_type: str, chunks: List[str], embeddings: Lis
     now = datetime.now(timezone.utc)
     with db_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                "delete from chunks where campaign_id = %s and doc_id = %s",
+                (CAMPAIGN_ID, doc_id),
+            )
             for t, emb in zip(chunks, embeddings):
                 cid = str(uuid.uuid4())
                 cur.execute(
@@ -566,11 +662,140 @@ def build_drive_store() -> DriveStore:
     return DriveStore(folder_map=folder_map, core_doc_map=core_doc_map)
 
 
-def reindex_after_apply_default() -> Dict[str, Any]:
-    return reindex(ReindexRequest(clean=False))
+def build_workflow_store() -> Optional[WorkflowStore]:
+    if not DB_URL:
+        return None
+    return WorkflowStore(campaign_id=CAMPAIGN_ID, connection_factory=db_conn)
+
+
+def doc_type_for_indexing(doc: WorldDocInfo) -> str:
+    if doc.title == "Thread Tracker":
+        return "threads"
+    entity_type = getattr(doc.entity_type, "value", str(doc.entity_type))
+    return entity_type or "other"
+
+
+def export_world_doc_for_indexing(drive, doc: WorldDocInfo) -> str:
+    if not doc.doc_id:
+        return ""
+
+    if doc.title == "Thread Tracker":
+        raw_html = export_google_doc(drive, doc.doc_id, "text/html")
+        raw = html_table_to_tsv(raw_html)
+        if raw.strip():
+            return raw
+
+    return export_google_doc(drive, doc.doc_id, "text/plain")
+
+
+def index_world_docs(docs: List[WorldDocInfo], *, clean: bool = False) -> Dict[str, Any]:
+    if not docs:
+        raise HTTPException(status_code=400, detail="No world docs configured for indexing")
+
+    drive = get_drive_service()
+    if clean:
+        delete_all_chunks_for_campaign()
+
+    total_chunks = 0
+    indexed_docs = 0
+    skipped_docs = 0
+    changed_docs = 0
+    for doc in docs:
+        if not doc.doc_id:
+            skipped_docs += 1
+            continue
+
+        doc_type = doc_type_for_indexing(doc)
+        raw = export_world_doc_for_indexing(drive, doc)
+
+        if doc.title == "Thread Tracker":
+            cleaned = raw.strip()
+            chunks = chunk_threads(cleaned)
+            if len(cleaned) < 50 or not chunks:
+                sync_world_doc_state(
+                    doc,
+                    doc_type=doc_type,
+                    raw_content=cleaned,
+                    chunk_count=0,
+                )
+                delete_chunks_for_doc(doc.doc_id)
+                skipped_docs += 1
+                continue
+        else:
+            cleaned = sanitize_for_rag(raw)
+            chunks = chunk_text(cleaned)
+            if not chunks:
+                sync_world_doc_state(
+                    doc,
+                    doc_type=doc_type,
+                    raw_content=cleaned,
+                    chunk_count=0,
+                )
+                delete_chunks_for_doc(doc.doc_id)
+                skipped_docs += 1
+                continue
+
+        embs = gemini_embed(chunks)
+        upsert_chunks(doc_id=doc.doc_id, doc_type=doc_type, chunks=chunks, embeddings=embs)
+        if sync_world_doc_state(
+            doc,
+            doc_type=doc_type,
+            raw_content=cleaned,
+            chunk_count=len(chunks),
+        ):
+            changed_docs += 1
+        total_chunks += len(chunks)
+        indexed_docs += 1
+
+    return {
+        "ok": True,
+        "indexed_docs": indexed_docs,
+        "indexed_chunks": total_chunks,
+        "skipped_docs": skipped_docs,
+        "changed_docs": changed_docs,
+        "clean": clean,
+    }
+
+
+def resolve_reindex_docs(targets: List[DocumentRef]) -> List[WorldDocInfo]:
+    docs: List[WorldDocInfo] = []
+    seen_doc_ids = set()
+
+    for target in targets:
+        found = drive_store_v2.find_doc(
+            folder=target.folder if target.folder else None,
+            title=target.title if target.title else None,
+            doc_id=target.doc_id,
+        )
+        if not found or not found.doc_id:
+            continue
+        if found.doc_id in seen_doc_ids:
+            continue
+        seen_doc_ids.add(found.doc_id)
+        docs.append(found)
+
+    return docs
+
+
+def reindex_after_apply_default(targets: List[DocumentRef]) -> Dict[str, Any]:
+    docs = resolve_reindex_docs(targets)
+    if not docs:
+        return {
+            "ok": True,
+            "indexed_docs": 0,
+            "indexed_chunks": 0,
+            "skipped_docs": 0,
+            "changed_docs": 0,
+            "clean": False,
+            "mode": "partial",
+        }
+    result = index_world_docs(docs, clean=False)
+    result["mode"] = "partial"
+    return result
 
 
 drive_store_v2 = build_drive_store()
+workflow_store_v2 = build_workflow_store()
 planner_v2 = PlannerService(generate_text_fn=planner_generate_json)
 consistency_planner_v2 = PlannerService(generate_text_fn=planner_generate_text)
 app.include_router(
@@ -580,6 +805,7 @@ app.include_router(
         reindex_fn=reindex_after_apply_default,
         indexed_chunks_fn=count_indexed_chunks,
         campaign_id=CAMPAIGN_ID,
+        workflow_store=workflow_store_v2,
     )
 )
 
@@ -610,51 +836,10 @@ def health():
 @app.post("/reindex")
 def reindex(body: ReindexRequest = ReindexRequest()):
     try:
-        require_env("BIBLE_DOC_ID", BIBLE_DOC_ID)
-        require_env("RULES_DOC_ID", RULES_DOC_ID)
-        require_env("GLOSSARY_DOC_ID", GLOSSARY_DOC_ID)
-        require_env("THREADS_DOC_ID", THREADS_DOC_ID)
-
-        drive = get_drive_service()
-        docs: List[Tuple[str, str]] = [
-            ("bible", BIBLE_DOC_ID),  # type: ignore[arg-type]
-            ("rules", RULES_DOC_ID),  # type: ignore[arg-type]
-            ("glossary", GLOSSARY_DOC_ID),  # type: ignore[arg-type]
-            ("threads", THREADS_DOC_ID),  # type: ignore[arg-type]
-        ]
-
-        total_chunks = 0
-        for doc_type, doc_id in docs:
-            if body.clean:
-                delete_chunks_for_doc(doc_id)
-
-            if doc_type == "threads":
-                # Prefer HTML export for tables. Fallback to plain text if HTML parse yields nothing.
-                raw_html = export_google_doc(drive, doc_id, "text/html")
-                raw = html_table_to_tsv(raw_html)
-                if not raw.strip():
-                    raw = export_google_doc(drive, doc_id, "text/plain")
-
-                # IMPORTANT: do not over-sanitize threads, keep row structure for quoting
-                cleaned = raw.strip()
-                chunks = chunk_threads(cleaned)
-
-                # Optional guard: avoid indexing empty/near-empty threads
-                if len(cleaned) < 50 or not chunks:
-                    continue
-            else:
-                raw = export_google_doc(drive, doc_id, "text/plain")
-                cleaned = sanitize_for_rag(raw)
-                chunks = chunk_text(cleaned)
-
-                if not chunks:
-                    continue
-
-            embs = gemini_embed(chunks)
-            upsert_chunks(doc_id=doc_id, doc_type=doc_type, chunks=chunks, embeddings=embs)
-            total_chunks += len(chunks)
-
-        return {"ok": True, "indexed_chunks": total_chunks, "clean": body.clean}
+        docs = drive_store_v2.list_world_docs()
+        result = index_world_docs(docs, clean=body.clean)
+        result["mode"] = "full"
+        return result
     except HTTPException:
         raise
     except Exception as e:

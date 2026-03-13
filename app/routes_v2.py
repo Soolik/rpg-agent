@@ -9,14 +9,21 @@ from .drive_store import DriveStore
 from .models_v2 import (
     ApplyChangesRequest,
     ApplyChangesResponse,
+    ApplyRunDetail,
+    ApplyRunRecord,
+    ChangeProposal,
     ConsistencyCheckRequest,
     ConsistencyCheckResponse,
+    DocumentRef,
+    ProposalDetail,
+    ProposalRecord,
     ProposeChangesRequest,
     ReadWorldDocRequest,
     ReadWorldDocResponse,
     WorldStatusResponse,
 )
 from .planner import PlannerService
+from .workflow_store import NullWorkflowStore, WorkflowStore
 
 
 CORE_DOC_TITLES = {"Campaign Bible", "Glossary", "Rules And Tone", "Thread Tracker"}
@@ -45,12 +52,14 @@ def build_context_for_planner(drive_store: DriveStore) -> str:
 def build_v2_router(
     drive_store: DriveStore,
     planner: PlannerService,
-    reindex_fn: Optional[Callable[[], Dict]] = None,
+    reindex_fn: Optional[Callable[[list[DocumentRef]], Dict]] = None,
     indexed_chunks_fn: Optional[Callable[[], Optional[int]]] = None,
     campaign_id: Optional[str] = None,
+    workflow_store: Optional[WorkflowStore | NullWorkflowStore] = None,
 ) -> APIRouter:
     router = APIRouter(tags=["world-v2"])
     applier = ProposalApplier(drive_store=drive_store, reindex_fn=reindex_fn)
+    store = workflow_store or NullWorkflowStore()
 
     @router.get("/world_status", response_model=WorldStatusResponse)
     def world_status() -> WorldStatusResponse:
@@ -74,6 +83,30 @@ def build_v2_router(
     def list_world_docs():
         return drive_store.list_world_docs()
 
+    @router.get("/proposals", response_model=list[ProposalRecord])
+    def list_proposals(limit: int = 20):
+        safe_limit = max(1, min(limit, 100))
+        return store.list_proposals(limit=safe_limit)
+
+    @router.get("/proposals/{proposal_id}", response_model=ProposalDetail)
+    def get_proposal(proposal_id: int):
+        proposal = store.get_proposal(proposal_id)
+        if not proposal:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+        return proposal
+
+    @router.get("/apply_runs", response_model=list[ApplyRunRecord])
+    def list_apply_runs(limit: int = 20):
+        safe_limit = max(1, min(limit, 100))
+        return store.list_apply_runs(limit=safe_limit)
+
+    @router.get("/apply_runs/{apply_run_id}", response_model=ApplyRunDetail)
+    def get_apply_run(apply_run_id: int):
+        apply_run = store.get_apply_run(apply_run_id)
+        if not apply_run:
+            raise HTTPException(status_code=404, detail="Apply run not found")
+        return apply_run
+
     @router.post("/read_world_doc", response_model=ReadWorldDocResponse)
     def read_world_doc(request: ReadWorldDocRequest) -> ReadWorldDocResponse:
         found = drive_store.find_doc(folder=request.folder, title=request.title, doc_id=request.doc_id)
@@ -87,11 +120,24 @@ def build_v2_router(
         docs = drive_store.list_world_docs()
         context = build_context_for_planner(drive_store)
         proposal = planner.propose(request=request, world_docs=docs, world_context=context)
+        proposal_id = store.save_proposal(request, proposal)
+        if proposal_id is not None:
+            proposal = ChangeProposal.model_validate(
+                {
+                    **proposal.model_dump(mode="json"),
+                    "proposal_id": proposal_id,
+                }
+            )
         return proposal
 
     @router.post("/apply_changes", response_model=ApplyChangesResponse)
     def apply_changes(request: ApplyChangesRequest) -> ApplyChangesResponse:
-        return applier.apply(request)
+        proposal_id = request.proposal_id or request.proposal.proposal_id
+        response = applier.apply(request)
+        response.proposal_id = proposal_id
+        apply_run_id = store.save_apply_run(request, response)
+        response.apply_run_id = apply_run_id
+        return response
 
     @router.post("/consistency_check", response_model=ConsistencyCheckResponse)
     def consistency_check(request: ConsistencyCheckRequest) -> ConsistencyCheckResponse:

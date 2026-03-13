@@ -1,0 +1,16 @@
+.python_packages/
+.tmp/
+.venv/
+.venv313/
+__pycache__/
+app/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.env
+_norton_/

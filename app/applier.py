@@ -13,7 +13,7 @@ from .models_v2 import (
 
 
 class ProposalApplier:
-    def __init__(self, drive_store: DriveStore, reindex_fn: Optional[Callable[[], Dict]] = None):
+    def __init__(self, drive_store: DriveStore, reindex_fn: Optional[Callable[[List[DocumentRef]], Dict]] = None):
         self.drive_store = drive_store
         self.reindex_fn = reindex_fn
 
@@ -22,6 +22,7 @@ class ProposalApplier:
             return ApplyChangesResponse(ok=False, summary="Changes were not approved.", results=[])
 
         results: List[AppliedActionResult] = []
+        reindex_targets: List[DocumentRef] = []
 
         for action in request.proposal.actions:
             try:
@@ -42,6 +43,9 @@ class ProposalApplier:
                         message="Document created",
                         target=DocumentRef(folder=created.folder, title=created.title, doc_id=created.doc_id, path_hint=created.path_hint),
                     ))
+                    reindex_targets.append(
+                        DocumentRef(folder=created.folder, title=created.title, doc_id=created.doc_id, path_hint=created.path_hint)
+                    )
 
                 elif action.action_type == ActionType.append_doc:
                     if not target:
@@ -53,6 +57,7 @@ class ProposalApplier:
                         message="Content appended",
                         target=target,
                     ))
+                    reindex_targets.append(target)
 
                 elif action.action_type == ActionType.replace_doc:
                     if not target:
@@ -64,6 +69,7 @@ class ProposalApplier:
                         message="Document replaced",
                         target=target,
                     ))
+                    reindex_targets.append(target)
 
                 elif action.action_type == ActionType.replace_section:
                     if not target:
@@ -77,6 +83,7 @@ class ProposalApplier:
                         message=f"Section '{action.section}' replaced",
                         target=target,
                     ))
+                    reindex_targets.append(target)
 
                 elif action.action_type in {ActionType.create_if_missing, ActionType.update_tracker_row, ActionType.reindex}:
                     results.append(AppliedActionResult(
@@ -100,7 +107,7 @@ class ProposalApplier:
         reindex_result = None
         if request.reindex_after_apply and self.reindex_fn:
             try:
-                reindex_result = self.reindex_fn()
+                reindex_result = self.reindex_fn(reindex_targets)
             except Exception as exc:
                 reindex_result = {"ok": False, "error": str(exc)}
 

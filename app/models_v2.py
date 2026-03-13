@@ -48,6 +48,7 @@ class DocumentAction(BaseModel):
 
 
 class ChangeProposal(BaseModel):
+    proposal_id: Optional[int] = None
     summary: str
     user_goal: str
     assumptions: List[str] = Field(default_factory=list)
@@ -64,6 +65,7 @@ class ProposeChangesRequest(BaseModel):
 
 
 class ApplyChangesRequest(BaseModel):
+    proposal_id: Optional[int] = None
     proposal: ChangeProposal
     approved: bool = True
     approved_by: Optional[str] = None
@@ -79,6 +81,8 @@ class AppliedActionResult(BaseModel):
 
 
 class ApplyChangesResponse(BaseModel):
+    proposal_id: Optional[int] = None
+    apply_run_id: Optional[int] = None
     ok: bool
     summary: str
     results: List[AppliedActionResult] = Field(default_factory=list)
@@ -99,6 +103,37 @@ class WorldStatusResponse(BaseModel):
     docs: List[WorldDocInfo] = Field(default_factory=list)
     indexed_chunks: Optional[int] = None
     notes: List[str] = Field(default_factory=list)
+
+
+class ProposalRecord(BaseModel):
+    id: int
+    campaign_id: str
+    summary: str
+    user_goal: str
+    approved: bool
+    approved_by: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class ProposalDetail(ProposalRecord):
+    request: Dict[str, Any] = Field(default_factory=dict)
+    proposal: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ApplyRunRecord(BaseModel):
+    id: int
+    campaign_id: str
+    proposal_id: Optional[int] = None
+    approved: bool
+    approved_by: Optional[str] = None
+    ok: bool
+    created_at: str
+
+
+class ApplyRunDetail(ApplyRunRecord):
+    request: Dict[str, Any] = Field(default_factory=dict)
+    response: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ReadWorldDocRequest(BaseModel):

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import os
+import re
 from dataclasses import dataclass
-from html import unescape
 from typing import Dict, List, Optional
 
 import google.auth
@@ -12,6 +11,60 @@ from .models_v2 import DocumentRef, WorldDocInfo, WorldEntityType
 
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+
+
+def normalize_section_name(section: str) -> str:
+    return re.sub(r"\s+", " ", section.strip().strip("# ")).strip().lower()
+
+
+def replace_section_content(document_text: str, section: str, content: str) -> str:
+    normalized = normalize_section_name(section)
+    cleaned_content = content.strip()
+    original_lines = document_text.splitlines()
+    had_trailing_newline = document_text.endswith("\n")
+
+    start_idx = None
+    start_level = None
+    heading_line = None
+
+    for idx, line in enumerate(original_lines):
+        match = HEADING_RE.match(line.strip())
+        if not match:
+            continue
+        level = len(match.group(1))
+        title = normalize_section_name(match.group(2))
+        if title == normalized:
+            start_idx = idx
+            start_level = level
+            heading_line = line.strip()
+            break
+
+    replacement_lines = [f"## {section.strip().strip('# ').strip()}"] if heading_line is None else [heading_line]
+    replacement_lines.append("")
+    if cleaned_content:
+        replacement_lines.extend(cleaned_content.splitlines())
+
+    if start_idx is None:
+        base = document_text.rstrip()
+        suffix = "\n\n" if base else ""
+        result = base + suffix + "\n".join(replacement_lines)
+        return result + "\n"
+
+    end_idx = len(original_lines)
+    for idx in range(start_idx + 1, len(original_lines)):
+        match = HEADING_RE.match(original_lines[idx].strip())
+        if match and len(match.group(1)) <= start_level:
+            end_idx = idx
+            break
+
+    updated_lines = original_lines[:start_idx] + replacement_lines + original_lines[end_idx:]
+    result = "\n".join(updated_lines).rstrip()
+    if had_trailing_newline or result:
+        result += "\n"
+    return result
 
 
 @dataclass
@@ -238,10 +291,9 @@ class DriveStore:
             docs.documents().batchUpdate(documentId=doc_ref.doc_id, body={"requests": requests}).execute()
 
     def replace_section(self, doc_ref: DocumentRef, section: str, content: str) -> None:
-        # Safe MVP: append a clearly marked section update instead of brittle in-place surgery.
-        normalized = section.strip().strip("# ")
-        block = f"\n\n## {normalized}\n\n{content.strip()}\n"
-        self.append_doc(doc_ref, block)
+        current = self.read_doc(doc_ref)
+        updated = replace_section_content(current, section, content)
+        self.replace_doc(doc_ref, updated)
 
     def find_doc(self, *, folder: Optional[str] = None, title: Optional[str] = None, doc_id: Optional[str] = None) -> Optional[WorldDocInfo]:
         docs = self.list_world_docs()
