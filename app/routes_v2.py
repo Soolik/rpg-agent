@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Optional
 
 from fastapi import APIRouter, HTTPException
 
@@ -19,21 +19,35 @@ from .models_v2 import (
 from .planner import PlannerService
 
 
+CORE_DOC_TITLES = {"Campaign Bible", "Glossary", "Rules And Tone", "Thread Tracker"}
+
+
 def build_context_for_planner(drive_store: DriveStore) -> str:
-    """
-    Placeholder. In production this should read the highest-value documents:
-    Campaign Bible, Glossary, Rules And Tone, Thread Tracker and a slice of important entity docs.
-    """
     docs = drive_store.list_world_docs()
     if not docs:
         return "No world docs available yet."
-    return "\n".join(f"- {doc.folder}/{doc.title}" for doc in docs[:200])
+
+    chunks = []
+    for doc in docs[:50]:
+        line = f"## DOC: {doc.folder}/{doc.title}"
+        if doc.title in CORE_DOC_TITLES and doc.doc_id:
+            try:
+                text = drive_store.read_doc(doc)
+                text = (text or "").strip()[:4000]
+                chunks.append(f"{line}\n{text}")
+                continue
+            except Exception:
+                pass
+        chunks.append(line)
+    return "\n\n".join(chunks)
 
 
 def build_v2_router(
     drive_store: DriveStore,
     planner: PlannerService,
     reindex_fn: Optional[Callable[[], Dict]] = None,
+    indexed_chunks_fn: Optional[Callable[[], Optional[int]]] = None,
+    campaign_id: Optional[str] = None,
 ) -> APIRouter:
     router = APIRouter(tags=["world-v2"])
     applier = ProposalApplier(drive_store=drive_store, reindex_fn=reindex_fn)
@@ -44,12 +58,15 @@ def build_v2_router(
         folders: Dict[str, int] = {}
         for doc in docs:
             folders[doc.folder] = folders.get(doc.folder, 0) + 1
+        indexed_chunks = indexed_chunks_fn() if indexed_chunks_fn else None
         return WorldStatusResponse(
+            campaign_id=campaign_id,
             folders=folders,
             docs=docs,
+            indexed_chunks=indexed_chunks,
             notes=[
-                "This response comes from DriveStore.list_world_docs().",
-                "Replace DriveStore stub with real Google Drive traversal.",
+                "Docs come from Google Drive / Docs through DriveStore.",
+                "replace_section currently appends a marked section block in MVP mode.",
             ],
         )
 

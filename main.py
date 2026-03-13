@@ -15,6 +15,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
+
+from app.drive_store import DriveStore
+from app.planner import PlannerService
+from app.routes_v2 import build_v2_router
 from googleapiclient.discovery import build
 from pgvector.psycopg import register_vector
 from pydantic import BaseModel, Field, ValidationError
@@ -38,6 +42,25 @@ GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-2.5-pro")
 
 # Debug/visibility
 REVISION = os.getenv("K_REVISION", "unknown")
+
+WORLD_FOLDER_ENV_MAP = {
+    "00 Admin": os.getenv("ADMIN_FOLDER_ID", ""),
+    "01 Bible": os.getenv("BIBLE_FOLDER_ID", ""),
+    "02 Sessions": os.getenv("SESSIONS_FOLDER_ID", ""),
+    "03 NPC": os.getenv("NPC_FOLDER_ID", ""),
+    "04 Locations": os.getenv("LOCATIONS_FOLDER_ID", ""),
+    "05 Factions": os.getenv("FACTIONS_FOLDER_ID", ""),
+    "06 Threads": os.getenv("THREADS_FOLDER_ID", ""),
+    "07 Secrets": os.getenv("SECRETS_FOLDER_ID", ""),
+    "08 Outputs": os.getenv("OUTPUTS_FOLDER_ID", ""),
+}
+
+CORE_WORLD_DOC_MAP = {
+    "Campaign Bible": BIBLE_DOC_ID or "",
+    "Rules And Tone": RULES_DOC_ID or "",
+    "Glossary": GLOSSARY_DOC_ID or "",
+    "Thread Tracker": THREADS_DOC_ID or "",
+}
 
 # -------------------------
 # Models (API)
@@ -506,6 +529,59 @@ def debug_github_auth():
         return f"OK token_len={len(token)} repo={data.get('full_name')} default_branch={data.get('default_branch')}\n"
     except Exception as e:
         return f"ERR {type(e).__name__}: {e}\n"
+
+
+def count_indexed_chunks() -> Optional[int]:
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("select count(*) from chunks where campaign_id = %s", (CAMPAIGN_ID,))
+                row = cur.fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return None
+
+
+def planner_generate_json(prompt: str) -> str:
+    return gemini_generate(
+        prompt,
+        response_mime_type="application/json",
+        temperature=0.2,
+        max_output_tokens=3000,
+    ).strip()
+
+
+def planner_generate_text(prompt: str) -> str:
+    return gemini_generate(
+        prompt,
+        response_mime_type="text/plain",
+        temperature=0.3,
+        max_output_tokens=2000,
+    ).strip()
+
+
+def build_drive_store() -> DriveStore:
+    folder_map = {k: v for k, v in WORLD_FOLDER_ENV_MAP.items() if v}
+    core_doc_map = {k: v for k, v in CORE_WORLD_DOC_MAP.items() if v}
+    return DriveStore(folder_map=folder_map, core_doc_map=core_doc_map)
+
+
+def reindex_after_apply_default() -> Dict[str, Any]:
+    return reindex(ReindexRequest(clean=False))
+
+
+drive_store_v2 = build_drive_store()
+planner_v2 = PlannerService(generate_text_fn=planner_generate_json)
+consistency_planner_v2 = PlannerService(generate_text_fn=planner_generate_text)
+app.include_router(
+    build_v2_router(
+        drive_store=drive_store_v2,
+        planner=planner_v2,
+        reindex_fn=reindex_after_apply_default,
+        indexed_chunks_fn=count_indexed_chunks,
+        campaign_id=CAMPAIGN_ID,
+    )
+)
 
 
 # -------------------------
