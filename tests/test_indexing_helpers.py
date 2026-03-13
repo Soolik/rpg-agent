@@ -63,6 +63,33 @@ class IndexingHelpersTest(unittest.TestCase):
         self.assertEqual(len(docs), 1)
         self.assertEqual(docs[0].doc_id, "doc-1")
 
+    def test_build_campaign_context_includes_doc_metadata(self):
+        context = main.build_campaign_context(
+            [
+                {
+                    "doc_type": "bible",
+                    "doc_id": "doc-1",
+                    "chunk_id": "chunk-1",
+                    "chunk_text": "## Test Automation\n\nTen wpis potwierdza dzialanie.",
+                    "distance": 0.1,
+                    "title": "Campaign Bible",
+                    "folder": "01 Bible",
+                    "path_hint": "01 Bible/Campaign Bible",
+                }
+            ]
+        )
+
+        self.assertIn("title=Campaign Bible", context)
+        self.assertIn("folder=01 Bible", context)
+        self.assertIn("## Test Automation", context)
+
+    def test_ctx_slice_keeps_tail_for_long_chunks(self):
+        text = ("a" * 1200) + "## Test Automation\nNowa tresc" + ("b" * 1200)
+        sliced = main.ctx_slice({"doc_type": "bible", "chunk_text": text})
+
+        self.assertIn("## Test Automation", sliced)
+        self.assertIn("...\n", sliced)
+
 
 if __name__ == "__main__":
     unittest.main()

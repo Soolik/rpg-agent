@@ -75,7 +75,7 @@ def build_v2_router(
             indexed_chunks=indexed_chunks,
             notes=[
                 "Docs come from Google Drive / Docs through DriveStore.",
-                "replace_section currently appends a marked section block in MVP mode.",
+                "replace_section updates an existing section body or appends it if missing.",
             ],
         )
 

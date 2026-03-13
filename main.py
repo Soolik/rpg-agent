@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
-from app.drive_store import DriveStore
+from app.drive_store import DriveStore, decode_google_export_text
 from app.models_v2 import DocumentRef, WorldDocInfo
 from app.planner import PlannerService
 from app.routes_v2 import build_v2_router
@@ -315,12 +315,12 @@ def get_drive_service():
 
 def export_google_doc_as_text(drive, doc_id: str) -> str:
     data = drive.files().export(fileId=doc_id, mimeType="text/plain").execute()
-    return data.decode("utf-8", errors="ignore")
+    return decode_google_export_text(data)
 
 
 def export_google_doc(drive, doc_id: str, mime_type: str) -> str:
     data = drive.files().export(fileId=doc_id, mimeType=mime_type).execute()
-    return data.decode("utf-8", errors="ignore")
+    return decode_google_export_text(data)
 
 
 def db_conn():
@@ -429,7 +429,7 @@ def sync_world_doc_state(
     return not exists
 
 
-def upsert_chunks(doc_id: str, doc_type: str, chunks: List[str], embeddings: List[List[float]]):
+def upsert_chunks(doc: WorldDocInfo, doc_type: str, chunks: List[str], embeddings: List[List[float]]):
     """
     Insert-only (tak jak wcześniej). Dla MVP OK.
     Przy reindex warto używać clean=true.
@@ -439,7 +439,7 @@ def upsert_chunks(doc_id: str, doc_type: str, chunks: List[str], embeddings: Lis
         with conn.cursor() as cur:
             cur.execute(
                 "delete from chunks where campaign_id = %s and doc_id = %s",
-                (CAMPAIGN_ID, doc_id),
+                (CAMPAIGN_ID, doc.doc_id),
             )
             for t, emb in zip(chunks, embeddings):
                 cid = str(uuid.uuid4())
@@ -451,11 +451,18 @@ def upsert_chunks(doc_id: str, doc_type: str, chunks: List[str], embeddings: Lis
                     (
                         cid,
                         CAMPAIGN_ID,
-                        doc_id,
+                        doc.doc_id,
                         doc_type,
                         t,
                         emb,
-                        json.dumps({"source": doc_type}),
+                        json.dumps(
+                            {
+                                "source": doc_type,
+                                "title": doc.title,
+                                "folder": doc.folder,
+                                "path_hint": doc.path_hint,
+                            }
+                        ),
                         now,
                     ),
                 )
@@ -468,18 +475,38 @@ def vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                select id, doc_id, doc_type, chunk_text, (embedding <-> %s::vector) as distance
-                from chunks
-                where campaign_id = %s
-                order by embedding <-> %s::vector
+                select
+                    c.id,
+                    c.doc_id,
+                    c.doc_type,
+                    c.chunk_text,
+                    (c.embedding <-> %s::vector) as distance,
+                    coalesce(wd.title, c.metadata->>'title', '') as title,
+                    coalesce(wd.folder, c.metadata->>'folder', '') as folder,
+                    coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', '') as path_hint
+                from chunks c
+                left join world_docs wd
+                    on wd.campaign_id = c.campaign_id
+                   and wd.doc_id = c.doc_id
+                where c.campaign_id = %s
+                order by c.embedding <-> %s::vector
                 limit %s
                 """,
                 (q_emb, CAMPAIGN_ID, q_emb, top_k),
             )
             rows = cur.fetchall()
     return [
-        {"chunk_id": cid, "doc_id": d, "doc_type": t, "chunk_text": c, "distance": float(dist)}
-        for (cid, d, t, c, dist) in rows
+        {
+            "chunk_id": cid,
+            "doc_id": d,
+            "doc_type": t,
+            "chunk_text": c,
+            "distance": float(dist),
+            "title": title,
+            "folder": folder,
+            "path_hint": path_hint,
+        }
+        for (cid, d, t, c, dist, title, folder, path_hint) in rows
     ]
 
 
@@ -577,6 +604,66 @@ PYTANIE:
 {question}
 
 ODPOWIEDŹ:
+""".strip()
+
+
+def ctx_slice(h: Dict[str, Any]) -> str:
+    doc_type = h.get("doc_type", "")
+    text = h.get("chunk_text", "") or ""
+    if not text:
+        return ""
+
+    limit = 2400 if doc_type == "threads" else 1800
+    if len(text) <= limit:
+        return text
+
+    head = text[:900].rstrip()
+    tail = text[-900:].lstrip()
+    return f"{head}\n...\n{tail}"
+
+
+def build_campaign_context(hits: List[Dict[str, Any]]) -> str:
+    blocks: List[str] = []
+    for idx, hit in enumerate(hits, start=1):
+        title = hit.get("title") or "unknown"
+        folder = hit.get("folder") or "unknown"
+        doc_type = hit.get("doc_type") or "other"
+        path_hint = hit.get("path_hint") or ""
+        label = f"[{idx}] title={title} | folder={folder} | doc_type={doc_type}"
+        if path_hint:
+            label += f" | path={path_hint}"
+        blocks.append(f"{label}\n{ctx_slice(hit)}")
+    return "\n\n".join(blocks)
+
+
+def build_campaign_prompt(question: str, context: str) -> str:
+    return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Odpowiadasz po polsku.
+
+ZASADY:
+1) Uzywaj wylacznie faktow z KONTEKSTU.
+2) Jesli odpowiedz jest w kontekscie, podaj ja wprost i mozliwie doslownie.
+3) Szczegolnie zwracaj uwage na zgodnosc pytania z title, folder i trescia chunku.
+4) Jesli czegos nie ma w kontekscie, zwroc JSON z format="bullets" i bullets=["brak w notatkach"].
+5) Nie dopowiadaj, nie spekuluj i nie lacz faktow spoza kontekstu.
+6) W used_context podaj numery blokow, z ktorych skorzystales.
+7) Zwracaj wylacznie JSON. Bez markdown i bez tekstu dookola.
+
+Dozwolony JSON:
+{{
+  "format": "bullets" | "table",
+  "bullets": ["..."],
+  "table": {{"columns": ["..."], "rows": [["..."]]}}},
+  "used_context": [1,2,3]
+}}
+
+KONTEKST (kazdy blok zawiera title, folder, doc_type i tresc chunku):
+{context}
+
+PYTANIE:
+{question}
+
+ODPOWIEDZ (tylko JSON):
 """.strip()
 
 
@@ -736,7 +823,7 @@ def index_world_docs(docs: List[WorldDocInfo], *, clean: bool = False) -> Dict[s
                 continue
 
         embs = gemini_embed(chunks)
-        upsert_chunks(doc_id=doc.doc_id, doc_type=doc_type, chunks=chunks, embeddings=embs)
+        upsert_chunks(doc=doc, doc_type=doc_type, chunks=chunks, embeddings=embs)
         if sync_world_doc_state(
             doc,
             doc_type=doc_type,
@@ -848,8 +935,14 @@ def reindex(body: ReindexRequest = ReindexRequest()):
 def ctx_slice(h: Dict[str, Any]) -> str:
     doc_type = h.get("doc_type", "")
     text = h.get("chunk_text", "") or ""
-    limit = 2400 if doc_type == "threads" else 900
-    return text[:limit]
+    if not text:
+        return ""
+    limit = 2400 if doc_type == "threads" else 1800
+    if len(text) <= limit:
+        return text
+    head = text[:900].rstrip()
+    tail = text[-900:].lstrip()
+    return f"{head}\n...\n{tail}"
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
@@ -868,7 +961,7 @@ def ask(req: AskRequest):
             return AskResponse(answer=answer, sources=[])
 
         hits = vector_search(q, req.top_k)
-        context = "\n\n".join([f"[{i+1}] ({h['doc_type']}) {ctx_slice(h)}" for i, h in enumerate(hits)])
+        context = build_campaign_context(hits)
         prompt = build_campaign_prompt(q, context)
 
         raw = gemini_generate(
@@ -911,6 +1004,9 @@ POPRAWNY OUTPUT (tylko JSON):
                     "doc_id": h["doc_id"],
                     "chunk_id": h["chunk_id"],
                     "distance": h["distance"],
+                    "title": h.get("title"),
+                    "folder": h.get("folder"),
+                    "path_hint": h.get("path_hint"),
                 }
                 for h in hits
             ]

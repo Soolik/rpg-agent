@@ -1,10 +1,17 @@
 import unittest
 
-from app.drive_store import DriveStore, replace_section_content
+from app.drive_store import DriveStore, decode_google_export_text, replace_section_content
 from app.models_v2 import WorldEntityType
 
 
 class DriveStoreSectionReplaceTest(unittest.TestCase):
+    def test_decode_google_export_text_strips_bom_and_normalizes_newlines(self):
+        raw = b"\xef\xbb\xbfLine 1\r\nLine 2\rLine 3"
+
+        decoded = decode_google_export_text(raw)
+
+        self.assertEqual(decoded, "Line 1\nLine 2\nLine 3")
+
     def test_replace_existing_section_body(self):
         original = (
             "# NPC\n\n"

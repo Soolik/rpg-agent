@@ -16,6 +16,12 @@ GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 
 
+def decode_google_export_text(data: bytes) -> str:
+    text = data.decode("utf-8-sig", errors="ignore")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text.lstrip("\ufeff")
+
+
 def normalize_section_name(section: str) -> str:
     return re.sub(r"\s+", " ", section.strip().strip("# ")).strip().lower()
 
@@ -104,7 +110,7 @@ class DriveStore:
     def _export_plain_text(self, file_id: str) -> str:
         drive = self._drive()
         data = drive.files().export(fileId=file_id, mimeType="text/plain").execute()
-        return data.decode("utf-8", errors="ignore")
+        return decode_google_export_text(data)
 
     def _folder_query_docs(self, folder_id: str) -> List[WorldDocInfo]:
         drive = self._drive()
