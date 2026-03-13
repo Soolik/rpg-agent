@@ -19,6 +19,7 @@ class PlannerServicePromptTest(unittest.TestCase):
         self.assertIn("Never invent folder names such as \"03 NPCs\"", prompt)
         self.assertIn("03 NPC", prompt)
         self.assertIn("Captain Mira", prompt)
+        self.assertIn("canonical folder list is fixed and authoritative", prompt)
 
     def test_propose_recovers_json_from_markdown_fence(self):
         planner = PlannerService(

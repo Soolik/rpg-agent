@@ -220,22 +220,17 @@ class DriveStore:
     def create_doc(self, folder: str, title: str, content: str, entity_type: WorldEntityType = WorldEntityType.other) -> WorldDocInfo:
         drive = self._drive()
         docs = self._docs()
-
-        created = docs.documents().create(body={"title": title}).execute()
-        doc_id = created["documentId"]
-
-        # optional move to target folder
         folder_id = self.folder_map.get(folder)
+        body = {"name": title, "mimeType": GOOGLE_DOC_MIME}
         if folder_id:
-            meta = drive.files().get(fileId=doc_id, fields="parents", supportsAllDrives=True).execute()
-            prev_parents = ",".join(meta.get("parents", []))
-            drive.files().update(
-                fileId=doc_id,
-                addParents=folder_id,
-                removeParents=prev_parents,
-                fields="id, parents",
-                supportsAllDrives=True,
-            ).execute()
+            body["parents"] = [folder_id]
+
+        created = drive.files().create(
+            body=body,
+            fields="id, name, parents",
+            supportsAllDrives=True,
+        ).execute()
+        doc_id = created["id"]
 
         if content.strip():
             docs.documents().batchUpdate(
