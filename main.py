@@ -83,8 +83,16 @@ CORE_WORLD_DOC_MAP = {
 # -------------------------
 
 AskMode = Literal["auto", "campaign", "general", "scene"]
-ChatIntent = Literal["auto", "answer", "proposal", "session_sync"]
-ArtifactType = Literal["gm_brief", "session_report", "player_summary"]
+ChatIntent = Literal["auto", "answer", "proposal", "session_sync", "creative"]
+ArtifactType = Literal[
+    "gm_brief",
+    "session_report",
+    "player_summary",
+    "session_hooks",
+    "scene_seed",
+    "npc_brief",
+    "twist_pack",
+]
 
 
 class AskRequest(BaseModel):
@@ -110,7 +118,7 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    kind: Literal["answer", "proposal", "session_sync"]
+    kind: Literal["answer", "proposal", "session_sync", "creative"]
     reply: str
     artifact_type: Optional[ArtifactType] = None
     artifact_text: Optional[str] = None
@@ -656,9 +664,32 @@ ODPOWIEDŹ:
 """.strip()
 
 
-def detect_chat_intent(message: str) -> Literal["answer", "proposal", "session_sync"]:
+def detect_chat_intent(message: str) -> Literal["answer", "proposal", "session_sync", "creative"]:
     text = (message or "").strip()
     lowered = text.lower()
+
+    creative_markers = [
+        "wymysl ",
+        "wymyśl ",
+        "pomysl ",
+        "pomysł ",
+        "zaproponuj ",
+        "daj 3 pomysly",
+        "daj 3 pomysły",
+        "hook",
+        "hooki",
+        "twist",
+        "twisty",
+        "seed",
+        "scene seed",
+        "nowego npc",
+        "nowy npc",
+        "stworz npc",
+        "stwórz npc",
+        "npc brief",
+    ]
+    if any(marker in lowered for marker in creative_markers):
+        return "creative"
 
     proposal_markers = [
         "dodaj ",
@@ -702,6 +733,16 @@ def render_source_labels(sources: List[Dict[str, Any]]) -> List[str]:
         seen.add(label)
         labels.append(label)
     return labels
+
+
+def is_creative_artifact_type(artifact_type: Optional[ArtifactType]) -> bool:
+    return artifact_type in {"session_hooks", "scene_seed", "npc_brief", "twist_pack"}
+
+
+def resolved_creative_artifact_type(artifact_type: Optional[ArtifactType]) -> ArtifactType:
+    if is_creative_artifact_type(artifact_type):
+        return artifact_type  # type: ignore[return-value]
+    return "session_hooks"
 
 
 def render_session_sync_reply(
@@ -751,6 +792,14 @@ def default_output_title(
         return f"Session Report - {stamp}"
     if artifact_type == "player_summary":
         return f"Player Summary - {stamp}"
+    if artifact_type == "session_hooks":
+        return f"Session Hooks - {stamp}"
+    if artifact_type == "scene_seed":
+        return f"Scene Seed - {stamp}"
+    if artifact_type == "npc_brief":
+        return f"NPC Brief - {stamp}"
+    if artifact_type == "twist_pack":
+        return f"Twist Pack - {stamp}"
     if kind == "answer":
         return f"Chat Answer - {stamp}"
     if kind == "proposal":
@@ -916,6 +965,51 @@ def render_gm_brief(
     return "\n".join(lines).strip()
 
 
+def suggest_doc_followups(patch: Optional[SessionPatch]) -> List[str]:
+    if not patch:
+        return []
+
+    followups: List[str] = []
+    seen = set()
+    folder_map = {
+        "npc": "03 NPC",
+        "location": "04 Locations",
+        "faction": "05 Factions",
+        "item": "00 Admin",
+        "other": "00 Admin",
+    }
+
+    for entity in patch.entities_patch:
+        folder = folder_map.get(entity.kind, "00 Admin")
+        item = f"Przejrzyj dokument {folder} / {entity.name}."
+        if item not in seen:
+            seen.add(item)
+            followups.append(item)
+
+    for thread in patch.thread_tracker_patch:
+        title = thread.thread_id or thread.title
+        item = f"Zweryfikuj wpis watku {title} w Thread Tracker."
+        if item not in seen:
+            seen.add(item)
+            followups.append(item)
+
+    return followups[:8]
+
+
+def suggest_next_session_prep(patch: Optional[SessionPatch]) -> List[str]:
+    if not patch:
+        return []
+
+    prep: List[str] = []
+    for thread in patch.thread_tracker_patch[:3]:
+        prep.append(f"Przygotuj scene pokazujaca konsekwencje watku {thread.title}.")
+    for entity in patch.entities_patch[:2]:
+        prep.append(f"Zdecyduj, jak {entity.name} zareaguje na nowe informacje.")
+    if patch.rag_additions:
+        prep.append("Sprawdz, czy nowe fakty sa juz odzwierciedlone w dokumentach swiata.")
+    return prep[:6]
+
+
 def render_session_report(
     *,
     message: str,
@@ -931,9 +1025,9 @@ def render_session_report(
         lines.extend(["## Session ID", str(session_id), ""])
 
     if patch:
-        lines.extend(["## Summary", patch.session_summary, ""])
+        lines.extend(["## Executive Summary", patch.session_summary, ""])
         if patch.entities_patch:
-            lines.append("## Entities")
+            lines.append("## World Changes")
             for entity in patch.entities_patch[:10]:
                 lines.append(f"- {entity.kind}: {entity.name} - {entity.description}")
             lines.append("")
@@ -946,6 +1040,18 @@ def render_session_report(
         if patch.rag_additions:
             lines.append("## Facts For Retrieval")
             for item in patch.rag_additions[:10]:
+                lines.append(f"- {item}")
+            lines.append("")
+        followups = suggest_doc_followups(patch)
+        if followups:
+            lines.append("## Suggested Document Follow-ups")
+            for item in followups:
+                lines.append(f"- {item}")
+            lines.append("")
+        prep = suggest_next_session_prep(patch)
+        if prep:
+            lines.append("## Prep For Next Session")
+            for item in prep:
                 lines.append(f"- {item}")
     else:
         lines.extend(["## Input Notes", message.strip(), "", "## Result", reply.strip()])
@@ -1004,6 +1110,136 @@ def build_chat_artifact(
         reply=reply,
         source_title=source_title,
     )
+
+
+def build_creative_artifact_sections(artifact_type: ArtifactType) -> str:
+    if artifact_type == "session_hooks":
+        return """
+Tytul:
+
+Hook 1:
+
+Hook 2:
+
+Hook 3:
+
+Stawki:
+
+Co przygotowac:
+""".strip()
+    if artifact_type == "scene_seed":
+        return """
+Tytul sceny:
+
+Cel sceny:
+
+Miejsce:
+
+Zaangazowane postacie:
+
+Przebieg:
+
+Komplikacja:
+
+Mozliwe skutki:
+""".strip()
+    if artifact_type == "npc_brief":
+        return """
+Imie:
+
+Rola w kampanii:
+
+Pierwsze wrazenie:
+
+Motywacja:
+
+Sekret:
+
+Relacje:
+
+Jak uzyc tej postaci na sesji:
+""".strip()
+    return """
+Twist 1:
+
+Twist 2:
+
+Twist 3:
+
+Foreshadowing:
+
+Ryzyko dla kampanii:
+""".strip()
+
+
+def build_creative_prompt(
+    *,
+    message: str,
+    artifact_type: ArtifactType,
+    world_context: str,
+    structured_context: str,
+) -> str:
+    format_instructions = build_creative_artifact_sections(artifact_type)
+    return f"""
+Jestes wspolautorem kampanii RPG "Krew Na Gwiazdach". Pisz po polsku.
+
+CEL:
+- Mozesz wymyslac nowe rzeczy.
+- Musza byc spojne z istniejacym swiatem, tonem kampanii i znanymi faktami.
+- Nie wolno przeczyc twardym faktom z kontekstu.
+- Jesli czegos nie ma w kontekscie, wolno Ci dopowiedziec tylko tyle, ile jest potrzebne do stworzenia uzytecznego materialu MG.
+
+ZASADY:
+1) Nie zwracaj JSON.
+2) Nie zwracaj code fence.
+3) Zwracaj tylko finalny artefakt tekstowy.
+4) Korzystaj z dokladnych nazw encji, watkow i miejsc, jesli sa znane.
+5) Zachowaj ton kampanii: smutne heroic fantasy, polityka, emocje, trudne wybory.
+
+AKTUALNY MODEL SWIATA:
+{structured_context}
+
+RELEWANTNY KONTEKST KAMPANII:
+{world_context}
+
+PROSBA UZYTKOWNIKA:
+{message}
+
+ZWROC DOKLADNIE TEN FORMAT:
+{format_instructions}
+""".strip()
+
+
+def generate_creative_artifact(
+    *,
+    message: str,
+    artifact_type: ArtifactType,
+) -> tuple[str, List[str]]:
+    structured_context = build_world_model_context(limit=30)
+    try:
+        hits = vector_search(message, 6)
+    except Exception:
+        hits = []
+    if hits:
+        world_context = build_campaign_context(hits)
+    else:
+        try:
+            world_context = build_context_for_planner(drive_store_v2)
+        except Exception:
+            world_context = "Brak dodatkowego kontekstu kampanii."
+    prompt = build_creative_prompt(
+        message=message,
+        artifact_type=artifact_type,
+        world_context=world_context,
+        structured_context=structured_context,
+    )
+    artifact_text = gemini_generate(
+        prompt,
+        response_mime_type="text/plain",
+        temperature=0.8,
+        max_output_tokens=2500,
+    ).strip()
+    return artifact_text, render_source_labels(hits)
 
 
 def ctx_slice(h: Dict[str, Any]) -> str:
@@ -1468,7 +1704,37 @@ def ask_text(req: AskRequest):
 def chat(req: ChatRequest):
     try:
         resolved_intent = req.intent if req.intent != "auto" else detect_chat_intent(req.message)
+        if is_creative_artifact_type(req.artifact_type):
+            resolved_intent = "creative"
         warnings: List[str] = []
+
+        if resolved_intent == "creative":
+            creative_artifact_type = resolved_creative_artifact_type(req.artifact_type)
+            artifact_text, references = generate_creative_artifact(
+                message=req.message,
+                artifact_type=creative_artifact_type,
+            )
+            output_doc = None
+            if req.save_output:
+                output_doc, warning = try_save_chat_output(
+                    kind="answer",
+                    content=artifact_text,
+                    requested_title=req.output_title,
+                    artifact_type=creative_artifact_type,
+                )
+                if warning:
+                    warnings.append(warning)
+            return ChatResponse(
+                kind="creative",
+                reply=artifact_text,
+                artifact_type=creative_artifact_type,
+                artifact_text=artifact_text,
+                references=references,
+                warnings=warnings,
+                output_doc_id=output_doc.doc_id if output_doc else None,
+                output_title=output_doc.title if output_doc else None,
+                output_path=output_doc.path_hint if output_doc else None,
+            )
 
         if resolved_intent == "answer":
             ask_response = ask(

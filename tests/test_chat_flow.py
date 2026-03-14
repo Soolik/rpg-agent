@@ -11,6 +11,12 @@ class ChatFlowTest(unittest.TestCase):
         )
         self.assertEqual(intent, "proposal")
 
+    def test_detect_chat_intent_recognizes_creative_request(self):
+        intent = main.detect_chat_intent(
+            "Wymysl 3 hooki na nastepna sesje zwiazane z Red Blade."
+        )
+        self.assertEqual(intent, "creative")
+
     def test_chat_answer_returns_human_text_with_sources(self):
         original_ask = main.ask
         try:
@@ -69,6 +75,51 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("# GM Brief", response.artifact_text)
         self.assertIn("## Sources", response.artifact_text)
         self.assertIn("01 Bible / Campaign Bible", response.artifact_text)
+
+    def test_chat_creative_returns_generated_artifact(self):
+        original_generate_creative_artifact = main.generate_creative_artifact
+        try:
+            main.generate_creative_artifact = lambda **kwargs: (
+                "Tytul:\nCienie Red Blade\n\nHook 1:\nKupiec znika tej samej nocy co poslaniec frakcji.",
+                ["01 Bible / Campaign Bible", "06 Threads / Thread Tracker"],
+            )
+
+            response = main.chat(
+                main.ChatRequest(
+                    message="Wymysl 3 hooki na nastepna sesje zwiazane z Red Blade.",
+                    artifact_type="session_hooks",
+                )
+            )
+        finally:
+            main.generate_creative_artifact = original_generate_creative_artifact
+
+        self.assertEqual(response.kind, "creative")
+        self.assertEqual(response.artifact_type, "session_hooks")
+        self.assertIn("Cienie Red Blade", response.reply)
+        self.assertEqual(response.references, ["01 Bible / Campaign Bible", "06 Threads / Thread Tracker"])
+
+    def test_chat_creative_defaults_to_session_hooks_when_artifact_not_given(self):
+        original_generate_creative_artifact = main.generate_creative_artifact
+        captured = {}
+
+        def fake_generate_creative_artifact(**kwargs):
+            captured.update(kwargs)
+            return "Tytul:\nCienie Red Blade", []
+
+        try:
+            main.generate_creative_artifact = fake_generate_creative_artifact
+
+            response = main.chat(
+                main.ChatRequest(
+                    message="Wymysl 3 hooki na nastepna sesje zwiazane z Red Blade.",
+                )
+            )
+        finally:
+            main.generate_creative_artifact = original_generate_creative_artifact
+
+        self.assertEqual(response.kind, "creative")
+        self.assertEqual(response.artifact_type, "session_hooks")
+        self.assertEqual(captured["artifact_type"], "session_hooks")
 
     def test_chat_answer_can_save_output_doc(self):
         original_ask = main.ask
@@ -356,9 +407,11 @@ class ChatFlowTest(unittest.TestCase):
 
         self.assertEqual(response.artifact_type, "session_report")
         self.assertIn("# Session Report", response.artifact_text)
-        self.assertIn("## Summary", response.artifact_text)
+        self.assertIn("## Executive Summary", response.artifact_text)
         self.assertIn("## Threads", response.artifact_text)
         self.assertIn("## Facts For Retrieval", response.artifact_text)
+        self.assertIn("## Suggested Document Follow-ups", response.artifact_text)
+        self.assertIn("## Prep For Next Session", response.artifact_text)
 
     def test_chat_proposal_returns_human_summary(self):
         original_drive_store = main.drive_store_v2
