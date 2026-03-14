@@ -110,6 +110,7 @@ class ChatResponse(BaseModel):
     proposal_id: Optional[int] = None
     session_id: Optional[int] = None
     references: List[str] = []
+    warnings: List[str] = []
     output_doc_id: Optional[str] = None
     output_title: Optional[str] = None
     output_path: Optional[str] = None
@@ -766,6 +767,27 @@ def save_chat_output(
     )
 
 
+def format_exception_message(error: Exception) -> str:
+    message = str(error).strip()
+    if message:
+        return message
+    return f"{type(error).__name__} without detail"
+
+
+def try_save_chat_output(
+    *,
+    kind: Literal["answer", "proposal", "session_sync"],
+    content: str,
+    requested_title: Optional[str] = None,
+) -> tuple[Optional[WorldDocInfo], Optional[str]]:
+    try:
+        return save_chat_output(kind=kind, content=content, requested_title=requested_title), None
+    except Exception as e:
+        detail = format_exception_message(e)
+        warning = f"Nie udalo sie zapisac outputu do Google Docs: {detail}"
+        return None, warning
+
+
 def ctx_slice(h: Dict[str, Any]) -> str:
     doc_type = h.get("doc_type", "")
     text = h.get("chunk_text", "") or ""
@@ -1228,6 +1250,7 @@ def ask_text(req: AskRequest):
 def chat(req: ChatRequest):
     try:
         resolved_intent = req.intent if req.intent != "auto" else detect_chat_intent(req.message)
+        warnings: List[str] = []
 
         if resolved_intent == "answer":
             ask_response = ask(
@@ -1241,11 +1264,20 @@ def chat(req: ChatRequest):
             reply = ask_response.answer.strip()
             if references:
                 reply = reply + "\n\nZrodla:\n" + "\n".join(f"- {label}" for label in references)
-            output_doc = save_chat_output(kind="answer", content=reply, requested_title=req.output_title) if req.save_output else None
+            output_doc = None
+            if req.save_output:
+                output_doc, warning = try_save_chat_output(
+                    kind="answer",
+                    content=reply,
+                    requested_title=req.output_title,
+                )
+                if warning:
+                    warnings.append(warning)
             return ChatResponse(
                 kind="answer",
                 reply=reply,
                 references=references,
+                warnings=warnings,
                 output_doc_id=output_doc.doc_id if output_doc else None,
                 output_title=output_doc.title if output_doc else None,
                 output_path=output_doc.path_hint if output_doc else None,
@@ -1263,11 +1295,20 @@ def chat(req: ChatRequest):
                 sync_response.sync,
                 source_title=req.source_title,
             )
-            output_doc = save_chat_output(kind="session_sync", content=reply, requested_title=req.output_title) if req.save_output else None
+            output_doc = None
+            if req.save_output:
+                output_doc, warning = try_save_chat_output(
+                    kind="session_sync",
+                    content=reply,
+                    requested_title=req.output_title,
+                )
+                if warning:
+                    warnings.append(warning)
             return ChatResponse(
                 kind="session_sync",
                 reply=reply,
                 session_id=sync_response.sync.session_id,
+                warnings=warnings,
                 output_doc_id=output_doc.doc_id if output_doc else None,
                 output_title=output_doc.title if output_doc else None,
                 output_path=output_doc.path_hint if output_doc else None,
@@ -1287,11 +1328,20 @@ def chat(req: ChatRequest):
             )
 
         reply = render_proposal_reply(proposal)
-        output_doc = save_chat_output(kind="proposal", content=reply, requested_title=req.output_title) if req.save_output else None
+        output_doc = None
+        if req.save_output:
+            output_doc, warning = try_save_chat_output(
+                kind="proposal",
+                content=reply,
+                requested_title=req.output_title,
+            )
+            if warning:
+                warnings.append(warning)
         return ChatResponse(
             kind="proposal",
             reply=reply,
             proposal_id=proposal.proposal_id,
+            warnings=warnings,
             output_doc_id=output_doc.doc_id if output_doc else None,
             output_title=output_doc.title if output_doc else None,
             output_path=output_doc.path_hint if output_doc else None,
@@ -1300,13 +1350,16 @@ def chat(req: ChatRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=format_exception_message(e))
 
 
 @app.post("/chat_text", response_class=PlainTextResponse)
 def chat_text(req: ChatRequest):
     response = chat(req)
-    return response.reply + "\n"
+    text = response.reply
+    if response.warnings:
+        text = text + "\n\nUwagi:\n" + "\n".join(f"- {warning}" for warning in response.warnings)
+    return text + "\n"
 
 
 def build_world_model_context(limit: int = 50) -> str:

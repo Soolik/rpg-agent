@@ -90,6 +90,39 @@ class ChatFlowTest(unittest.TestCase):
         self.assertEqual(fake_drive_store.created["title"], "Answer 01")
         self.assertEqual(fake_drive_store.created["content"], "Gotowy tekst.")
 
+    def test_chat_answer_returns_warning_when_output_save_fails(self):
+        original_ask = main.ask
+        original_drive_store = main.drive_store_v2
+
+        class FakeDriveStore:
+            def find_doc(self, folder=None, title=None, doc_id=None):
+                return None
+
+            def create_doc(self, folder, title, content, entity_type=None):
+                raise RuntimeError("storageQuotaExceeded")
+
+        try:
+            main.ask = lambda req: main.AskResponse(answer="Gotowy tekst.", sources=[])
+            main.drive_store_v2 = FakeDriveStore()
+
+            response = main.chat(
+                main.ChatRequest(
+                    message="Odpowiedz krotko na pytanie.",
+                    intent="answer",
+                    save_output=True,
+                    output_title="Answer 01",
+                )
+            )
+        finally:
+            main.ask = original_ask
+            main.drive_store_v2 = original_drive_store
+
+        self.assertEqual(response.kind, "answer")
+        self.assertEqual(response.reply, "Gotowy tekst.")
+        self.assertEqual(response.output_doc_id, None)
+        self.assertEqual(len(response.warnings), 1)
+        self.assertIn("storageQuotaExceeded", response.warnings[0])
+
     def test_chat_session_sync_returns_human_summary(self):
         original_sync = main.ingest_session_and_sync
         try:
