@@ -10,28 +10,37 @@ from .text_normalization import normalize_text_artifacts
 
 PROPER_NOUN_IGNORE_KEYS = {
     "active threads",
+    "campaign bible",
     "campaign state",
     "co przygotowac",
     "dmg",
+    "factions",
     "gm",
+    "glossary",
     "hook",
     "hooks",
     "imie",
     "jak uzyc tej postaci na sesji",
+    "key npcs",
     "key npcs and factions",
     "mg",
     "npc",
     "pierwsze wrazenie",
+    "prep",
     "prep checklist",
     "pre-session brief",
     "pre session brief",
+    "pressure points",
     "relacje",
     "risks and pressure points",
     "rola w kampanii",
+    "rules and tone",
     "scene opportunities",
     "sekret",
     "session",
     "stawki",
+    "thread tracker",
+    "threads",
     "tytul",
 }
 
@@ -129,8 +138,17 @@ def extract_proper_noun_candidates(text: str) -> List[str]:
         if looks_like_proper_noun_label(match):
             add_name(match)
 
+    for match in re.findall(
+        r"(?mi)^\s*(?:imie|tytul)\s*:\s*([^\n]{2,80})$",
+        normalize_text_artifacts(text or ""),
+    ):
+        if looks_like_proper_noun_label(match):
+            add_name(match)
+
     for phrase in extract_titlecase_phrases(text):
-        if " " in phrase or looks_like_proper_noun_label(phrase):
+        if " " not in phrase:
+            continue
+        if looks_like_proper_noun_label(phrase):
             add_name(phrase)
 
     return candidates
@@ -162,10 +180,21 @@ def build_continuity_report(
     known_keys = {normalize_key(name): name for name in known_names}
     request_names = _dedupe_names([*extract_titlecase_phrases(message), *(extra_allowed_names or [])])
     request_keys = {normalize_key(name): name for name in request_names}
-    output_names = _dedupe_names(extract_proper_noun_candidates(generated_text))
-
     source_backed: List[str] = []
     inferred: List[str] = []
+    normalized_text = normalize_key(generated_text)
+    for name in known_names:
+        key = normalize_key(name)
+        if key and key in normalized_text:
+            source_backed.append(name)
+    for name in request_names:
+        key = normalize_key(name)
+        if key and key not in known_keys and key in normalized_text:
+            inferred.append(name)
+    output_names = _dedupe_names(extract_proper_noun_candidates(generated_text))
+
+    source_backed = _dedupe_names(source_backed)
+    inferred = _dedupe_names(inferred)
     proposed_new: List[str] = []
     possible_conflicts: List[str] = []
     issues: List[ContinuityIssue] = []
