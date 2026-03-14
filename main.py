@@ -1301,9 +1301,79 @@ def artifact_required_markers(artifact_type: ArtifactType) -> List[str]:
     return []
 
 
+def artifact_style_guidance(artifact_type: ArtifactType) -> str:
+    if artifact_type == "pre_session_brief":
+        return (
+            "- Kazda sekcja ma byc zwiezla i praktyczna.\n"
+            "- Uzywaj 2-5 bulletow na sekcje, zamiast dlugich akapitow.\n"
+            '- W "Scene Opportunities" dawaj konkretne sceny do zagrania.\n'
+            '- W "Prep Checklist" dawaj konkretne rzeczy do przygotowania przez MG.'
+        )
+    if artifact_type == "session_hooks":
+        return (
+            "- Daj dokladnie trzy rozne hooki.\n"
+            "- Kazdy hook: 2-4 zdania.\n"
+            "- Sekcje 'Stawki' i 'Co przygotowac' wypelnij krotszymi bulletami."
+        )
+    if artifact_type == "scene_seed":
+        return "- Kazda sekcja ma byc krotka, konkretna i gotowa do uzycia na sesji."
+    if artifact_type == "npc_brief":
+        return (
+            "- Kazda sekcja ma byc konkretna i zwiezla.\n"
+            "- Nie pisz dlugich blokow tekstu; zwykle 2-4 zdania na sekcje.\n"
+            "- Sekcje 'Relacje' i 'Jak uzyc tej postaci na sesji' moga byc listami."
+        )
+    if artifact_type == "twist_pack":
+        return "- Kazdy twist ma byc odrebny, konkretny i opisany w 2-4 zdaniach."
+    return "- Pisz zwiezle i praktycznie."
+
+
 def missing_artifact_markers(text: str, artifact_type: ArtifactType) -> List[str]:
     lowered = (text or "").lower()
     return [marker for marker in artifact_required_markers(artifact_type) if marker.lower() not in lowered]
+
+
+def fill_missing_artifact_sections(
+    *,
+    artifact_type: ArtifactType,
+    partial_text: str,
+    repair_context: str,
+    missing_markers: List[str],
+) -> str:
+    if not missing_markers:
+        return ""
+
+    fill_prompt = f"""
+Uzupelnij brakujace sekcje artefaktu tekstowego. Zwracaj tylko brakujace sekcje.
+Nie zwracaj JSON. Nie zwracaj code fence. Wszystkie tresci maja byc po polsku.
+
+BRAKUJACE SEKCJE:
+{chr(10).join(f"- {marker}" for marker in missing_markers)}
+
+WYMAGANY FORMAT DLA TYCH SEKCJI:
+{chr(10).join(marker for marker in missing_markers)}
+
+ZASADY STYLU:
+{artifact_style_guidance(artifact_type)}
+
+ISTNIEJACY ARTEFAKT:
+{partial_text or '[empty]'}
+
+KONTEKST:
+{repair_context}
+
+ZWROC TYLKO BRAKUJACE SEKCJE:
+""".strip()
+
+    try:
+        return gemini_generate(
+            fill_prompt,
+            response_mime_type="text/plain",
+            temperature=0.4,
+            max_output_tokens=2000,
+        ).strip()
+    except Exception:
+        return ""
 
 
 def append_missing_artifact_sections(text: str, artifact_type: ArtifactType) -> str:
@@ -1361,6 +1431,16 @@ POPRAWIONY ARTEFAKT:
         repaired = ""
 
     candidate = repaired or cleaned
+    missing = missing_artifact_markers(candidate, artifact_type)
+    if missing:
+        filled_sections = fill_missing_artifact_sections(
+            artifact_type=artifact_type,
+            partial_text=candidate,
+            repair_context=repair_context,
+            missing_markers=missing,
+        )
+        if filled_sections:
+            candidate = "\n\n".join(part for part in [candidate.strip(), filled_sections.strip()] if part).strip()
     return append_missing_artifact_sections(candidate, artifact_type)
 
 
@@ -1389,6 +1469,10 @@ ZASADY:
 5) Zachowaj ton kampanii: smutne heroic fantasy, polityka, emocje, trudne wybory.
 6) Uzyj wszystkich wymaganych sekcji z formatu i nie pomijaj zadnej.
 7) Jesli format zawiera Hook 1/2/3 albo Twist 1/2/3, wypelnij wszystkie te sekcje.
+8) Pisz zwiezle i praktycznie. Unikaj jednego bardzo dlugiego akapitu kosztem pozostalych sekcji.
+
+WYTYCZNE STYLU:
+{artifact_style_guidance(artifact_type)}
 
 AKTUALNY MODEL SWIATA:
 {structured_context}
@@ -1427,6 +1511,10 @@ ZASADY:
 4) Uzywaj dokladnych nazw encji, watkow i dokumentow, jesli sa znane.
 5) W sekcjach "Scene Opportunities" i "Prep Checklist" dawaj konkretne, praktyczne propozycje MG.
 6) Wypelnij wszystkie sekcje z wymaganego formatu.
+7) Pisz zwiezle i praktycznie. Lepiej dac krotsze sekcje niz urwac artefakt po pierwszej.
+
+WYTYCZNE STYLU:
+{artifact_style_guidance("pre_session_brief")}
 
 AKTUALNY MODEL SWIATA:
 {structured_context}

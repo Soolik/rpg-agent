@@ -171,6 +171,36 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("Sekret:", shaped)
         self.assertIn("Jak uzyc tej postaci na sesji:", shaped)
 
+    def test_ensure_artifact_shape_uses_generated_missing_sections(self):
+        original_generate = main.gemini_generate
+        calls = {"count": 0}
+
+        def fake_generate(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return "Tytul: Cienie Red Blade\n\nHook 1:\nZaczepka na rynku."
+            return (
+                "Hook 2:\nPoslaniec Red Blade znika przed spotkaniem.\n\n"
+                "Hook 3:\nMira dostaje ultimatum od wlasnych ludzi.\n\n"
+                "Stawki:\n- Miasto traci zaufanie do Miry.\n\n"
+                "Co przygotowac:\n- Strażników portowych.\n- Plotki o Red Blade."
+            )
+
+        try:
+            main.gemini_generate = fake_generate
+            shaped = main.ensure_artifact_shape(
+                artifact_type="session_hooks",
+                text="Tytul: Cienie Red Blade\n\nHook 1:\nZaczepka na rynku.",
+                repair_context="Kontekst testowy.",
+            )
+        finally:
+            main.gemini_generate = original_generate
+
+        self.assertIn("Hook 2:\nPoslaniec Red Blade znika", shaped)
+        self.assertIn("Hook 3:\nMira dostaje ultimatum", shaped)
+        self.assertIn("Stawki:\n- Miasto traci zaufanie", shaped)
+        self.assertIn("Co przygotowac:\n- Strażników portowych.", shaped)
+
     def test_chat_answer_can_save_output_doc(self):
         original_ask = main.ask
         original_drive_store = main.drive_store_v2
@@ -498,7 +528,13 @@ class ChatFlowTest(unittest.TestCase):
             calls["count"] += 1
             if calls["count"] == 1:
                 return "# Pre-Session Brief\n\n## Campaign State\nNapiecie rosnie."
-            return ""
+            return (
+                "## Active Threads\n- T01 / Red Blade nabiera znaczenia.\n\n"
+                "## Key NPCs and Factions\n- Captain Mira.\n- Red Blade.\n\n"
+                "## Risks and Pressure Points\n- Wyciek informacji rozbije sojusze.\n\n"
+                "## Scene Opportunities\n- Przesluchanie poslańca Red Blade.\n\n"
+                "## Prep Checklist\n- Przygotuj konsekwencje polityczne."
+            )
 
         try:
             main.gemini_generate = fake_generate
@@ -526,6 +562,7 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("## Risks and Pressure Points", artifact_text)
         self.assertIn("## Scene Opportunities", artifact_text)
         self.assertIn("## Prep Checklist", artifact_text)
+        self.assertIn("T01 / Red Blade nabiera znaczenia.", artifact_text)
 
     def test_chat_proposal_returns_human_summary(self):
         original_drive_store = main.drive_store_v2
