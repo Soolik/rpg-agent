@@ -136,6 +136,39 @@ class WorldModelStoreTest(unittest.TestCase):
         self.assertEqual(status.thread_count, 5)
         self.assertEqual(status.session_count, 6)
 
+    def test_cleanup_duplicate_threads_deletes_shadow_thread_when_canonical_match_exists(self):
+        cursor = FakeCursor(fetchone_values=[])
+        cursor.fetchall_result = [
+            (2, "mira's allegiances", None, "Mira's Allegiances", "Updated", "Captain Mira revealed a secret contact with Red Blade."),
+            (1, "T01", "T01", "Red Blade", "active", "Captain Mira works with Red Blade."),
+        ]
+        connection = FakeConnection(cursor)
+        store = WorldModelStore(campaign_id="kng", connection_factory=lambda: connection)
+
+        response = store.cleanup_duplicate_threads(dry_run=False)
+
+        self.assertEqual(response.duplicate_thread_count, 1)
+        self.assertEqual(response.deleted_thread_ids, [2])
+        self.assertEqual(connection.commit_called, 1)
+        self.assertIn("delete from world_threads", cursor.statements[1][0].lower())
+        self.assertEqual(cursor.statements[1][1], ("kng", [2]))
+
+    def test_cleanup_duplicate_threads_dry_run_reports_without_deleting(self):
+        cursor = FakeCursor(fetchone_values=[])
+        cursor.fetchall_result = [
+            (2, "mira's allegiances", None, "Mira's Allegiances", "Updated", "Captain Mira revealed a secret contact with Red Blade."),
+            (1, "T01", "T01", "Red Blade", "active", "Captain Mira works with Red Blade."),
+        ]
+        connection = FakeConnection(cursor)
+        store = WorldModelStore(campaign_id="kng", connection_factory=lambda: connection)
+
+        response = store.cleanup_duplicate_threads(dry_run=True)
+
+        self.assertEqual(response.duplicate_thread_count, 1)
+        self.assertEqual(response.deleted_thread_ids, [2])
+        self.assertEqual(connection.commit_called, 0)
+        self.assertEqual(len(cursor.statements), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

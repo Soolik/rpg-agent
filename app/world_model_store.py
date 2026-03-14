@@ -9,6 +9,7 @@ from .models_v2 import (
     SessionPatchPayload,
     SyncSessionPatchRequest,
     SyncSessionPatchResponse,
+    WorldModelCleanupResponse,
     WorldEntityRecord,
     WorldModelStatusResponse,
     WorldSessionRecord,
@@ -18,6 +19,40 @@ from .models_v2 import (
 
 def normalize_key(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _best_canonical_thread_match(
+    duplicate_row: tuple[int, str, Optional[str], str, Optional[str], str],
+    canonical_rows: list[tuple[int, str, Optional[str], str, Optional[str], str]],
+) -> Optional[tuple[int, str, Optional[str], str, Optional[str], str]]:
+    _, _, _, duplicate_title, duplicate_status, duplicate_change = duplicate_row
+    duplicate_title_key = normalize_key(duplicate_title)
+    duplicate_haystack = normalize_key(" ".join(filter(None, [duplicate_title, duplicate_status, duplicate_change])))
+    best_match = None
+    best_score = 0
+
+    for candidate in canonical_rows:
+        _, _, candidate_thread_id, candidate_title, _, _ = candidate
+        candidate_title_key = normalize_key(candidate_title)
+        candidate_thread_id_key = normalize_key(candidate_thread_id or "")
+        score = 0
+
+        if duplicate_title_key and duplicate_title_key == candidate_title_key:
+            score += 3
+        if candidate_title_key and candidate_title_key in duplicate_haystack:
+            score += 2
+        if candidate_thread_id_key and candidate_thread_id_key in duplicate_haystack:
+            score += 2
+
+        if score > best_score:
+            best_match = candidate
+            best_score = score
+        elif score == best_score:
+            best_match = None
+
+    if best_score < 2:
+        return None
+    return best_match
 
 
 @dataclass
@@ -254,6 +289,54 @@ class WorldModelStore:
             for row in rows
         ]
 
+    def cleanup_duplicate_threads(self, dry_run: bool = True) -> WorldModelCleanupResponse:
+        with self.connection_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select id, thread_key, thread_id, title, status, last_change
+                    from world_threads
+                    where campaign_id = %s
+                    order by updated_at desc, id desc
+                    """,
+                    (self.campaign_id,),
+                )
+                rows = cur.fetchall()
+
+                canonical_rows = [row for row in rows if row[2]]
+                duplicate_ids: list[int] = []
+
+                for row in rows:
+                    if row[2]:
+                        continue
+                    if _best_canonical_thread_match(row, canonical_rows):
+                        duplicate_ids.append(int(row[0]))
+
+                if duplicate_ids and not dry_run:
+                    cur.execute(
+                        """
+                        delete from world_threads
+                        where campaign_id = %s and id = any(%s)
+                        """,
+                        (self.campaign_id, duplicate_ids),
+                    )
+            if duplicate_ids and not dry_run:
+                conn.commit()
+
+        summary = "World model cleanup completed"
+        if duplicate_ids:
+            summary = "Duplicate world threads identified"
+            if not dry_run:
+                summary = "Duplicate world threads deleted"
+
+        return WorldModelCleanupResponse(
+            campaign_id=self.campaign_id,
+            summary=summary,
+            dry_run=dry_run,
+            duplicate_thread_count=len(duplicate_ids),
+            deleted_thread_ids=duplicate_ids,
+        )
+
     def status(self) -> WorldModelStatusResponse:
         with self.connection_factory() as conn:
             with conn.cursor() as cur:
@@ -283,6 +366,9 @@ class NullWorldModelStore:
 
     def list_sessions(self, limit: int = 20) -> list[WorldSessionRecord]:
         return []
+
+    def cleanup_duplicate_threads(self, dry_run: bool = True) -> Optional[WorldModelCleanupResponse]:
+        return None
 
     def status(self) -> WorldModelStatusResponse:
         return WorldModelStatusResponse(campaign_id="", entity_count=0, thread_count=0, session_count=0)

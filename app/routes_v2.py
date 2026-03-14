@@ -22,6 +22,7 @@ from .models_v2 import (
     ReadWorldDocResponse,
     SyncSessionPatchRequest,
     SyncSessionPatchResponse,
+    WorldModelCleanupResponse,
     WorldEntityRecord,
     WorldModelStatusResponse,
     WorldSessionRecord,
@@ -118,6 +119,13 @@ def build_v2_router(
     def list_sessions(limit: int = 20):
         safe_limit = max(1, min(limit, 100))
         return model_store.list_sessions(limit=safe_limit)
+
+    @router.post("/world_model_cleanup", response_model=WorldModelCleanupResponse)
+    def world_model_cleanup(dry_run: bool = True):
+        response = model_store.cleanup_duplicate_threads(dry_run=dry_run)
+        if response is None:
+            raise HTTPException(status_code=503, detail="World model store is not configured")
+        return response
 
     @router.get("/proposals", response_model=list[ProposalRecord])
     def list_proposals(limit: int = 20):

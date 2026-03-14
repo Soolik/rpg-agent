@@ -240,3 +240,11 @@ class WorldModelStatusResponse(BaseModel):
     entity_count: int = 0
     thread_count: int = 0
     session_count: int = 0
+
+
+class WorldModelCleanupResponse(BaseModel):
+    campaign_id: str
+    summary: str
+    dry_run: bool = True
+    duplicate_thread_count: int = 0
+    deleted_thread_ids: List[int] = Field(default_factory=list)
