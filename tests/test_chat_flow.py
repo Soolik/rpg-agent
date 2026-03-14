@@ -1,7 +1,7 @@
 import unittest
 
 import main
-from app.models_v2 import ChangeProposal, DocumentRef
+from app.models_v2 import ChangeProposal, DocumentRef, WorldEntityRecord, WorldThreadRecord
 
 
 class ChatFlowTest(unittest.TestCase):
@@ -134,6 +134,187 @@ class ChatFlowTest(unittest.TestCase):
         self.assertEqual(response.kind, "creative")
         self.assertEqual(response.artifact_type, "session_hooks")
         self.assertEqual(captured["artifact_type"], "session_hooks")
+
+    def test_collect_canonical_names_uses_world_model_matches(self):
+        original_store = main.world_model_store_v2
+
+        class FakeStore:
+            def list_entities(self, limit=100, kind=None):
+                return [
+                    WorldEntityRecord(
+                        id=1,
+                        campaign_id="kng",
+                        entity_kind="npc",
+                        name="Captain Mira",
+                        description="Desc",
+                        tags=[],
+                        last_session_id=None,
+                        updated_at="2026-03-14T00:00:00+00:00",
+                    )
+                ]
+
+            def list_threads(self, limit=100, status=None):
+                return [
+                    WorldThreadRecord(
+                        id=1,
+                        campaign_id="kng",
+                        thread_key="T01",
+                        thread_id="T01",
+                        title="Red Blade",
+                        status="active",
+                        last_change="Change",
+                        last_session_id=None,
+                        updated_at="2026-03-14T00:00:00+00:00",
+                    )
+                ]
+
+        try:
+            main.world_model_store_v2 = FakeStore()
+            names = main.collect_canonical_names(
+                "Wymysl 3 hooki na sesje zwiazane z Red Blade i Captain Mira.",
+                [],
+            )
+        finally:
+            main.world_model_store_v2 = original_store
+
+        self.assertEqual(names, ["Captain Mira", "Red Blade"])
+
+    def test_generate_creative_artifact_session_hooks_uses_structured_sections(self):
+        original_generate = main.gemini_generate
+        original_build_world_model_context = main.build_world_model_context
+        original_build_recent_sessions_context = main.build_recent_sessions_context
+        original_build_context_for_planner = main.build_context_for_planner
+        original_vector_search = main.vector_search
+        original_render_source_labels = main.render_source_labels
+        original_store = main.world_model_store_v2
+        prompts = []
+
+        class FakeStore:
+            def list_entities(self, limit=100, kind=None):
+                return [
+                    WorldEntityRecord(
+                        id=1,
+                        campaign_id="kng",
+                        entity_kind="npc",
+                        name="Captain Mira",
+                        description="Desc",
+                        tags=[],
+                        last_session_id=None,
+                        updated_at="2026-03-14T00:00:00+00:00",
+                    )
+                ]
+
+            def list_threads(self, limit=100, status=None):
+                return [
+                    WorldThreadRecord(
+                        id=1,
+                        campaign_id="kng",
+                        thread_key="T01",
+                        thread_id="T01",
+                        title="Red Blade",
+                        status="active",
+                        last_change="Change",
+                        last_session_id=None,
+                        updated_at="2026-03-14T00:00:00+00:00",
+                    )
+                ]
+
+        outputs = iter(
+            [
+                "Cienie Red Blade",
+                "Captain Mira prosi BG o dyskretne spotkanie z emisariuszem Red Blade.",
+                "Dowody wskazuja, ze Red Blade testuje lojalnosc Captain Mira.",
+                "BG odkrywaja, ze magazyn zaopatrzenia Red Blade zostal okradziony przez kogos z otoczenia Miry.",
+                "* Utrata zaufania do Captain Mira.\n* Eskalacja konfliktu o zasoby.",
+                "* Przygotuj emisariusza Red Blade.\n* Przygotuj magazyn i tropy po wlamaniu.",
+            ]
+        )
+
+        def fake_generate(prompt, **kwargs):
+            prompts.append(prompt)
+            return next(outputs)
+
+        try:
+            main.world_model_store_v2 = FakeStore()
+            main.gemini_generate = fake_generate
+            main.build_world_model_context = lambda limit=30: "KNOWN ENTITIES:\n- npc: Captain Mira\nKNOWN THREADS:\n- T01 | Red Blade"
+            main.build_recent_sessions_context = lambda limit=5: "RECENT SESSIONS:\n- session_id=1 | source=Session 05 | summary=Mira ujawnila kontakt."
+            main.build_context_for_planner = lambda drive_store: "Campaign context about Red Blade."
+            main.vector_search = lambda message, top_k: []
+            main.render_source_labels = lambda hits: []
+
+            artifact_text, references = main.generate_creative_artifact(
+                message="Wymysl 3 hooki na nastepna sesje zwiazane z Red Blade i Captain Mira.",
+                artifact_type="session_hooks",
+            )
+        finally:
+            main.world_model_store_v2 = original_store
+            main.gemini_generate = original_generate
+            main.build_world_model_context = original_build_world_model_context
+            main.build_recent_sessions_context = original_build_recent_sessions_context
+            main.build_context_for_planner = original_build_context_for_planner
+            main.vector_search = original_vector_search
+            main.render_source_labels = original_render_source_labels
+
+        self.assertEqual(references, [])
+        self.assertIn("Tytul: Cienie Red Blade", artifact_text)
+        self.assertIn("Hook 1:\nCaptain Mira prosi BG", artifact_text)
+        self.assertIn("Hook 2:\nDowody wskazuja, ze Red Blade", artifact_text)
+        self.assertIn("Hook 3:\nBG odkrywaja", artifact_text)
+        self.assertIn("Stawki:\n* Utrata zaufania do Captain Mira.", artifact_text)
+        self.assertIn("Co przygotowac:\n* Przygotuj emisariusza Red Blade.", artifact_text)
+        self.assertNotIn("Do doprecyzowania.", artifact_text)
+        self.assertTrue(any("Nie tlumacz nazw kanonicznych." in prompt for prompt in prompts))
+
+    def test_generate_creative_artifact_npc_brief_uses_structured_sections(self):
+        original_generate = main.gemini_generate
+        original_build_world_model_context = main.build_world_model_context
+        original_build_recent_sessions_context = main.build_recent_sessions_context
+        original_build_context_for_planner = main.build_context_for_planner
+        original_vector_search = main.vector_search
+        original_render_source_labels = main.render_source_labels
+        outputs = iter(
+            [
+                "Kael",
+                "Dowodca polowy Red Blade, ktory wchodzi w spor z Captain Mira o metode przetrwania.",
+                "Surowy, spokojny i stale gotowy do wydania rozkazu.",
+                "Wierzy, ze tylko brutalna skutecznosc uratuje ludzi przed katastrofa.",
+                "Ukrywa, ze juz poswiecil niewinnych w imie planu Red Blade.",
+                "* Captain Mira: uwaza ja za zbyt miekka.\n* Red Blade: ma w frakcji lojalistow.",
+                "* Moze zlecic BG moralnie watpliwa misje.\n* Moze podwazyc autorytet Captain Mira.",
+            ]
+        )
+
+        def fake_generate(prompt, **kwargs):
+            return next(outputs)
+
+        try:
+            main.gemini_generate = fake_generate
+            main.build_world_model_context = lambda limit=30: "KNOWN ENTITIES:\n- npc: Captain Mira\nKNOWN THREADS:\n- T01 | Red Blade"
+            main.build_recent_sessions_context = lambda limit=5: "RECENT SESSIONS:\n- session_id=1 | source=Session 05 | summary=Mira ujawnila kontakt."
+            main.build_context_for_planner = lambda drive_store: "Campaign context about Red Blade."
+            main.vector_search = lambda message, top_k: []
+            main.render_source_labels = lambda hits: []
+
+            artifact_text, references = main.generate_creative_artifact(
+                message="Stworz nowego NPC powiazanego z Red Blade, ktory moze wejsc w konflikt z Captain Mira.",
+                artifact_type="npc_brief",
+            )
+        finally:
+            main.gemini_generate = original_generate
+            main.build_world_model_context = original_build_world_model_context
+            main.build_recent_sessions_context = original_build_recent_sessions_context
+            main.build_context_for_planner = original_build_context_for_planner
+            main.vector_search = original_vector_search
+            main.render_source_labels = original_render_source_labels
+
+        self.assertEqual(references, [])
+        self.assertIn("Imie: Kael", artifact_text)
+        self.assertIn("Rola w kampanii:\nDowodca polowy Red Blade", artifact_text)
+        self.assertIn("Sekret:\nUkrywa, ze juz poswiecil niewinnych", artifact_text)
+        self.assertIn("Relacje:\n* Captain Mira:", artifact_text)
+        self.assertIn("Jak uzyc tej postaci na sesji:\n* Moze zlecic BG", artifact_text)
+        self.assertNotIn("Do doprecyzowania.", artifact_text)
 
     def test_ensure_artifact_shape_appends_missing_sections(self):
         original_generate = main.gemini_generate

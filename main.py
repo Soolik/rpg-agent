@@ -736,6 +736,84 @@ def render_source_labels(sources: List[Dict[str, Any]]) -> List[str]:
     return labels
 
 
+def extract_titlecase_phrases(text: str) -> List[str]:
+    ignored = {
+        "wymysl",
+        "przygotuj",
+        "stworz",
+        "potrzebny",
+        "daj",
+        "zrob",
+        "opisz",
+    }
+    matches = re.findall(
+        r"\b[A-Z][A-Za-z0-9'_-]+(?:\s+[A-Z][A-Za-z0-9'_-]+){0,3}\b",
+        text or "",
+    )
+    phrases: List[str] = []
+    seen = set()
+    for match in matches:
+        cleaned = match.strip()
+        key = normalize_world_model_key(cleaned)
+        if not cleaned or key in seen:
+            continue
+        if " " not in cleaned and key in ignored:
+            continue
+        seen.add(key)
+        phrases.append(cleaned)
+    return phrases
+
+
+def collect_canonical_names(message: str, hits: List[Dict[str, Any]], limit: int = 12) -> List[str]:
+    names: List[str] = []
+    seen = set()
+    normalized_message = normalize_world_model_key(message)
+
+    def add_name(value: Optional[str]) -> None:
+        cleaned = (value or "").strip()
+        key = normalize_world_model_key(cleaned)
+        if not cleaned or not key or key in seen:
+            return
+        seen.add(key)
+        names.append(cleaned)
+
+    try:
+        if world_model_store_v2:
+            for entity in world_model_store_v2.list_entities(limit=100):
+                if normalize_world_model_key(entity.name) in normalized_message:
+                    add_name(entity.name)
+            for thread in world_model_store_v2.list_threads(limit=100):
+                if normalize_world_model_key(thread.title) in normalized_message:
+                    add_name(thread.title)
+    except Exception:
+        pass
+
+    for phrase in extract_titlecase_phrases(message):
+        add_name(phrase)
+
+    for hit in hits:
+        title = (hit.get("title") or "").strip()
+        if title and normalize_world_model_key(title) in normalized_message:
+            add_name(title)
+
+    return names[:limit]
+
+
+def build_canonical_names_context(canonical_names: List[str]) -> str:
+    if not canonical_names:
+        return "Brak dodatkowych nazw kanonicznych."
+    return "\n".join(
+        [
+            "NAZWY KANONICZNE:",
+            *[f"- {name}" for name in canonical_names],
+            "ZASADY DLA NAZW KANONICZNYCH:",
+            "- Nie tlumacz tych nazw.",
+            "- Nie zamieniaj ich na synonimy ani spolszczone odpowiedniki.",
+            "- Jesli uzywasz tych nazw, kopiuj je dokladnie w tej formie.",
+        ]
+    )
+
+
 def is_creative_artifact_type(artifact_type: Optional[ArtifactType]) -> bool:
     return artifact_type in {"session_hooks", "scene_seed", "npc_brief", "twist_pack"}
 
@@ -1530,6 +1608,210 @@ def build_placeholder_sections(artifact_type: ArtifactType, markers: List[str]) 
     return "\n".join(lines).strip()
 
 
+def creative_section_specs(artifact_type: ArtifactType) -> List[Dict[str, Any]]:
+    if artifact_type == "session_hooks":
+        return [
+            {"marker": "Tytul:", "instruction": "Jedna krotka linia, 4-8 slow.", "require_canonical_name": False},
+            {
+                "marker": "Hook 1:",
+                "instruction": "Napisz 2-4 zdania. To ma byc konkretny incydent otwierajacy sesje.",
+                "require_canonical_name": True,
+            },
+            {
+                "marker": "Hook 2:",
+                "instruction": "Napisz 2-4 zdania. Ten hook ma byc wyraznie inny od poprzedniego.",
+                "require_canonical_name": True,
+            },
+            {
+                "marker": "Hook 3:",
+                "instruction": "Napisz 2-4 zdania. Ten hook ma byc wyraznie inny od poprzednich.",
+                "require_canonical_name": True,
+            },
+            {
+                "marker": "Stawki:",
+                "instruction": "Daj 4-6 krotkich bulletow zaczynajacych sie od '* '.",
+                "require_canonical_name": False,
+            },
+            {
+                "marker": "Co przygotowac:",
+                "instruction": "Daj 4-6 krotkich bulletow zaczynajacych sie od '* '.",
+                "require_canonical_name": False,
+            },
+        ]
+    if artifact_type == "npc_brief":
+        return [
+            {"marker": "Imie:", "instruction": "Podaj imie albo imie i nazwisko nowej postaci.", "require_canonical_name": False},
+            {
+                "marker": "Rola w kampanii:",
+                "instruction": "Napisz 2-4 zdania o roli tej postaci w kampanii.",
+                "require_canonical_name": True,
+            },
+            {
+                "marker": "Pierwsze wrazenie:",
+                "instruction": "Napisz 2-4 zdania o wygladzie i aurze postaci.",
+                "require_canonical_name": False,
+            },
+            {
+                "marker": "Motywacja:",
+                "instruction": "Napisz 2-4 zdania o motywacji i presji tej postaci.",
+                "require_canonical_name": False,
+            },
+            {
+                "marker": "Sekret:",
+                "instruction": "Napisz 2-4 zdania o sekrecie lub ukrytym koszcie tej postaci.",
+                "require_canonical_name": True,
+            },
+            {
+                "marker": "Relacje:",
+                "instruction": "Daj 3-5 bulletow zaczynajacych sie od '* ' o relacjach postaci.",
+                "require_canonical_name": True,
+            },
+            {
+                "marker": "Jak uzyc tej postaci na sesji:",
+                "instruction": "Daj 3-5 bulletow zaczynajacych sie od '* ' z praktycznymi sposobami uzycia.",
+                "require_canonical_name": True,
+            },
+        ]
+    return []
+
+
+def render_partial_artifact_sections(section_values: Dict[str, str], artifact_type: ArtifactType) -> str:
+    lines: List[str] = []
+    for marker in artifact_required_markers(artifact_type):
+        if marker not in section_values:
+            continue
+        if lines:
+            lines.append("")
+        lines.extend(render_artifact_section_block(marker, section_values[marker]))
+    return "\n".join(lines).strip()
+
+
+def strip_section_marker(text: str, marker: str) -> str:
+    stripped = (text or "").strip()
+    if stripped.lower().startswith(marker.lower()):
+        stripped = stripped[len(marker):].lstrip()
+    return stripped.strip()
+
+
+def generate_creative_section(
+    *,
+    artifact_type: ArtifactType,
+    marker: str,
+    instruction: str,
+    message: str,
+    world_context: str,
+    structured_context: str,
+    recent_sessions_context: str,
+    canonical_names: List[str],
+    prior_sections_text: str,
+    require_canonical_name: bool,
+) -> str:
+    canonical_context = build_canonical_names_context(canonical_names)
+    prompt = f"""
+Jestes wspolautorem kampanii RPG "Krew Na Gwiazdach". Pisz po polsku.
+
+Masz wygenerowac tylko tresc jednej sekcji artefaktu `{artifact_type}`.
+Nie zwracaj JSON. Nie zwracaj code fence. Nie zwracaj nazwy sekcji.
+
+SEKCJA:
+{marker}
+
+INSTRUKCJA DLA SEKCJI:
+{instruction}
+
+ZASADY:
+- Zachowaj ton kampanii: smutne heroic fantasy, polityka, emocje, trudne wybory.
+- Pisz zwiezle i konkretnie.
+- Nie przeczyc twardym faktom z kontekstu.
+- Nie tlumacz nazw kanonicznych.
+
+{canonical_context}
+
+AKTUALNY MODEL SWIATA:
+{structured_context}
+
+OSTATNIE SESJE:
+{recent_sessions_context}
+
+RELEWANTNY KONTEKST KAMPANII:
+{world_context}
+
+PROSBA UZYTKOWNIKA:
+{message}
+
+JUZ WYGNEROWANE SEKCJE:
+{prior_sections_text or '[brak]'}
+
+ZWROC TYLKO TRESC SEKCJI:
+""".strip()
+
+    def run_prompt(extra_rule: Optional[str] = None) -> str:
+        effective_prompt = prompt
+        if extra_rule:
+            effective_prompt = f"{prompt}\n\nDODATKOWA REGULA:\n{extra_rule}"
+        return strip_section_marker(
+            gemini_generate(
+                effective_prompt,
+                response_mime_type="text/plain",
+                temperature=0.7,
+                max_output_tokens=1200,
+            ).strip(),
+            marker,
+        )
+
+    try:
+        candidate = run_prompt()
+    except Exception:
+        candidate = ""
+
+    needs_retry = section_needs_fill(
+        artifact_type=artifact_type,
+        marker=marker,
+        content=candidate,
+        is_last_marker=marker == artifact_required_markers(artifact_type)[-1],
+    )
+    missing_name = require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)
+    if needs_retry or missing_name:
+        retry_rule = "Uzupelnij sekcje pelna, konkretna trescia."
+        if require_canonical_name and canonical_names:
+            retry_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
+        try:
+            retry_candidate = run_prompt(retry_rule)
+            if retry_candidate:
+                candidate = retry_candidate
+        except Exception:
+            pass
+    return candidate.strip()
+
+
+def generate_structured_creative_artifact(
+    *,
+    artifact_type: ArtifactType,
+    message: str,
+    world_context: str,
+    structured_context: str,
+    recent_sessions_context: str,
+    canonical_names: List[str],
+) -> str:
+    section_values: Dict[str, str] = {}
+    specs = creative_section_specs(artifact_type)
+    for spec in specs:
+        body = generate_creative_section(
+            artifact_type=artifact_type,
+            marker=spec["marker"],
+            instruction=spec["instruction"],
+            message=message,
+            world_context=world_context,
+            structured_context=structured_context,
+            recent_sessions_context=recent_sessions_context,
+            canonical_names=canonical_names,
+            prior_sections_text=render_partial_artifact_sections(section_values, artifact_type),
+            require_canonical_name=bool(spec.get("require_canonical_name")),
+        )
+        section_values[spec["marker"]] = body
+    return render_partial_artifact_sections(section_values, artifact_type)
+
+
 def append_missing_artifact_sections(text: str, artifact_type: ArtifactType) -> str:
     missing = missing_artifact_markers(text, artifact_type)
     if not missing:
@@ -1611,6 +1893,7 @@ def build_creative_prompt(
     artifact_type: ArtifactType,
     world_context: str,
     structured_context: str,
+    canonical_names_context: str,
 ) -> str:
     format_instructions = build_creative_artifact_sections(artifact_type)
     return f"""
@@ -1631,9 +1914,12 @@ ZASADY:
 6) Uzyj wszystkich wymaganych sekcji z formatu i nie pomijaj zadnej.
 7) Jesli format zawiera Hook 1/2/3 albo Twist 1/2/3, wypelnij wszystkie te sekcje.
 8) Pisz zwiezle i praktycznie. Unikaj jednego bardzo dlugiego akapitu kosztem pozostalych sekcji.
+9) Nie tlumacz nazw kanonicznych i nie zamieniaj ich na synonimy.
 
 WYTYCZNE STYLU:
 {artifact_style_guidance(artifact_type)}
+
+{canonical_names_context}
 
 AKTUALNY MODEL SWIATA:
 {structured_context}
@@ -1655,6 +1941,7 @@ def build_pre_session_brief_prompt(
     world_context: str,
     structured_context: str,
     recent_sessions_context: str,
+    canonical_names_context: str,
 ) -> str:
     format_instructions = build_creative_artifact_sections("pre_session_brief")
     return f"""
@@ -1673,9 +1960,12 @@ ZASADY:
 5) W sekcjach "Scene Opportunities" i "Prep Checklist" dawaj konkretne, praktyczne propozycje MG.
 6) Wypelnij wszystkie sekcje z wymaganego formatu.
 7) Pisz zwiezle i praktycznie. Lepiej dac krotsze sekcje niz urwac artefakt po pierwszej.
+8) Nie tlumacz nazw kanonicznych i nie zamieniaj ich na synonimy.
 
 WYTYCZNE STYLU:
 {artifact_style_guidance("pre_session_brief")}
+
+{canonical_names_context}
 
 AKTUALNY MODEL SWIATA:
 {structured_context}
@@ -1700,6 +1990,7 @@ def generate_creative_artifact(
     artifact_type: ArtifactType,
 ) -> tuple[str, List[str]]:
     structured_context = build_world_model_context(limit=30)
+    recent_sessions_context = build_recent_sessions_context(limit=5)
     try:
         hits = vector_search(message, 6)
     except Exception:
@@ -1711,11 +2002,26 @@ def generate_creative_artifact(
             world_context = build_context_for_planner(drive_store_v2)
         except Exception:
             world_context = "Brak dodatkowego kontekstu kampanii."
+    canonical_names = collect_canonical_names(message, hits)
+    canonical_names_context = build_canonical_names_context(canonical_names)
+
+    if artifact_type in {"session_hooks", "npc_brief"}:
+        artifact_text = generate_structured_creative_artifact(
+            artifact_type=artifact_type,
+            message=message,
+            world_context=world_context,
+            structured_context=structured_context,
+            recent_sessions_context=recent_sessions_context,
+            canonical_names=canonical_names,
+        )
+        return artifact_text, render_source_labels(hits)
+
     prompt = build_creative_prompt(
         message=message,
         artifact_type=artifact_type,
         world_context=world_context,
         structured_context=structured_context,
+        canonical_names_context=canonical_names_context,
     )
     artifact_text = gemini_generate(
         prompt,
@@ -1730,6 +2036,9 @@ def generate_creative_artifact(
             "",
             "RELEWANTNY KONTEKST KAMPANII:",
             world_context,
+            "",
+            "NAZWY KANONICZNE:",
+            canonical_names_context,
             "",
             "PROSBA UZYTKOWNIKA:",
             message,
@@ -1757,12 +2066,14 @@ def generate_pre_session_brief(message: str) -> tuple[str, List[str]]:
             world_context = build_context_for_planner(drive_store_v2)
         except Exception:
             world_context = "Brak dodatkowego kontekstu kampanii."
+    canonical_names_context = build_canonical_names_context(collect_canonical_names(message, hits))
 
     prompt = build_pre_session_brief_prompt(
         message=message,
         world_context=world_context,
         structured_context=structured_context,
         recent_sessions_context=recent_sessions_context,
+        canonical_names_context=canonical_names_context,
     )
     artifact_text = gemini_generate(
         prompt,
@@ -1780,6 +2091,9 @@ def generate_pre_session_brief(message: str) -> tuple[str, List[str]]:
             "",
             "RELEWANTNY KONTEKST KAMPANII:",
             world_context,
+            "",
+            "NAZWY KANONICZNE:",
+            canonical_names_context,
             "",
             "PROSBA UZYTKOWNIKA:",
             message,
