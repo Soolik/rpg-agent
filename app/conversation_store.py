@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -10,7 +11,11 @@ from pydantic import BaseModel, Field
 
 
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "sql" / "004_conversations.sql"
-SCHEMA_STATEMENTS = [statement.strip() for statement in SCHEMA_PATH.read_text(encoding="utf-8").split(";") if statement.strip()]
+
+
+@lru_cache(maxsize=1)
+def _schema_statements() -> list[str]:
+    return [statement.strip() for statement in SCHEMA_PATH.read_text(encoding="utf-8").split(";") if statement.strip()]
 
 
 class ConversationRecord(BaseModel):
@@ -47,7 +52,7 @@ class ConversationStore:
             return
         with self.connection_factory() as conn:
             with conn.cursor() as cur:
-                for statement in SCHEMA_STATEMENTS:
+                for statement in _schema_statements():
                     cur.execute(statement)
             conn.commit()
         self._schema_ready = True
