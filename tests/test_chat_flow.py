@@ -183,7 +183,7 @@ class ChatFlowTest(unittest.TestCase):
                 "Hook 2:\nPoslaniec Red Blade znika przed spotkaniem.\n\n"
                 "Hook 3:\nMira dostaje ultimatum od wlasnych ludzi.\n\n"
                 "Stawki:\n- Miasto traci zaufanie do Miry.\n\n"
-                "Co przygotowac:\n- Strażników portowych.\n- Plotki o Red Blade."
+                "Co przygotowac:\n- Straznikow portowych.\n- Plotki o Red Blade."
             )
 
         try:
@@ -199,7 +199,26 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("Hook 2:\nPoslaniec Red Blade znika", shaped)
         self.assertIn("Hook 3:\nMira dostaje ultimatum", shaped)
         self.assertIn("Stawki:\n- Miasto traci zaufanie", shaped)
-        self.assertIn("Co przygotowac:\n- Strażników portowych.", shaped)
+        self.assertIn("Co przygotowac:\n- Straznikow portowych.", shaped)
+
+    def test_merge_artifact_sections_replaces_placeholder_content(self):
+        merged = main.merge_artifact_sections(
+            "Tytul: Cienie Red Blade\n\nHook 1:\nZaczepka.\n\nHook 2:\nDo doprecyzowania.",
+            "Hook 2:\nPelny drugi hook.",
+            "session_hooks",
+        )
+
+        self.assertIn("Hook 2:\nPelny drugi hook.", merged)
+        self.assertNotIn("Hook 2:\nDo doprecyzowania.", merged)
+
+    def test_markers_requiring_fill_detect_placeholder_sections(self):
+        markers = main.markers_requiring_fill(
+            "# Pre-Session Brief\n\n## Campaign State\nNapiecie rosnie.\n\n## Active Threads\n- Do doprecyzowania.",
+            "pre_session_brief",
+        )
+
+        self.assertIn("## Active Threads", markers)
+        self.assertIn("## Prep Checklist", markers)
 
     def test_chat_answer_can_save_output_doc(self):
         original_ask = main.ask
@@ -532,7 +551,7 @@ class ChatFlowTest(unittest.TestCase):
                 "## Active Threads\n- T01 / Red Blade nabiera znaczenia.\n\n"
                 "## Key NPCs and Factions\n- Captain Mira.\n- Red Blade.\n\n"
                 "## Risks and Pressure Points\n- Wyciek informacji rozbije sojusze.\n\n"
-                "## Scene Opportunities\n- Przesluchanie poslańca Red Blade.\n\n"
+                "## Scene Opportunities\n- Przesluchanie poslanca Red Blade.\n\n"
                 "## Prep Checklist\n- Przygotuj konsekwencje polityczne."
             )
 

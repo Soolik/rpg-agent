@@ -1328,6 +1328,107 @@ def artifact_style_guidance(artifact_type: ArtifactType) -> str:
     return "- Pisz zwiezle i praktycznie."
 
 
+def extract_artifact_sections(text: str, artifact_type: ArtifactType) -> Dict[str, str]:
+    markers = artifact_required_markers(artifact_type)
+    sections: Dict[str, str] = {}
+    current_marker: Optional[str] = None
+    buffer: List[str] = []
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        matched_marker: Optional[str] = None
+        inline_value = ""
+
+        for marker in markers:
+            if stripped == marker:
+                matched_marker = marker
+                break
+            if not marker.startswith("#") and stripped.startswith(marker):
+                matched_marker = marker
+                inline_value = stripped[len(marker):].strip()
+                break
+
+        if matched_marker:
+            if current_marker is not None:
+                sections[current_marker] = "\n".join(buffer).strip()
+            current_marker = matched_marker
+            buffer = [inline_value] if inline_value else []
+            continue
+
+        if current_marker is not None:
+            buffer.append(line)
+
+    if current_marker is not None:
+        sections[current_marker] = "\n".join(buffer).strip()
+    return sections
+
+
+def normalize_section_body(content: str) -> str:
+    normalized = re.sub(r"^[\-\*\d\.\)\s]+", "", (content or "").strip(), flags=re.MULTILINE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def section_min_length(artifact_type: ArtifactType, marker: str) -> int:
+    if artifact_type == "pre_session_brief":
+        return 60 if marker == "## Campaign State" else 35
+    if artifact_type == "session_hooks":
+        if marker == "Tytul:":
+            return 8
+        if marker in {"Stawki:", "Co przygotowac:"}:
+            return 35
+        return 50
+    if artifact_type == "scene_seed":
+        return 25
+    if artifact_type == "npc_brief":
+        return 3 if marker == "Imie:" else 45
+    if artifact_type == "twist_pack":
+        return 40
+    return 20
+
+
+def section_needs_fill(
+    *,
+    artifact_type: ArtifactType,
+    marker: str,
+    content: str,
+    is_last_marker: bool,
+) -> bool:
+    normalized = normalize_section_body(content)
+    lowered = normalized.lower()
+    if not normalized:
+        return True
+    if "do doprecyzowania" in lowered:
+        return True
+    if len(normalized) < section_min_length(artifact_type, marker):
+        return True
+    if is_last_marker and artifact_type in {"pre_session_brief", "npc_brief"}:
+        if len(normalized) >= section_min_length(artifact_type, marker) and not re.search(r"[.!?)]$", normalized):
+            return True
+    return False
+
+
+def markers_requiring_fill(text: str, artifact_type: ArtifactType) -> List[str]:
+    sections = extract_artifact_sections(text, artifact_type)
+    markers = artifact_required_markers(artifact_type)
+    required: List[str] = []
+    for idx, marker in enumerate(markers):
+        if marker.startswith("# ") and not marker.startswith("## "):
+            if marker not in sections:
+                required.append(marker)
+            continue
+        content = sections.get(marker, "")
+        if section_needs_fill(
+            artifact_type=artifact_type,
+            marker=marker,
+            content=content,
+            is_last_marker=idx == len(markers) - 1,
+        ):
+            required.append(marker)
+    return required
+
+
 def missing_artifact_markers(text: str, artifact_type: ArtifactType) -> List[str]:
     lowered = (text or "").lower()
     return [marker for marker in artifact_required_markers(artifact_type) if marker.lower() not in lowered]
@@ -1376,6 +1477,59 @@ ZWROC TYLKO BRAKUJACE SEKCJE:
         return ""
 
 
+def render_artifact_section_block(marker: str, content: str) -> List[str]:
+    body = (content or "").strip()
+    lines: List[str] = []
+    if marker.startswith("# ") and not marker.startswith("## "):
+        lines.append(marker)
+        return lines
+
+    if marker.startswith("#"):
+        lines.append(marker)
+        lines.append("")
+        if body:
+            lines.extend(body.splitlines())
+        else:
+            lines.append("- Do doprecyzowania.")
+        return lines
+
+    if marker in {"Tytul:", "Tytul sceny:", "Imie:"} and body and "\n" not in body and not body.lstrip().startswith(("*", "-")):
+        lines.append(f"{marker} {body}".rstrip())
+        return lines
+
+    lines.append(marker)
+    if body:
+        lines.extend(body.splitlines())
+    else:
+        lines.append("Do doprecyzowania.")
+    return lines
+
+
+def merge_artifact_sections(base_text: str, supplement_text: str, artifact_type: ArtifactType) -> str:
+    base_sections = extract_artifact_sections(base_text, artifact_type)
+    supplement_sections = extract_artifact_sections(supplement_text, artifact_type)
+    merged = {**base_sections, **supplement_sections}
+
+    lines: List[str] = []
+    for marker in artifact_required_markers(artifact_type):
+        if lines:
+            lines.append("")
+        lines.extend(render_artifact_section_block(marker, merged.get(marker, "")))
+    return "\n".join(lines).strip()
+
+
+def build_placeholder_sections(artifact_type: ArtifactType, markers: List[str]) -> str:
+    lines: List[str] = []
+    for marker in markers:
+        if lines:
+            lines.append("")
+        if marker.startswith("#"):
+            lines.extend([marker, "", "- Do doprecyzowania."])
+        else:
+            lines.extend([marker, "Do doprecyzowania."])
+    return "\n".join(lines).strip()
+
+
 def append_missing_artifact_sections(text: str, artifact_type: ArtifactType) -> str:
     missing = missing_artifact_markers(text, artifact_type)
     if not missing:
@@ -1398,7 +1552,7 @@ def ensure_artifact_shape(
     repair_context: str,
 ) -> str:
     cleaned = (text or "").strip()
-    if cleaned and not missing_artifact_markers(cleaned, artifact_type):
+    if cleaned and not markers_requiring_fill(cleaned, artifact_type):
         return cleaned
 
     repair_prompt = f"""
@@ -1431,16 +1585,23 @@ POPRAWIONY ARTEFAKT:
         repaired = ""
 
     candidate = repaired or cleaned
-    missing = missing_artifact_markers(candidate, artifact_type)
-    if missing:
+    markers_to_fill = markers_requiring_fill(candidate, artifact_type)
+    if markers_to_fill:
         filled_sections = fill_missing_artifact_sections(
             artifact_type=artifact_type,
             partial_text=candidate,
             repair_context=repair_context,
-            missing_markers=missing,
+            missing_markers=markers_to_fill,
         )
         if filled_sections:
-            candidate = "\n\n".join(part for part in [candidate.strip(), filled_sections.strip()] if part).strip()
+            candidate = merge_artifact_sections(candidate, filled_sections, artifact_type)
+    remaining_missing = missing_artifact_markers(candidate, artifact_type)
+    if remaining_missing:
+        candidate = merge_artifact_sections(
+            candidate,
+            build_placeholder_sections(artifact_type, remaining_missing),
+            artifact_type,
+        )
     return append_missing_artifact_sections(candidate, artifact_type)
 
 
