@@ -177,6 +177,43 @@ class ChatFlowTest(unittest.TestCase):
         self.assertEqual(response.artifact_type, "session_hooks")
         self.assertEqual(captured["artifact_type"], "session_hooks")
 
+    def test_chat_explicit_proposal_intent_is_not_overridden_by_creative_artifact_type(self):
+        original_planner = main.planner_v2
+        original_workflow_store = main.workflow_store_v2
+
+        class FakePlanner:
+            def propose(self, request, world_docs, world_context):
+                return ChangeProposal(
+                    proposal_id=77,
+                    summary="Dodaj NPC do kanonu.",
+                    user_goal=request.instruction,
+                    assumptions=[],
+                    impacted_docs=[DocumentRef(folder="03 NPC", title="Nowy NPC")],
+                    actions=[],
+                    needs_confirmation=True,
+                )
+
+        class FakeWorkflowStore:
+            def save_proposal(self, request, proposal, **kwargs):
+                return 77
+
+        try:
+            main.planner_v2 = FakePlanner()
+            main.workflow_store_v2 = FakeWorkflowStore()
+            response = main.chat(
+                main.ChatRequest(
+                    message="Dodaj nowego NPC powiazanego z Red Blade.",
+                    intent="proposal",
+                    artifact_type="npc_brief",
+                )
+            )
+        finally:
+            main.planner_v2 = original_planner
+            main.workflow_store_v2 = original_workflow_store
+
+        self.assertEqual(response.kind, "proposal")
+        self.assertEqual(response.proposal_id, 77)
+
     def test_collect_canonical_names_uses_world_model_matches(self):
         original_store = main.world_model_store_v2
 

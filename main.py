@@ -2858,8 +2858,9 @@ def chat(req: ChatRequest):
             )
 
         resolved_artifact_type = infer_artifact_type(req.message, req.artifact_type)
-        resolved_intent = req.intent if req.intent != "auto" else detect_chat_intent(req.message)
-        if is_creative_artifact_type(resolved_artifact_type):
+        explicit_intent = req.intent != "auto"
+        resolved_intent = req.intent if explicit_intent else detect_chat_intent(req.message)
+        if not explicit_intent and is_creative_artifact_type(resolved_artifact_type):
             resolved_intent = "creative"
         warnings: List[str] = []
 
