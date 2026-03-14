@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from app.drive_store import DriveStore, decode_google_export_text
-from app.models_v2 import DocumentRef, WorldDocInfo
+from app.models_v2 import DocumentRef, SessionPatchPayload, SyncSessionPatchRequest, SyncSessionPatchResponse, WorldDocInfo
 from app.planner import PlannerService
 from app.routes_v2 import build_v2_router
 from app.world_model_store import WorldModelStore
@@ -113,6 +113,16 @@ class SessionPatch(BaseModel):
     thread_tracker_patch: List[ThreadPatch] = []
     entities_patch: List[EntityPatch] = []
     rag_additions: List[str] = []
+
+
+class IngestAndSyncSessionRequest(IngestSessionRequest):
+    source_doc_id: Optional[str] = None
+    source_title: Optional[str] = None
+
+
+class IngestAndSyncSessionResponse(BaseModel):
+    patch: SessionPatch
+    sync: SyncSessionPatchResponse
 
 
 class CampaignOut(BaseModel):
@@ -1066,6 +1076,61 @@ def ask_text(req: AskRequest):
     return resp.answer + "\n"
 
 
+def generate_session_patch(raw_notes: str) -> SessionPatch:
+    cleaned_notes = raw_notes.strip()
+    if not cleaned_notes:
+        raise HTTPException(status_code=400, detail="raw_notes is empty")
+
+    notes = sanitize_for_rag(cleaned_notes)
+
+    prompt = f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach".
+Masz z surowych notatek wygenerowac PATCH do dokumentow kampanii.
+Nie zmyslaj. Jesli czegos nie ma w notatkach, pomin to.
+Zwroc wylacznie JSON zgodny z tym schematem:
+{{
+  "session_summary": "krotkie podsumowanie (max 8 zdan)",
+  "thread_tracker_patch": [{{"thread_id": "Txx (opcjonalnie)", "title": "...", "status": "...", "change": "co dopisac/zmienic"}}],
+  "entities_patch": [{{"kind": "npc|location|faction|item|other", "name": "...", "description": "...", "tags": ["..."]}}],
+  "rag_additions": ["krotkie fakty warte wejscia do indeksu, bez smieci z terminala"]
+}}
+
+NOTATKI:
+{notes}
+
+PATCH (tylko JSON):
+""".strip()
+
+    raw = gemini_generate(
+        prompt,
+        response_mime_type="application/json",
+        temperature=0.2,
+        max_output_tokens=2500,
+    ).strip()
+
+    obj = json.loads(extract_json_object(raw))
+    return SessionPatch.model_validate(obj)
+
+
+def sync_generated_session_patch(req: IngestAndSyncSessionRequest, patch: SessionPatch) -> SyncSessionPatchResponse:
+    if req.campaign_id and req.campaign_id != CAMPAIGN_ID:
+        raise HTTPException(status_code=400, detail="campaign_id does not match configured campaign")
+    if not world_model_store_v2:
+        raise HTTPException(status_code=503, detail="World model store is not configured")
+
+    sync_request = SyncSessionPatchRequest(
+        patch=SessionPatchPayload.model_validate(patch.model_dump(mode="json")),
+        raw_notes=req.raw_notes,
+        campaign_id=req.campaign_id,
+        source_doc_id=req.source_doc_id,
+        source_title=req.source_title,
+    )
+    response = world_model_store_v2.sync_session_patch(sync_request)
+    if response is None:
+        raise HTTPException(status_code=503, detail="World model store is not configured")
+    return response
+
+
 @app.post("/ingest_session", response_model=SessionPatch)
 def ingest_session(req: IngestSessionRequest):
     """
@@ -1073,6 +1138,8 @@ def ingest_session(req: IngestSessionRequest):
     Niczego nie zapisujemy do Google Docs automatem.
     """
     try:
+        return generate_session_patch(req.raw_notes)
+
         raw_notes = req.raw_notes.strip()
         if not raw_notes:
             raise HTTPException(status_code=400, detail="raw_notes is empty")
@@ -1108,6 +1175,18 @@ PATCH (tylko JSON):
         patch = SessionPatch.model_validate(obj)
         return patch
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ingest_session_and_sync", response_model=IngestAndSyncSessionResponse)
+def ingest_session_and_sync(req: IngestAndSyncSessionRequest):
+    try:
+        patch = generate_session_patch(req.raw_notes)
+        sync = sync_generated_session_patch(req, patch)
+        return IngestAndSyncSessionResponse(patch=patch, sync=sync)
     except HTTPException:
         raise
     except Exception as e:
