@@ -1102,6 +1102,93 @@ def build_world_model_context(limit: int = 50) -> str:
     return "\n".join(lines) if lines else "No structured world model entries available yet."
 
 
+def normalize_world_model_key(value: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def reconcile_session_patch_with_world_model(patch: SessionPatch) -> SessionPatch:
+    if not world_model_store_v2:
+        return patch
+
+    try:
+        known_entities = world_model_store_v2.list_entities(limit=100)
+        known_threads = world_model_store_v2.list_threads(limit=100)
+    except Exception:
+        return patch
+
+    entity_by_name = {normalize_world_model_key(entity.name): entity for entity in known_entities}
+    reconciled_entities: List[EntityPatch] = []
+    for entity in patch.entities_patch:
+        matched = entity_by_name.get(normalize_world_model_key(entity.name))
+        if matched:
+            reconciled_entities.append(
+                EntityPatch(
+                    kind=matched.entity_kind,  # type: ignore[arg-type]
+                    name=matched.name,
+                    description=entity.description,
+                    tags=entity.tags,
+                )
+            )
+        else:
+            reconciled_entities.append(entity)
+
+    def match_thread(thread: ThreadPatch):
+        if thread.thread_id:
+            normalized_thread_id = normalize_world_model_key(thread.thread_id)
+            for known in known_threads:
+                if known.thread_id and normalize_world_model_key(known.thread_id) == normalized_thread_id:
+                    return known
+
+        normalized_title = normalize_world_model_key(thread.title)
+        for known in known_threads:
+            if normalize_world_model_key(known.title) == normalized_title:
+                return known
+
+        haystack = normalize_world_model_key(" ".join(filter(None, [thread.title, thread.change, thread.status or ""])))
+        ranked_matches = []
+        for known in known_threads:
+            candidates = [
+                normalize_world_model_key(known.title),
+                normalize_world_model_key(known.thread_key),
+                normalize_world_model_key(known.thread_id),
+            ]
+            matched_lengths = [len(candidate) for candidate in candidates if candidate and candidate in haystack]
+            if matched_lengths:
+                ranked_matches.append((max(matched_lengths), known))
+
+        if ranked_matches:
+            ranked_matches.sort(key=lambda item: item[0], reverse=True)
+            return ranked_matches[0][1]
+        return None
+
+    reconciled_threads: List[ThreadPatch] = []
+    seen_thread_keys = set()
+    for thread in patch.thread_tracker_patch:
+        matched = match_thread(thread)
+        if matched:
+            resolved = ThreadPatch(
+                thread_id=matched.thread_id or thread.thread_id,
+                title=matched.title,
+                status=thread.status or matched.status,
+                change=thread.change,
+            )
+        else:
+            resolved = thread
+
+        dedupe_key = normalize_world_model_key(resolved.thread_id or resolved.title)
+        if dedupe_key in seen_thread_keys:
+            continue
+        seen_thread_keys.add(dedupe_key)
+        reconciled_threads.append(resolved)
+
+    return SessionPatch(
+        session_summary=patch.session_summary,
+        thread_tracker_patch=reconciled_threads,
+        entities_patch=reconciled_entities,
+        rag_additions=patch.rag_additions,
+    )
+
+
 def generate_session_patch(raw_notes: str) -> SessionPatch:
     cleaned_notes = raw_notes.strip()
     if not cleaned_notes:
@@ -1144,7 +1231,8 @@ PATCH (tylko JSON):
     ).strip()
 
     obj = json.loads(extract_json_object(raw))
-    return SessionPatch.model_validate(obj)
+    patch = SessionPatch.model_validate(obj)
+    return reconcile_session_patch_with_world_model(patch)
 
 
 def sync_generated_session_patch(req: IngestAndSyncSessionRequest, patch: SessionPatch) -> SyncSessionPatchResponse:

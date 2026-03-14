@@ -137,6 +137,50 @@ class SessionSyncFlowTest(unittest.TestCase):
         self.assertEqual(response.patch.entities_patch[0].name, "Captain Mira")
         self.assertEqual(fake_store.requests[0].source_title, "Session 05")
 
+    def test_generate_session_patch_reuses_matching_known_thread(self):
+        original_generate = main.gemini_generate
+        original_store = main.world_model_store_v2
+
+        class FakeStore:
+            def list_entities(self, limit=50, kind=None):
+                return []
+
+            def list_threads(self, limit=50, status=None):
+                return [
+                    WorldThreadRecord(
+                        id=1,
+                        campaign_id="kng",
+                        thread_key="T01",
+                        thread_id="T01",
+                        title="Red Blade",
+                        status="active",
+                        last_change="Old change",
+                        last_session_id=None,
+                        updated_at="2026-03-14T00:00:00+00:00",
+                    )
+                ]
+
+        try:
+            main.world_model_store_v2 = FakeStore()
+            main.gemini_generate = lambda *args, **kwargs: """
+            {
+              "session_summary": "Captain Mira ujawnila sekret.",
+              "thread_tracker_patch": [
+                {"thread_id": null, "title": "Mira's Allegiances", "status": "Updated", "change": "Captain Mira ujawnila tajny kontakt z Red Blade."}
+              ],
+              "entities_patch": [],
+              "rag_additions": []
+            }
+            """
+
+            patch = main.generate_session_patch("Raw notes")
+        finally:
+            main.gemini_generate = original_generate
+            main.world_model_store_v2 = original_store
+
+        self.assertEqual(patch.thread_tracker_patch[0].thread_id, "T01")
+        self.assertEqual(patch.thread_tracker_patch[0].title, "Red Blade")
+
 
 if __name__ == "__main__":
     unittest.main()
