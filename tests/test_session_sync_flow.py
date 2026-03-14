@@ -1,6 +1,7 @@
 import unittest
 
 import main
+from app.models_v2 import WorldEntityRecord, WorldThreadRecord
 
 
 class SessionSyncFlowTest(unittest.TestCase):
@@ -27,6 +28,65 @@ class SessionSyncFlowTest(unittest.TestCase):
         self.assertEqual(patch.session_summary, "Captain Mira ujawnila sekret.")
         self.assertEqual(len(patch.thread_tracker_patch), 1)
         self.assertEqual(patch.entities_patch[0].name, "Captain Mira")
+
+    def test_generate_session_patch_includes_world_model_context(self):
+        original_generate = main.gemini_generate
+        original_store = main.world_model_store_v2
+        captured = {}
+
+        class FakeStore:
+            def list_entities(self, limit=50, kind=None):
+                return [
+                    WorldEntityRecord(
+                        id=1,
+                        campaign_id="kng",
+                        entity_kind="npc",
+                        name="Captain Mira",
+                        description="Desc",
+                        tags=[],
+                        last_session_id=None,
+                        updated_at="2026-03-14T00:00:00+00:00",
+                    )
+                ]
+
+            def list_threads(self, limit=50, status=None):
+                return [
+                    WorldThreadRecord(
+                        id=1,
+                        campaign_id="kng",
+                        thread_key="T01",
+                        thread_id="T01",
+                        title="Red Blade",
+                        status="active",
+                        last_change="Change",
+                        last_session_id=None,
+                        updated_at="2026-03-14T00:00:00+00:00",
+                    )
+                ]
+
+        def fake_generate(prompt, **kwargs):
+            captured["prompt"] = prompt
+            return """
+            {
+              "session_summary": "Captain Mira ujawnila sekret.",
+              "thread_tracker_patch": [],
+              "entities_patch": [],
+              "rag_additions": []
+            }
+            """
+
+        try:
+            main.world_model_store_v2 = FakeStore()
+            main.gemini_generate = fake_generate
+            main.generate_session_patch("Raw notes")
+        finally:
+            main.gemini_generate = original_generate
+            main.world_model_store_v2 = original_store
+
+        self.assertIn("KNOWN ENTITIES:", captured["prompt"])
+        self.assertIn("Captain Mira", captured["prompt"])
+        self.assertIn("KNOWN THREADS:", captured["prompt"])
+        self.assertIn("T01 | Red Blade", captured["prompt"])
 
     def test_ingest_session_and_sync_returns_patch_and_sync_result(self):
         original_generate = main.gemini_generate

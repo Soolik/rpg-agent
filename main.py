@@ -1076,12 +1076,39 @@ def ask_text(req: AskRequest):
     return resp.answer + "\n"
 
 
+def build_world_model_context(limit: int = 50) -> str:
+    if not world_model_store_v2:
+        return "No structured world model entries available yet."
+
+    try:
+        entities = world_model_store_v2.list_entities(limit=limit)
+        threads = world_model_store_v2.list_threads(limit=limit)
+    except Exception:
+        return "World model context unavailable."
+
+    lines: List[str] = []
+    if entities:
+        lines.append("KNOWN ENTITIES:")
+        for entity in entities:
+            lines.append(f"- {entity.entity_kind}: {entity.name}")
+
+    if threads:
+        lines.append("KNOWN THREADS:")
+        for thread in threads:
+            prefix = f"{thread.thread_id} | " if thread.thread_id else ""
+            status = f" | status={thread.status}" if thread.status else ""
+            lines.append(f"- {prefix}{thread.title}{status}")
+
+    return "\n".join(lines) if lines else "No structured world model entries available yet."
+
+
 def generate_session_patch(raw_notes: str) -> SessionPatch:
     cleaned_notes = raw_notes.strip()
     if not cleaned_notes:
         raise HTTPException(status_code=400, detail="raw_notes is empty")
 
     notes = sanitize_for_rag(cleaned_notes)
+    world_model_context = build_world_model_context()
 
     prompt = f"""
 Jestes asystentem MG kampanii "Krew Na Gwiazdach".
@@ -1094,6 +1121,14 @@ Zwroc wylacznie JSON zgodny z tym schematem:
   "entities_patch": [{{"kind": "npc|location|faction|item|other", "name": "...", "description": "...", "tags": ["..."]}}],
   "rag_additions": ["krotkie fakty warte wejscia do indeksu, bez smieci z terminala"]
 }}
+
+RULES:
+- If a thread matches an existing known thread, reuse its exact title and exact thread_id when available.
+- If an entity matches an existing known entity, reuse its exact name and kind.
+- Prefer updating existing threads and entities over inventing duplicates.
+
+CURRENT WORLD MODEL:
+{world_model_context}
 
 NOTATKI:
 {notes}
