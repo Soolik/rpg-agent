@@ -5,6 +5,8 @@ import os
 import re
 import uuid
 import hashlib
+from copy import deepcopy
+from contextvars import ContextVar
 import google.auth
 import psycopg
 import requests
@@ -39,6 +41,8 @@ from html import unescape
 
 APP_NAME = "rpg-agent"
 app = FastAPI(title=APP_NAME)
+
+REQUEST_TELEMETRY: ContextVar[Optional[Dict[str, Any]]] = ContextVar("request_telemetry", default=None)
 
 # ---- env ----
 CAMPAIGN_ID = os.getenv("CAMPAIGN_ID", "kng")
@@ -114,6 +118,7 @@ class ChatRequest(BaseModel):
     artifact_type: Optional[ArtifactType] = None
     source_title: Optional[str] = None
     include_sources: bool = False
+    include_telemetry: bool = False
     save_output: bool = False
     output_title: Optional[str] = None
 
@@ -130,6 +135,7 @@ class ChatResponse(BaseModel):
     output_doc_id: Optional[str] = None
     output_title: Optional[str] = None
     output_path: Optional[str] = None
+    telemetry: Optional[Dict[str, Any]] = None
 
 
 class ReindexRequest(BaseModel):
@@ -316,6 +322,37 @@ def chunk_threads(text: str) -> List[str]:
     return out
 
 
+def start_request_telemetry(enabled: bool):
+    if not enabled:
+        return None
+    return REQUEST_TELEMETRY.set(
+        {
+            "gemini_calls": [],
+            "sections": [],
+            "artifacts": [],
+        }
+    )
+
+
+def reset_request_telemetry(token) -> None:
+    if token is not None:
+        REQUEST_TELEMETRY.reset(token)
+
+
+def record_telemetry(bucket: str, event: Dict[str, Any]) -> None:
+    telemetry = REQUEST_TELEMETRY.get()
+    if telemetry is None:
+        return
+    telemetry.setdefault(bucket, []).append(event)
+
+
+def current_request_telemetry() -> Optional[Dict[str, Any]]:
+    telemetry = REQUEST_TELEMETRY.get()
+    if telemetry is None:
+        return None
+    return deepcopy(telemetry)
+
+
 def gemini_embed(texts: List[str]) -> List[List[float]]:
     if not GEMINI_API_KEY:
         raise RuntimeError("Brak GEMINI_API_KEY")
@@ -337,6 +374,7 @@ def gemini_generate(
     response_mime_type: str = "text/plain",
     temperature: float = 0.6,
     max_output_tokens: int = 2500,
+    telemetry_label: Optional[str] = None,
 ) -> str:
     if not GEMINI_API_KEY:
         raise RuntimeError("Brak GEMINI_API_KEY")
@@ -352,17 +390,54 @@ def gemini_generate(
     }
     r = requests.post(f"{url}?key={GEMINI_API_KEY}", json=payload, timeout=90)
     if r.status_code != 200:
+        record_telemetry(
+            "gemini_calls",
+            {
+                "label": telemetry_label or "gemini_generate",
+                "status_code": r.status_code,
+                "error": r.text[:500],
+                "temperature": temperature,
+                "max_output_tokens": max_output_tokens,
+                "response_mime_type": response_mime_type,
+                "prompt_chars": len(prompt),
+            },
+        )
         raise RuntimeError(f"Gemini generate error: {r.status_code} {r.text}")
     data = r.json()
 
+    out = ""
+    finish_reason = None
     try:
-        parts = data["candidates"][0]["content"]["parts"]
+        candidate = data["candidates"][0]
+        finish_reason = candidate.get("finishReason")
+        parts = candidate["content"]["parts"]
         texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
         out = "\n".join([t for t in texts if t.strip()]).strip()
-        if out:
-            return out
     except Exception:
-        pass
+        out = ""
+
+    usage = data.get("usageMetadata", {}) if isinstance(data, dict) else {}
+    record_telemetry(
+        "gemini_calls",
+        {
+            "label": telemetry_label or "gemini_generate",
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
+            "response_mime_type": response_mime_type,
+            "prompt_chars": len(prompt),
+            "response_chars": len(out),
+            "finish_reason": finish_reason,
+            "prompt_block_reason": (data.get("promptFeedback") or {}).get("blockReason"),
+            "safety_ratings": (data.get("candidates") or [{}])[0].get("safetyRatings"),
+            "prompt_token_count": usage.get("promptTokenCount"),
+            "candidates_token_count": usage.get("candidatesTokenCount"),
+            "total_token_count": usage.get("totalTokenCount"),
+            "thoughts_token_count": usage.get("thoughtsTokenCount"),
+            "response_preview": out[:200],
+        },
+    )
+    if out:
+        return out
     return str(data)
 
 
@@ -1901,6 +1976,7 @@ def generate_section_candidate(
     canonical_context = build_canonical_names_context(canonical_names)
     markers = artifact_required_markers(artifact_type)
     is_last_marker = marker == markers[-1]
+    attempts: List[Dict[str, Any]] = []
     prompt = f"""
 Jestes wspolautorem kampanii RPG "Krew Na Gwiazdach". Pisz po polsku.
 
@@ -1950,13 +2026,23 @@ ZWROC TYLKO TRESC SEKCJI:
                 response_mime_type="text/plain",
                 temperature=temperature,
                 max_output_tokens=900,
+                telemetry_label=f"section:{artifact_type}:{marker}",
             ).strip(),
         )
 
     try:
         candidate = run_prompt()
+        attempts.append(
+            {
+                "stage": "initial",
+                "chars": len(candidate),
+                "sentences": sentence_count(candidate),
+                "complete_bullets": complete_bullet_count(candidate),
+            }
+        )
     except Exception:
         candidate = ""
+        attempts.append({"stage": "initial", "error": True})
 
     needs_retry = section_needs_fill(
         artifact_type=artifact_type,
@@ -1973,8 +2059,16 @@ ZWROC TYLKO TRESC SEKCJI:
             retry_candidate = run_prompt(retry_rule, temperature=0.35)
             if retry_candidate:
                 candidate = retry_candidate
+            attempts.append(
+                {
+                    "stage": "retry",
+                    "chars": len(candidate),
+                    "sentences": sentence_count(candidate),
+                    "complete_bullets": complete_bullet_count(candidate),
+                }
+            )
         except Exception:
-            pass
+            attempts.append({"stage": "retry", "error": True})
     if section_needs_fill(
         artifact_type=artifact_type,
         marker=marker,
@@ -1994,6 +2088,14 @@ ZWROC TYLKO TRESC SEKCJI:
             broken_content=candidate,
             require_canonical_name=require_canonical_name,
         )
+        attempts.append(
+            {
+                "stage": "repair",
+                "chars": len(candidate),
+                "sentences": sentence_count(candidate),
+                "complete_bullets": complete_bullet_count(candidate),
+            }
+        )
     if section_needs_fill(
         artifact_type=artifact_type,
         marker=marker,
@@ -2007,9 +2109,38 @@ ZWROC TYLKO TRESC SEKCJI:
             compact_candidate = run_prompt(compact_rule, temperature=0.25)
             if compact_candidate:
                 candidate = compact_candidate
+            attempts.append(
+                {
+                    "stage": "compact",
+                    "chars": len(candidate),
+                    "sentences": sentence_count(candidate),
+                    "complete_bullets": complete_bullet_count(candidate),
+                }
+            )
         except Exception:
-            pass
-    return sanitize_generated_section(marker, candidate).strip()
+            attempts.append({"stage": "compact", "error": True})
+    final_candidate = sanitize_generated_section(marker, candidate).strip()
+    record_telemetry(
+        "sections",
+        {
+            "artifact_type": artifact_type,
+            "marker": marker,
+            "mode": "section_candidate",
+            "attempts": attempts,
+            "final_chars": len(final_candidate),
+            "final_sentences": sentence_count(final_candidate),
+            "final_complete_bullets": complete_bullet_count(final_candidate),
+            "needs_fill_after_finalize": section_needs_fill(
+                artifact_type=artifact_type,
+                marker=marker,
+                content=final_candidate,
+                is_last_marker=is_last_marker,
+            ),
+            "contains_canonical_name": any(name in final_candidate for name in canonical_names) if canonical_names else False,
+            "final_preview": final_candidate[:180],
+        },
+    )
+    return final_candidate
 
 
 def generate_bullet_item(
@@ -2098,6 +2229,7 @@ ZWROC TYLKO NOWY BULLET:
                     response_mime_type="text/plain",
                     temperature=0.3,
                     max_output_tokens=220,
+                    telemetry_label=f"bullet_item:{artifact_type}:{marker}:{target_index}",
                 ).strip()
             )
         except Exception:
@@ -2181,6 +2313,7 @@ ZWROC TYLKO POPRAWIONA TRESC SEKCJI:
                 response_mime_type="text/plain",
                 temperature=0.35,
                 max_output_tokens=900,
+                telemetry_label=f"repair:{artifact_type}:{marker}",
             ).strip(),
         )
     except Exception:
@@ -2214,6 +2347,7 @@ def generate_creative_section(
             require_canonical_name=require_canonical_name,
         )
         items = complete_bullet_items(candidate)
+        initial_item_count = len(items)
         target_count = section_target_bullet_count(artifact_type, marker)
 
         while len(items) < target_count:
@@ -2256,7 +2390,27 @@ def generate_creative_section(
                 else:
                     items.append(replacement)
 
-        return "\n".join(f"* {item}" for item in items)
+        final_section = "\n".join(f"* {item}" for item in items)
+        record_telemetry(
+            "sections",
+            {
+                "artifact_type": artifact_type,
+                "marker": marker,
+                "mode": "bullet_fill",
+                "initial_complete_items": initial_item_count,
+                "target_items": target_count,
+                "final_items": len(items),
+                "used_fill_items": max(0, len(items) - initial_item_count),
+                "needs_fill_after_finalize": section_needs_fill(
+                    artifact_type=artifact_type,
+                    marker=marker,
+                    content=final_section,
+                    is_last_marker=marker == artifact_required_markers(artifact_type)[-1],
+                ),
+                "final_preview": final_section[:180],
+            },
+        )
+        return final_section
 
     return generate_section_candidate(
         artifact_type=artifact_type,
@@ -2299,7 +2453,18 @@ def generate_structured_creative_artifact(
             require_canonical_name=bool(spec.get("require_canonical_name")),
         )
         section_values[spec["marker"]] = body
-    return render_partial_artifact_sections(section_values, artifact_type)
+    artifact_text = render_partial_artifact_sections(section_values, artifact_type)
+    record_telemetry(
+        "artifacts",
+        {
+            "artifact_type": artifact_type,
+            "mode": "structured",
+            "chars": len(artifact_text),
+            "markers_requiring_fill": markers_requiring_fill(artifact_text, artifact_type),
+            "preview": artifact_text[:200],
+        },
+    )
+    return artifact_text
 
 
 def append_missing_artifact_sections(text: str, artifact_type: ArtifactType) -> str:
@@ -3029,7 +3194,14 @@ def ask_text(req: AskRequest):
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
+    telemetry_token = start_request_telemetry(req.include_telemetry)
     try:
+        def build_chat_response(**kwargs) -> ChatResponse:
+            return ChatResponse(
+                **kwargs,
+                telemetry=current_request_telemetry() if req.include_telemetry else None,
+            )
+
         resolved_artifact_type = infer_artifact_type(req.message, req.artifact_type)
         resolved_intent = req.intent if req.intent != "auto" else detect_chat_intent(req.message)
         if is_creative_artifact_type(resolved_artifact_type):
@@ -3048,7 +3220,7 @@ def chat(req: ChatRequest):
                 )
                 if warning:
                     warnings.append(warning)
-            return ChatResponse(
+            return build_chat_response(
                 kind="answer",
                 reply=artifact_text,
                 artifact_type=resolved_artifact_type,
@@ -3076,7 +3248,7 @@ def chat(req: ChatRequest):
                 )
                 if warning:
                     warnings.append(warning)
-            return ChatResponse(
+            return build_chat_response(
                 kind="creative",
                 reply=artifact_text,
                 artifact_type=creative_artifact_type,
@@ -3121,7 +3293,7 @@ def chat(req: ChatRequest):
                 )
                 if warning:
                     warnings.append(warning)
-            return ChatResponse(
+            return build_chat_response(
                 kind="answer",
                 reply=reply,
                 artifact_type=resolved_artifact_type,
@@ -3168,7 +3340,7 @@ def chat(req: ChatRequest):
                 )
                 if warning:
                     warnings.append(warning)
-            return ChatResponse(
+            return build_chat_response(
                 kind="session_sync",
                 reply=reply,
                 artifact_type=resolved_artifact_type,
@@ -3216,7 +3388,7 @@ def chat(req: ChatRequest):
             )
             if warning:
                 warnings.append(warning)
-        return ChatResponse(
+        return build_chat_response(
             kind="proposal",
             reply=reply,
             artifact_type=resolved_artifact_type,
@@ -3232,6 +3404,8 @@ def chat(req: ChatRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=format_exception_message(e))
+    finally:
+        reset_request_telemetry(telemetry_token)
 
 
 @app.post("/chat_text", response_class=PlainTextResponse)
@@ -3242,6 +3416,8 @@ def chat_text(req: ChatRequest):
         text = text + "\n\nZapisano do:\n- " + response.output_path
     if response.warnings:
         text = text + "\n\nUwagi:\n" + "\n".join(f"- {warning}" for warning in response.warnings)
+    if response.telemetry:
+        text = text + "\n\nTelemetry:\n" + json.dumps(response.telemetry, ensure_ascii=False, indent=2)
     return text + "\n"
 
 

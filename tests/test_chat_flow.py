@@ -60,6 +60,28 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("Zrodla:", response.reply)
         self.assertEqual(response.references, ["01 Bible / Campaign Bible"])
 
+    def test_chat_can_return_telemetry_when_requested(self):
+        original_ask = main.ask
+
+        def fake_ask(req):
+            main.record_telemetry("gemini_calls", {"label": "answer:test", "finish_reason": "STOP"})
+            return main.AskResponse(answer="Gotowy tekst.", sources=[])
+
+        try:
+            main.ask = fake_ask
+            response = main.chat(
+                main.ChatRequest(
+                    message="Odpowiedz krotko.",
+                    intent="answer",
+                    include_telemetry=True,
+                )
+            )
+        finally:
+            main.ask = original_ask
+
+        self.assertIsNotNone(response.telemetry)
+        self.assertEqual(response.telemetry["gemini_calls"][0]["label"], "answer:test")
+
     def test_chat_answer_can_render_gm_brief_artifact(self):
         original_ask = main.ask
         try:
@@ -89,6 +111,26 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("# GM Brief", response.artifact_text)
         self.assertIn("## Sources", response.artifact_text)
         self.assertIn("01 Bible / Campaign Bible", response.artifact_text)
+
+    def test_chat_text_appends_telemetry_when_present(self):
+        original_chat = main.chat
+        try:
+            main.chat = lambda req: main.ChatResponse(
+                kind="answer",
+                reply="Gotowy tekst.",
+                telemetry={"gemini_calls": [{"label": "debug:test"}]},
+            )
+            text = main.chat_text(
+                main.ChatRequest(
+                    message="Odpowiedz krotko.",
+                    include_telemetry=True,
+                )
+            )
+        finally:
+            main.chat = original_chat
+
+        self.assertIn("Telemetry:", text)
+        self.assertIn("\"debug:test\"", text)
 
     def test_chat_creative_returns_generated_artifact(self):
         original_generate_creative_artifact = main.generate_creative_artifact
