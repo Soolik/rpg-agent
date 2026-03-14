@@ -172,6 +172,116 @@ class WorkflowStoreTest(unittest.TestCase):
         self.assertTrue(row.response["ok"])
         self.assertIn("from apply_runs", cursor.statements[0][0].lower())
 
+    def test_save_proposal_persists_status_metadata(self):
+        cursor = FakeCursor(fetchone_values=[(21,)])
+        connection = FakeConnection(cursor)
+        store = WorkflowStore(campaign_id="kng", connection_factory=lambda: connection)
+
+        proposal = ChangeProposal(summary="Test", user_goal="Goal")
+        proposal_id = store.save_proposal(
+            request=ProposeChangesRequest(instruction="do it"),
+            proposal=proposal,
+            proposal_type="world_model_change",
+            proposal_status="proposed",
+            supersedes_proposal_id=12,
+        )
+
+        self.assertEqual(proposal_id, 21)
+        payload = cursor.statements[1][1][0]
+        self.assertIn('"proposal_type": "world_model_change"', payload)
+        self.assertIn('"proposal_status": "proposed"', payload)
+        self.assertIn('"supersedes_proposal_id": 12', payload)
+
+    def test_list_proposal_details_filters_on_metadata(self):
+        now = datetime.now(timezone.utc)
+        cursor = FakeCursor(fetchone_values=[])
+        cursor.fetchall = lambda: [
+            (
+                1,
+                "kng",
+                "Summary A",
+                "Goal A",
+                False,
+                None,
+                now,
+                now,
+                {"instruction": "A"},
+                {"proposal_id": 1, "proposal_type": "world_model_change", "proposal_status": "proposed"},
+            ),
+            (
+                2,
+                "kng",
+                "Summary B",
+                "Goal B",
+                False,
+                None,
+                now,
+                now,
+                {"instruction": "B"},
+                {"proposal_id": 2, "proposal_type": "general", "proposal_status": "accepted"},
+            ),
+        ]
+        connection = FakeConnection(cursor)
+        store = WorkflowStore(campaign_id="kng", connection_factory=lambda: connection)
+
+        rows = store.list_proposal_details(limit=10, proposal_type="world_model_change", proposal_status="proposed")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].id, 1)
+        self.assertEqual(rows[0].proposal["proposal_status"], "proposed")
+
+    def test_update_proposal_state_updates_payload_and_flags(self):
+        now = datetime.now(timezone.utc)
+        select_cursor = FakeCursor(
+            fetchone_values=[
+                (
+                    4,
+                    "kng",
+                    "Summary",
+                    "Goal",
+                    False,
+                    None,
+                    now,
+                    now,
+                    {"instruction": "do it"},
+                    {"proposal_id": 4, "proposal_type": "world_model_change", "proposal_status": "proposed"},
+                ),
+                (
+                    4,
+                    "kng",
+                    "Summary",
+                    "Goal",
+                    True,
+                    "mgr",
+                    now,
+                    now,
+                    {"instruction": "do it"},
+                    {
+                        "proposal_id": 4,
+                        "proposal_type": "world_model_change",
+                        "proposal_status": "accepted",
+                        "accepted_apply_run_id": 88,
+                        "reviewed_by": "mgr",
+                    },
+                ),
+            ]
+        )
+        connection = FakeConnection(select_cursor)
+        store = WorkflowStore(campaign_id="kng", connection_factory=lambda: connection)
+
+        row = store.update_proposal_state(
+            4,
+            proposal_status="accepted",
+            reviewed_by="mgr",
+            accepted_apply_run_id=88,
+        )
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row.proposal["proposal_status"], "accepted")
+        self.assertEqual(row.proposal["accepted_apply_run_id"], 88)
+        self.assertEqual(connection.commit_called, 1)
+        self.assertIn("update proposals", select_cursor.statements[1][0].lower())
+
 
 if __name__ == "__main__":
     unittest.main()

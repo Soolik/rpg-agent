@@ -21,7 +21,15 @@ class WorkflowStore:
     campaign_id: str
     connection_factory: Callable[[], object]
 
-    def save_proposal(self, request: ProposeChangesRequest, proposal: ChangeProposal) -> int:
+    def save_proposal(
+        self,
+        request: ProposeChangesRequest,
+        proposal: ChangeProposal,
+        *,
+        proposal_type: str = "general",
+        proposal_status: str = "proposed",
+        supersedes_proposal_id: Optional[int] = None,
+    ) -> int:
         with self.connection_factory() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -53,6 +61,12 @@ class WorkflowStore:
                 payload = {
                     **proposal.model_dump(mode="json"),
                     "proposal_id": proposal_id,
+                    "proposal_type": proposal_type,
+                    "proposal_status": proposal_status,
+                    "supersedes_proposal_id": supersedes_proposal_id,
+                    "accepted_apply_run_id": None,
+                    "rejected_reason": None,
+                    "reviewed_by": None,
                 }
                 cur.execute(
                     """
@@ -78,6 +92,7 @@ class WorkflowStore:
         proposal_id = request.proposal_id or request.proposal.proposal_id or response.proposal_id
         request_payload = request.model_dump(mode="json")
         response_payload = response.model_dump(mode="json")
+        approved_flag = bool(request.approved and response.ok)
 
         with self.connection_factory() as conn:
             with conn.cursor() as cur:
@@ -117,7 +132,7 @@ class WorkflowStore:
                         where campaign_id = %s and id = %s
                         """,
                         (
-                            request.approved,
+                            approved_flag,
                             request.approved_by,
                             self.campaign_id,
                             proposal_id,
@@ -213,6 +228,109 @@ class WorkflowStore:
             },
         )
 
+    def list_proposal_details(
+        self,
+        limit: int = 20,
+        *,
+        proposal_type: Optional[str] = None,
+        proposal_status: Optional[str] = None,
+    ) -> list[ProposalDetail]:
+        with self.connection_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select id, campaign_id, summary, user_goal, approved, approved_by, created_at, updated_at,
+                           request_json, proposal_json
+                    from proposals
+                    where campaign_id = %s
+                    order by created_at desc
+                    limit %s
+                    """,
+                    (self.campaign_id, limit),
+                )
+                rows = cur.fetchall()
+
+        details: list[ProposalDetail] = []
+        for row in rows:
+            payload = {
+                **(row[9] or {}),
+                "proposal_id": (row[9] or {}).get("proposal_id") or row[0],
+            }
+            if proposal_type and payload.get("proposal_type", "general") != proposal_type:
+                continue
+            if proposal_status and payload.get("proposal_status", "proposed") != proposal_status:
+                continue
+            details.append(
+                ProposalDetail(
+                    id=row[0],
+                    campaign_id=row[1],
+                    summary=row[2],
+                    user_goal=row[3],
+                    approved=bool(row[4]),
+                    approved_by=row[5],
+                    created_at=row[6].isoformat(),
+                    updated_at=row[7].isoformat(),
+                    request=row[8] or {},
+                    proposal=payload,
+                )
+            )
+        return details
+
+    def update_proposal_state(
+        self,
+        proposal_id: int,
+        *,
+        proposal_status: str,
+        reviewed_by: Optional[str] = None,
+        rejected_reason: Optional[str] = None,
+        accepted_apply_run_id: Optional[int] = None,
+    ) -> Optional[ProposalDetail]:
+        current = self.get_proposal(proposal_id)
+        if not current:
+            return None
+
+        payload = {
+            **current.proposal,
+            "proposal_id": current.proposal.get("proposal_id") or current.id,
+            "proposal_status": proposal_status,
+            "reviewed_by": reviewed_by or current.proposal.get("reviewed_by"),
+            "rejected_reason": rejected_reason,
+            "accepted_apply_run_id": accepted_apply_run_id,
+        }
+
+        approved = current.approved
+        approved_by = current.approved_by
+        if proposal_status == "accepted":
+            approved = True
+            approved_by = reviewed_by or approved_by
+        elif proposal_status in {"rejected", "superseded"}:
+            approved = False
+            if reviewed_by:
+                approved_by = reviewed_by
+
+        with self.connection_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    update proposals
+                    set approved = %s,
+                        approved_by = %s,
+                        proposal_json = %s::jsonb,
+                        updated_at = now()
+                    where campaign_id = %s and id = %s
+                    """,
+                    (
+                        approved,
+                        approved_by,
+                        json.dumps(payload),
+                        self.campaign_id,
+                        proposal_id,
+                    ),
+                )
+            conn.commit()
+
+        return self.get_proposal(proposal_id)
+
     def get_apply_run(self, apply_run_id: int) -> Optional[ApplyRunDetail]:
         with self.connection_factory() as conn:
             with conn.cursor() as cur:
@@ -243,7 +361,15 @@ class WorkflowStore:
 
 
 class NullWorkflowStore:
-    def save_proposal(self, request: ProposeChangesRequest, proposal: ChangeProposal) -> Optional[int]:
+    def save_proposal(
+        self,
+        request: ProposeChangesRequest,
+        proposal: ChangeProposal,
+        *,
+        proposal_type: str = "general",
+        proposal_status: str = "proposed",
+        supersedes_proposal_id: Optional[int] = None,
+    ) -> Optional[int]:
         return None
 
     def save_apply_run(
@@ -260,6 +386,26 @@ class NullWorkflowStore:
         return []
 
     def get_proposal(self, proposal_id: int) -> Optional[ProposalDetail]:
+        return None
+
+    def list_proposal_details(
+        self,
+        limit: int = 20,
+        *,
+        proposal_type: Optional[str] = None,
+        proposal_status: Optional[str] = None,
+    ) -> list[ProposalDetail]:
+        return []
+
+    def update_proposal_state(
+        self,
+        proposal_id: int,
+        *,
+        proposal_status: str,
+        reviewed_by: Optional[str] = None,
+        rejected_reason: Optional[str] = None,
+        accepted_apply_run_id: Optional[int] = None,
+    ) -> Optional[ProposalDetail]:
         return None
 
     def get_apply_run(self, apply_run_id: int) -> Optional[ApplyRunDetail]:

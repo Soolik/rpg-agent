@@ -19,6 +19,23 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
+from app.applier import ProposalApplier
+from app.chat_models import (
+    ArtifactType,
+    AskRequest,
+    AskResponse,
+    CampaignOut,
+    ChatIntent,
+    ChatRequest,
+    ChatResponse,
+    EntityPatch,
+    IngestAndSyncSessionRequest,
+    IngestAndSyncSessionResponse,
+    IngestSessionRequest,
+    ReindexRequest,
+    SessionPatch,
+    ThreadPatch,
+)
 from app.creative_artifacts import (
     append_missing_artifact_sections,
     artifact_required_markers,
@@ -60,13 +77,14 @@ from app.models_v2 import (
     WorldEntityType,
 )
 from app.planner import PlannerService
+from app.routes_v1 import build_v1_router
 from app.routes_v2 import build_context_for_planner, build_v2_router
 from app.text_normalization import normalize_text_artifacts
 from app.world_model_store import WorldModelStore
 from app.workflow_store import WorkflowStore
 from googleapiclient.discovery import build
 from pgvector.psycopg import register_vector
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import ValidationError
 from html import unescape
 
 APP_NAME = "rpg-agent"
@@ -119,104 +137,6 @@ CORE_WORLD_DOC_MAP = {
 # Models (API)
 # -------------------------
 
-AskMode = Literal["auto", "campaign", "general", "scene"]
-ChatIntent = Literal["auto", "answer", "proposal", "session_sync", "creative"]
-ArtifactType = Literal[
-    "gm_brief",
-    "session_report",
-    "player_summary",
-    "pre_session_brief",
-    "session_hooks",
-    "scene_seed",
-    "npc_brief",
-    "twist_pack",
-]
-
-
-class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1)
-    top_k: int = Field(default=6, ge=1, le=20)
-    include_sources: bool = False
-    mode: AskMode = "auto"
-
-
-class AskResponse(BaseModel):
-    answer: str
-    sources: List[Dict[str, Any]] = []
-
-
-class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1)
-    intent: ChatIntent = "auto"
-    artifact_type: Optional[ArtifactType] = None
-    source_title: Optional[str] = None
-    include_sources: bool = False
-    include_telemetry: bool = False
-    save_output: bool = False
-    output_title: Optional[str] = None
-
-
-class ChatResponse(BaseModel):
-    kind: Literal["answer", "proposal", "session_sync", "creative"]
-    reply: str
-    artifact_type: Optional[ArtifactType] = None
-    artifact_text: Optional[str] = None
-    proposal_id: Optional[int] = None
-    session_id: Optional[int] = None
-    references: List[str] = []
-    warnings: List[str] = []
-    output_doc_id: Optional[str] = None
-    output_title: Optional[str] = None
-    output_path: Optional[str] = None
-    telemetry: Optional[Dict[str, Any]] = None
-
-
-class ReindexRequest(BaseModel):
-    clean: bool = False
-
-
-class IngestSessionRequest(BaseModel):
-    raw_notes: str = Field(..., min_length=1)
-    campaign_id: Optional[str] = None
-
-
-class ThreadPatch(BaseModel):
-    thread_id: Optional[str] = None
-    title: str
-    status: Optional[str] = None
-    change: str
-
-
-class EntityPatch(BaseModel):
-    kind: Literal["npc", "location", "faction", "item", "other"] = "other"
-    name: str
-    description: str
-    tags: List[str] = []
-
-
-class SessionPatch(BaseModel):
-    session_summary: str
-    thread_tracker_patch: List[ThreadPatch] = []
-    entities_patch: List[EntityPatch] = []
-    rag_additions: List[str] = []
-
-
-class IngestAndSyncSessionRequest(IngestSessionRequest):
-    source_doc_id: Optional[str] = None
-    source_title: Optional[str] = None
-
-
-class IngestAndSyncSessionResponse(BaseModel):
-    patch: SessionPatch
-    sync: SyncSessionPatchResponse
-
-
-class CampaignOut(BaseModel):
-    # twardy output dla trybu kampanii (zero dopowiedzeń)
-    format: Literal["bullets", "table"] = "bullets"
-    bullets: List[str] = []
-    table: Optional[Dict[str, Any]] = None
-    used_context: List[int] = []
 
 
 # -------------------------
@@ -2746,6 +2666,7 @@ workflow_store_v2 = build_workflow_store()
 world_model_store_v2 = build_world_model_store()
 planner_v2 = PlannerService(generate_text_fn=planner_generate_json)
 consistency_planner_v2 = PlannerService(generate_text_fn=planner_generate_text)
+proposal_applier_v2 = ProposalApplier(drive_store=drive_store_v2, reindex_fn=reindex_after_apply_default)
 app.include_router(
     build_v2_router(
         drive_store=drive_store_v2,
@@ -2755,6 +2676,18 @@ app.include_router(
         campaign_id=CAMPAIGN_ID,
         workflow_store=workflow_store_v2,
         world_model_store=world_model_store_v2,
+    )
+)
+app.include_router(
+    build_v1_router(
+        chat_request_cls=ChatRequest,
+        chat_fn=lambda req: chat(req),
+        health_fn=lambda: health(),
+        drive_store=drive_store_v2,
+        planner=planner_v2,
+        workflow_store=workflow_store_v2,
+        world_model_store=world_model_store_v2,
+        applier=proposal_applier_v2,
     )
 )
 
