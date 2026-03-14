@@ -20,9 +20,16 @@ from .models_v2 import (
     ProposeChangesRequest,
     ReadWorldDocRequest,
     ReadWorldDocResponse,
+    SyncSessionPatchRequest,
+    SyncSessionPatchResponse,
+    WorldEntityRecord,
+    WorldModelStatusResponse,
+    WorldSessionRecord,
     WorldStatusResponse,
+    WorldThreadRecord,
 )
 from .planner import PlannerService
+from .world_model_store import NullWorldModelStore, WorldModelStore
 from .workflow_store import NullWorkflowStore, WorkflowStore
 
 
@@ -56,10 +63,12 @@ def build_v2_router(
     indexed_chunks_fn: Optional[Callable[[], Optional[int]]] = None,
     campaign_id: Optional[str] = None,
     workflow_store: Optional[WorkflowStore | NullWorkflowStore] = None,
+    world_model_store: Optional[WorldModelStore | NullWorldModelStore] = None,
 ) -> APIRouter:
     router = APIRouter(tags=["world-v2"])
     applier = ProposalApplier(drive_store=drive_store, reindex_fn=reindex_fn)
     store = workflow_store or NullWorkflowStore()
+    model_store = world_model_store or NullWorldModelStore()
 
     @router.get("/world_status", response_model=WorldStatusResponse)
     def world_status() -> WorldStatusResponse:
@@ -82,6 +91,33 @@ def build_v2_router(
     @router.get("/list_world_docs")
     def list_world_docs():
         return drive_store.list_world_docs()
+
+    @router.get("/world_model_status", response_model=WorldModelStatusResponse)
+    def world_model_status():
+        status = model_store.status()
+        if not status.campaign_id and campaign_id:
+            return WorldModelStatusResponse(
+                campaign_id=campaign_id,
+                entity_count=status.entity_count,
+                thread_count=status.thread_count,
+                session_count=status.session_count,
+            )
+        return status
+
+    @router.get("/entities", response_model=list[WorldEntityRecord])
+    def list_entities(limit: int = 20, kind: Optional[str] = None):
+        safe_limit = max(1, min(limit, 100))
+        return model_store.list_entities(limit=safe_limit, kind=kind)
+
+    @router.get("/threads", response_model=list[WorldThreadRecord])
+    def list_threads(limit: int = 20, status: Optional[str] = None):
+        safe_limit = max(1, min(limit, 100))
+        return model_store.list_threads(limit=safe_limit, status=status)
+
+    @router.get("/sessions", response_model=list[WorldSessionRecord])
+    def list_sessions(limit: int = 20):
+        safe_limit = max(1, min(limit, 100))
+        return model_store.list_sessions(limit=safe_limit)
 
     @router.get("/proposals", response_model=list[ProposalRecord])
     def list_proposals(limit: int = 20):
@@ -114,6 +150,15 @@ def build_v2_router(
             raise HTTPException(status_code=404, detail="World document not found")
         content = drive_store.read_doc(found)
         return ReadWorldDocResponse(doc=found, content=content)
+
+    @router.post("/sync_session_patch", response_model=SyncSessionPatchResponse)
+    def sync_session_patch(request: SyncSessionPatchRequest) -> SyncSessionPatchResponse:
+        if request.campaign_id and campaign_id and request.campaign_id != campaign_id:
+            raise HTTPException(status_code=400, detail="campaign_id does not match configured campaign")
+        response = model_store.sync_session_patch(request)
+        if response is None:
+            raise HTTPException(status_code=503, detail="World model store is not configured")
+        return response
 
     @router.post("/propose_changes")
     def propose_changes(request: ProposeChangesRequest):

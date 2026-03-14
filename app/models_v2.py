@@ -163,3 +163,80 @@ class ConsistencyCheckResponse(BaseModel):
     summary: str
     issues: List[ConsistencyIssue] = Field(default_factory=list)
     suggestions: List[str] = Field(default_factory=list)
+
+
+class SessionThreadPatchPayload(BaseModel):
+    thread_id: Optional[str] = None
+    title: str
+    status: Optional[str] = None
+    change: str
+
+
+class SessionEntityPatchPayload(BaseModel):
+    kind: Literal["npc", "location", "faction", "item", "other"] = "other"
+    name: str
+    description: str
+    tags: List[str] = Field(default_factory=list)
+
+
+class SessionPatchPayload(BaseModel):
+    session_summary: str
+    thread_tracker_patch: List[SessionThreadPatchPayload] = Field(default_factory=list)
+    entities_patch: List[SessionEntityPatchPayload] = Field(default_factory=list)
+    rag_additions: List[str] = Field(default_factory=list)
+
+
+class SyncSessionPatchRequest(BaseModel):
+    patch: SessionPatchPayload
+    raw_notes: Optional[str] = None
+    campaign_id: Optional[str] = None
+    source_doc_id: Optional[str] = None
+    source_title: Optional[str] = None
+
+
+class SyncSessionPatchResponse(BaseModel):
+    session_id: int
+    campaign_id: str
+    summary: str
+    entity_count: int
+    thread_count: int
+
+
+class WorldEntityRecord(BaseModel):
+    id: int
+    campaign_id: str
+    entity_kind: str
+    name: str
+    description: str
+    tags: List[str] = Field(default_factory=list)
+    last_session_id: Optional[int] = None
+    updated_at: str
+
+
+class WorldThreadRecord(BaseModel):
+    id: int
+    campaign_id: str
+    thread_key: str
+    thread_id: Optional[str] = None
+    title: str
+    status: Optional[str] = None
+    last_change: str
+    last_session_id: Optional[int] = None
+    updated_at: str
+
+
+class WorldSessionRecord(BaseModel):
+    id: int
+    campaign_id: str
+    session_summary: str
+    entity_count: int
+    thread_count: int
+    source_title: Optional[str] = None
+    created_at: str
+
+
+class WorldModelStatusResponse(BaseModel):
+    campaign_id: str
+    entity_count: int = 0
+    thread_count: int = 0
+    session_count: int = 0

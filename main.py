@@ -21,6 +21,7 @@ from app.drive_store import DriveStore, decode_google_export_text
 from app.models_v2 import DocumentRef, WorldDocInfo
 from app.planner import PlannerService
 from app.routes_v2 import build_v2_router
+from app.world_model_store import WorldModelStore
 from app.workflow_store import WorkflowStore
 from googleapiclient.discovery import build
 from pgvector.psycopg import register_vector
@@ -618,8 +619,23 @@ def ctx_slice(h: Dict[str, Any]) -> str:
         return text
 
     head = text[:900].rstrip()
+    anchor = ""
+    match = re.search(r"#{1,6}\s+[^\n]+", text)
+    if match:
+        start = max(0, match.start() - 200)
+        end = min(len(text), match.end() + 400)
+        anchor = text[start:end].strip()
+    if not anchor:
+        midpoint = len(text) // 2
+        start = max(0, midpoint - 300)
+        end = min(len(text), midpoint + 300)
+        anchor = text[start:end].strip()
     tail = text[-900:].lstrip()
-    return f"{head}\n...\n{tail}"
+    parts = [head]
+    if anchor and anchor not in head and anchor not in tail:
+        parts.extend(["...", anchor])
+    parts.extend(["...", tail])
+    return "\n".join(parts)
 
 
 def build_campaign_context(hits: List[Dict[str, Any]]) -> str:
@@ -755,6 +771,12 @@ def build_workflow_store() -> Optional[WorkflowStore]:
     return WorkflowStore(campaign_id=CAMPAIGN_ID, connection_factory=db_conn)
 
 
+def build_world_model_store() -> Optional[WorldModelStore]:
+    if not DB_URL:
+        return None
+    return WorldModelStore(campaign_id=CAMPAIGN_ID, connection_factory=db_conn)
+
+
 def doc_type_for_indexing(doc: WorldDocInfo) -> str:
     if doc.title == "Thread Tracker":
         return "threads"
@@ -883,6 +905,7 @@ def reindex_after_apply_default(targets: List[DocumentRef]) -> Dict[str, Any]:
 
 drive_store_v2 = build_drive_store()
 workflow_store_v2 = build_workflow_store()
+world_model_store_v2 = build_world_model_store()
 planner_v2 = PlannerService(generate_text_fn=planner_generate_json)
 consistency_planner_v2 = PlannerService(generate_text_fn=planner_generate_text)
 app.include_router(
@@ -893,6 +916,7 @@ app.include_router(
         indexed_chunks_fn=count_indexed_chunks,
         campaign_id=CAMPAIGN_ID,
         workflow_store=workflow_store_v2,
+        world_model_store=world_model_store_v2,
     )
 )
 
@@ -941,8 +965,23 @@ def ctx_slice(h: Dict[str, Any]) -> str:
     if len(text) <= limit:
         return text
     head = text[:900].rstrip()
+    anchor = ""
+    match = re.search(r"#{1,6}\s+[^\n]+", text)
+    if match:
+        start = max(0, match.start() - 200)
+        end = min(len(text), match.end() + 400)
+        anchor = text[start:end].strip()
+    if not anchor:
+        midpoint = len(text) // 2
+        start = max(0, midpoint - 300)
+        end = min(len(text), midpoint + 300)
+        anchor = text[start:end].strip()
     tail = text[-900:].lstrip()
-    return f"{head}\n...\n{tail}"
+    parts = [head]
+    if anchor and anchor not in head and anchor not in tail:
+        parts.extend(["...", anchor])
+    parts.extend(["...", tail])
+    return "\n".join(parts)
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
