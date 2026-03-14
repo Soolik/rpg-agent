@@ -1448,6 +1448,14 @@ def normalize_section_body(content: str) -> str:
     return normalized
 
 
+def bullet_count(content: str) -> int:
+    return sum(1 for line in (content or "").splitlines() if re.match(r"^\s*[\*\-]\s+", line))
+
+
+def ends_with_sentence_punctuation(content: str) -> bool:
+    return bool(re.search(r"[.!?\)\]\"']\s*$", (content or "").strip()))
+
+
 def section_min_length(artifact_type: ArtifactType, marker: str) -> int:
     if artifact_type == "pre_session_brief":
         return 60 if marker == "## Campaign State" else 35
@@ -1473,12 +1481,28 @@ def section_needs_fill(
     content: str,
     is_last_marker: bool,
 ) -> bool:
+    raw = (content or "").strip()
     normalized = normalize_section_body(content)
     lowered = normalized.lower()
     if not normalized:
         return True
     if "do doprecyzowania" in lowered:
         return True
+    if artifact_type == "session_hooks":
+        if marker == "Tytul:":
+            return "\n" in raw or len(raw.split()) > 12
+        if marker in {"Hook 1:", "Hook 2:", "Hook 3:"}:
+            return len(normalized) < section_min_length(artifact_type, marker) or not ends_with_sentence_punctuation(raw)
+        if marker in {"Stawki:", "Co przygotowac:"}:
+            return bullet_count(raw) < 2
+    if artifact_type == "npc_brief":
+        if marker == "Imie:":
+            return "\n" in raw or len(normalized) < 2
+        if marker in {"Relacje:", "Jak uzyc tej postaci na sesji:"}:
+            return bullet_count(raw) < 2
+        return len(normalized) < section_min_length(artifact_type, marker) or not ends_with_sentence_punctuation(raw)
+    if artifact_type == "pre_session_brief" and marker.startswith("## "):
+        return bullet_count(raw) < 2
     if len(normalized) < section_min_length(artifact_type, marker):
         return True
     if is_last_marker and artifact_type in {"pre_session_brief", "npc_brief"}:
@@ -1505,6 +1529,25 @@ def markers_requiring_fill(text: str, artifact_type: ArtifactType) -> List[str]:
         ):
             required.append(marker)
     return required
+
+
+def section_retry_rule(artifact_type: ArtifactType, marker: str) -> str:
+    if artifact_type == "session_hooks":
+        if marker == "Tytul:":
+            return "Zwroc dokladnie jeden krotki wiersz tytulu. Bez listy, bez lamanych linii."
+        if marker in {"Hook 1:", "Hook 2:", "Hook 3:"}:
+            return "Zwroc 2-4 pelne zdania i zakoncz sekcje pelnym zdaniem z kropka, pytajnikiem albo wykrzyknikiem."
+        if marker in {"Stawki:", "Co przygotowac:"}:
+            return "Zwroc co najmniej 4 osobne bullety zaczynajace sie od '* '."
+    if artifact_type == "npc_brief":
+        if marker == "Imie:":
+            return "Zwroc tylko imie albo imie i nazwisko w jednym wierszu."
+        if marker in {"Relacje:", "Jak uzyc tej postaci na sesji:"}:
+            return "Zwroc co najmniej 3 osobne bullety zaczynajace sie od '* '."
+        return "Zwroc 2-4 pelne zdania i zakoncz sekcje pelnym zdaniem."
+    if artifact_type == "pre_session_brief" and marker.startswith("## "):
+        return "Zwroc co najmniej 3 osobne bullety zaczynajace sie od '* '."
+    return "Uzupelnij sekcje pelna i konkretna trescia."
 
 
 def missing_artifact_markers(text: str, artifact_type: ArtifactType) -> List[str]:
@@ -1772,7 +1815,7 @@ ZWROC TYLKO TRESC SEKCJI:
     )
     missing_name = require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)
     if needs_retry or missing_name:
-        retry_rule = "Uzupelnij sekcje pelna, konkretna trescia."
+        retry_rule = section_retry_rule(artifact_type, marker)
         if require_canonical_name and canonical_names:
             retry_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
         try:

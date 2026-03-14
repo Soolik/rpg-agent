@@ -401,6 +401,29 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("## Active Threads", markers)
         self.assertIn("## Prep Checklist", markers)
 
+    def test_markers_requiring_fill_detects_truncated_session_hooks_sections(self):
+        markers = main.markers_requiring_fill(
+            "Tytul:\nZa dlugi\nw dwoch liniach.\n\n"
+            "Hook 1:\nCaptain Mira prosi BG o pomoc w sprawie Red Blade i\n\n"
+            "Stawki:\n* Jedna stawka.",
+            "session_hooks",
+        )
+
+        self.assertIn("Tytul:", markers)
+        self.assertIn("Hook 1:", markers)
+        self.assertIn("Stawki:", markers)
+
+    def test_markers_requiring_fill_detects_incomplete_npc_lists(self):
+        markers = main.markers_requiring_fill(
+            "Imie: Kael\n\n"
+            "Rola w kampanii:\nDowodca Red Blade, ktory naciska Captain Mira.\n\n"
+            "Relacje:\n* Captain Mira: uwaza ja za zbyt miekka.",
+            "npc_brief",
+        )
+
+        self.assertIn("Relacje:", markers)
+        self.assertIn("Jak uzyc tej postaci na sesji:", markers)
+
     def test_chat_answer_can_save_output_doc(self):
         original_ask = main.ask
         original_drive_store = main.drive_store_v2
