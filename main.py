@@ -423,7 +423,11 @@ def gemini_generate_stream(
         payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": thinking_budget}
 
     response = requests.post(
-        f"{url}?key={GEMINI_API_KEY}",
+        url,
+        headers={
+            "x-goog-api-key": GEMINI_API_KEY,
+            "Content-Type": "application/json",
+        },
         json=payload,
         timeout=90,
         stream=True,
@@ -2954,10 +2958,13 @@ def stream_chat(req: ChatRequest) -> Optional[DirectChatStream]:
     if is_campaign_question(req.message):
         return None
 
-    return DirectChatStream(
-        chunks=gemini_generate_stream(build_general_prompt(req.message.strip())),
-        kind="answer",
-    )
+    try:
+        return DirectChatStream(
+            chunks=gemini_generate_stream(build_general_prompt(req.message.strip())),
+            kind="answer",
+        )
+    except Exception:
+        return None
 
 
 @app.post("/chat", response_model=ChatResponse)
