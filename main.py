@@ -59,6 +59,9 @@ OUTPUT_ROLLUP_MODE = os.getenv("OUTPUT_ROLLUP_MODE", "replace").strip().lower()
 # Models
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")
 GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-2.5-pro")
+CREATIVE_THINKING_BUDGET = int(os.getenv("CREATIVE_THINKING_BUDGET", "128"))
+CREATIVE_SECTION_MAX_OUTPUT_TOKENS = int(os.getenv("CREATIVE_SECTION_MAX_OUTPUT_TOKENS", "1200"))
+CREATIVE_BULLET_MAX_OUTPUT_TOKENS = int(os.getenv("CREATIVE_BULLET_MAX_OUTPUT_TOKENS", "320"))
 
 # Debug/visibility
 REVISION = os.getenv("K_REVISION", "unknown")
@@ -374,6 +377,7 @@ def gemini_generate(
     response_mime_type: str = "text/plain",
     temperature: float = 0.6,
     max_output_tokens: int = 2500,
+    thinking_budget: Optional[int] = None,
     telemetry_label: Optional[str] = None,
 ) -> str:
     if not GEMINI_API_KEY:
@@ -388,6 +392,8 @@ def gemini_generate(
             "responseMimeType": response_mime_type,
         },
     }
+    if thinking_budget is not None:
+        payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": thinking_budget}
     r = requests.post(f"{url}?key={GEMINI_API_KEY}", json=payload, timeout=90)
     if r.status_code != 200:
         record_telemetry(
@@ -398,6 +404,7 @@ def gemini_generate(
                 "error": r.text[:500],
                 "temperature": temperature,
                 "max_output_tokens": max_output_tokens,
+                "thinking_budget": thinking_budget,
                 "response_mime_type": response_mime_type,
                 "prompt_chars": len(prompt),
             },
@@ -423,6 +430,7 @@ def gemini_generate(
             "label": telemetry_label or "gemini_generate",
             "temperature": temperature,
             "max_output_tokens": max_output_tokens,
+            "thinking_budget": thinking_budget,
             "response_mime_type": response_mime_type,
             "prompt_chars": len(prompt),
             "response_chars": len(out),
@@ -1784,6 +1792,8 @@ ZWROC TYLKO BRAKUJACE SEKCJE:
             response_mime_type="text/plain",
             temperature=0.4,
             max_output_tokens=2000,
+            thinking_budget=CREATIVE_THINKING_BUDGET,
+            telemetry_label=f"fill_missing:{artifact_type}",
         ).strip()
     except Exception:
         return ""
@@ -2025,7 +2035,8 @@ ZWROC TYLKO TRESC SEKCJI:
                 effective_prompt,
                 response_mime_type="text/plain",
                 temperature=temperature,
-                max_output_tokens=900,
+                max_output_tokens=CREATIVE_SECTION_MAX_OUTPUT_TOKENS,
+                thinking_budget=CREATIVE_THINKING_BUDGET,
                 telemetry_label=f"section:{artifact_type}:{marker}",
             ).strip(),
         )
@@ -2228,7 +2239,8 @@ ZWROC TYLKO NOWY BULLET:
                     effective_prompt,
                     response_mime_type="text/plain",
                     temperature=0.3,
-                    max_output_tokens=220,
+                    max_output_tokens=CREATIVE_BULLET_MAX_OUTPUT_TOKENS,
+                    thinking_budget=CREATIVE_THINKING_BUDGET,
                     telemetry_label=f"bullet_item:{artifact_type}:{marker}:{target_index}",
                 ).strip()
             )
@@ -2312,7 +2324,8 @@ ZWROC TYLKO POPRAWIONA TRESC SEKCJI:
                 prompt,
                 response_mime_type="text/plain",
                 temperature=0.35,
-                max_output_tokens=900,
+                max_output_tokens=CREATIVE_SECTION_MAX_OUTPUT_TOKENS,
+                thinking_budget=CREATIVE_THINKING_BUDGET,
                 telemetry_label=f"repair:{artifact_type}:{marker}",
             ).strip(),
         )
@@ -2517,6 +2530,8 @@ POPRAWIONY ARTEFAKT:
             response_mime_type="text/plain",
             temperature=0.2,
             max_output_tokens=2500,
+            thinking_budget=CREATIVE_THINKING_BUDGET,
+            telemetry_label=f"ensure_shape:{artifact_type}",
         ).strip()
     except Exception:
         repaired = ""
@@ -2683,6 +2698,8 @@ def generate_creative_artifact(
         response_mime_type="text/plain",
         temperature=0.8,
         max_output_tokens=2500,
+        thinking_budget=CREATIVE_THINKING_BUDGET,
+        telemetry_label=f"creative:{artifact_type}",
     ).strip()
     repair_context = "\n\n".join(
         [

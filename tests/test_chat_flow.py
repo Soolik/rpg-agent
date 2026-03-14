@@ -273,7 +273,7 @@ class ChatFlowTest(unittest.TestCase):
         )
 
         def fake_generate(prompt, **kwargs):
-            prompts.append(prompt)
+            prompts.append({"prompt": prompt, "kwargs": kwargs})
             return next(outputs)
 
         try:
@@ -306,7 +306,8 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("Stawki:\n* Utrata zaufania do Captain Mira.", artifact_text)
         self.assertIn("Co przygotowac:\n* Przygotuj emisariusza Red Blade.", artifact_text)
         self.assertNotIn("Do doprecyzowania.", artifact_text)
-        self.assertTrue(any("Nie tlumacz nazw kanonicznych." in prompt for prompt in prompts))
+        self.assertTrue(any("Nie tlumacz nazw kanonicznych." in item["prompt"] for item in prompts))
+        self.assertTrue(all(item["kwargs"].get("thinking_budget") == main.CREATIVE_THINKING_BUDGET for item in prompts))
 
     def test_generate_creative_artifact_npc_brief_uses_structured_sections(self):
         original_generate = main.gemini_generate
@@ -327,7 +328,10 @@ class ChatFlowTest(unittest.TestCase):
             ]
         )
 
+        calls = []
+
         def fake_generate(prompt, **kwargs):
+            calls.append(kwargs)
             return next(outputs)
 
         try:
@@ -867,6 +871,7 @@ class ChatFlowTest(unittest.TestCase):
         original_vector_search = main.vector_search
         original_build_context_for_planner = main.build_context_for_planner
         original_render_source_labels = main.render_source_labels
+        calls = []
 
         outputs = iter(
             [
@@ -880,6 +885,7 @@ class ChatFlowTest(unittest.TestCase):
         )
 
         def fake_generate(prompt, **kwargs):
+            calls.append(kwargs)
             return next(outputs)
 
         try:
@@ -910,6 +916,7 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("## Prep Checklist", artifact_text)
         self.assertIn("T01 / Red Blade nabiera znaczenia.", artifact_text)
         self.assertNotIn("Do doprecyzowania.", artifact_text)
+        self.assertTrue(all(call.get("thinking_budget") == main.CREATIVE_THINKING_BUDGET for call in calls))
 
     def test_chat_proposal_returns_human_summary(self):
         original_drive_store = main.drive_store_v2
