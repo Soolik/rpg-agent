@@ -26,6 +26,7 @@ from app.models_v2 import (
     SyncSessionPatchRequest,
     SyncSessionPatchResponse,
     WorldDocInfo,
+    WorldEntityType,
 )
 from app.planner import PlannerService
 from app.routes_v2 import build_context_for_planner, build_v2_router
@@ -99,6 +100,8 @@ class ChatRequest(BaseModel):
     intent: ChatIntent = "auto"
     source_title: Optional[str] = None
     include_sources: bool = False
+    save_output: bool = False
+    output_title: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -107,6 +110,9 @@ class ChatResponse(BaseModel):
     proposal_id: Optional[int] = None
     session_id: Optional[int] = None
     references: List[str] = []
+    output_doc_id: Optional[str] = None
+    output_title: Optional[str] = None
+    output_path: Optional[str] = None
 
 
 class ReindexRequest(BaseModel):
@@ -726,6 +732,40 @@ def render_proposal_reply(proposal: ChangeProposal) -> str:
     return "\n".join(lines)
 
 
+def default_output_title(kind: Literal["answer", "proposal", "session_sync"]) -> str:
+    stamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+    if kind == "answer":
+        return f"Chat Answer - {stamp}"
+    if kind == "proposal":
+        return f"Chat Proposal - {stamp}"
+    return f"Session Sync - {stamp}"
+
+
+def save_chat_output(
+    *,
+    kind: Literal["answer", "proposal", "session_sync"],
+    content: str,
+    requested_title: Optional[str] = None,
+) -> Optional[WorldDocInfo]:
+    if not drive_store_v2:
+        return None
+
+    title = (requested_title or "").strip() or default_output_title(kind)
+    existing = drive_store_v2.find_doc(folder="08 Outputs", title=title)
+    doc_ref = DocumentRef(folder="08 Outputs", title=title, doc_id=existing.doc_id if existing else None)
+
+    if existing and existing.doc_id:
+        drive_store_v2.replace_doc(doc_ref, content)
+        return existing
+
+    return drive_store_v2.create_doc(
+        folder="08 Outputs",
+        title=title,
+        content=content,
+        entity_type=WorldEntityType.output,
+    )
+
+
 def ctx_slice(h: Dict[str, Any]) -> str:
     doc_type = h.get("doc_type", "")
     text = h.get("chunk_text", "") or ""
@@ -1201,7 +1241,15 @@ def chat(req: ChatRequest):
             reply = ask_response.answer.strip()
             if references:
                 reply = reply + "\n\nZrodla:\n" + "\n".join(f"- {label}" for label in references)
-            return ChatResponse(kind="answer", reply=reply, references=references)
+            output_doc = save_chat_output(kind="answer", content=reply, requested_title=req.output_title) if req.save_output else None
+            return ChatResponse(
+                kind="answer",
+                reply=reply,
+                references=references,
+                output_doc_id=output_doc.doc_id if output_doc else None,
+                output_title=output_doc.title if output_doc else None,
+                output_path=output_doc.path_hint if output_doc else None,
+            )
 
         if resolved_intent == "session_sync":
             sync_response = ingest_session_and_sync(
@@ -1210,14 +1258,19 @@ def chat(req: ChatRequest):
                     source_title=req.source_title,
                 )
             )
+            reply = render_session_sync_reply(
+                sync_response.patch,
+                sync_response.sync,
+                source_title=req.source_title,
+            )
+            output_doc = save_chat_output(kind="session_sync", content=reply, requested_title=req.output_title) if req.save_output else None
             return ChatResponse(
                 kind="session_sync",
-                reply=render_session_sync_reply(
-                    sync_response.patch,
-                    sync_response.sync,
-                    source_title=req.source_title,
-                ),
+                reply=reply,
                 session_id=sync_response.sync.session_id,
+                output_doc_id=output_doc.doc_id if output_doc else None,
+                output_title=output_doc.title if output_doc else None,
+                output_path=output_doc.path_hint if output_doc else None,
             )
 
         docs = drive_store_v2.list_world_docs()
@@ -1233,10 +1286,15 @@ def chat(req: ChatRequest):
                 }
             )
 
+        reply = render_proposal_reply(proposal)
+        output_doc = save_chat_output(kind="proposal", content=reply, requested_title=req.output_title) if req.save_output else None
         return ChatResponse(
             kind="proposal",
-            reply=render_proposal_reply(proposal),
+            reply=reply,
             proposal_id=proposal.proposal_id,
+            output_doc_id=output_doc.doc_id if output_doc else None,
+            output_title=output_doc.title if output_doc else None,
+            output_path=output_doc.path_hint if output_doc else None,
         )
 
     except HTTPException:
@@ -1414,6 +1472,7 @@ Zwroc wylacznie JSON zgodny z tym schematem:
 }}
 
 RULES:
+- Wszystkie pola tekstowe w JSON pisz po polsku.
 - If a thread matches an existing known thread, reuse its exact title and exact thread_id when available.
 - If an entity matches an existing known entity, reuse its exact name and kind.
 - Prefer updating existing threads and entities over inventing duplicates.

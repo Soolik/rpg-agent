@@ -40,6 +40,56 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("Zrodla:", response.reply)
         self.assertEqual(response.references, ["01 Bible / Campaign Bible"])
 
+    def test_chat_answer_can_save_output_doc(self):
+        original_ask = main.ask
+        original_drive_store = main.drive_store_v2
+
+        class FakeDriveStore:
+            def __init__(self):
+                self.created = None
+
+            def find_doc(self, folder=None, title=None, doc_id=None):
+                return None
+
+            def create_doc(self, folder, title, content, entity_type=None):
+                self.created = {
+                    "folder": folder,
+                    "title": title,
+                    "content": content,
+                    "entity_type": entity_type,
+                }
+                return main.WorldDocInfo(
+                    folder=folder,
+                    title=title,
+                    doc_id="out-1",
+                    path_hint=f"{folder}/{title}",
+                    entity_type=main.WorldEntityType.output,
+                )
+
+        fake_drive_store = FakeDriveStore()
+
+        try:
+            main.ask = lambda req: main.AskResponse(answer="Gotowy tekst.", sources=[])
+            main.drive_store_v2 = fake_drive_store
+
+            response = main.chat(
+                main.ChatRequest(
+                    message="Odpowiedz krotko na pytanie.",
+                    intent="answer",
+                    save_output=True,
+                    output_title="Answer 01",
+                )
+            )
+        finally:
+            main.ask = original_ask
+            main.drive_store_v2 = original_drive_store
+
+        self.assertEqual(response.output_doc_id, "out-1")
+        self.assertEqual(response.output_title, "Answer 01")
+        self.assertEqual(fake_drive_store.created["folder"], "08 Outputs")
+        self.assertEqual(fake_drive_store.created["title"], "Answer 01")
+        self.assertEqual(fake_drive_store.created["content"], "Gotowy tekst.")
+
     def test_chat_session_sync_returns_human_summary(self):
         original_sync = main.ingest_session_and_sync
         try:

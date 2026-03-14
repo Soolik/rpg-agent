@@ -87,6 +87,7 @@ class SessionSyncFlowTest(unittest.TestCase):
         self.assertIn("Captain Mira", captured["prompt"])
         self.assertIn("KNOWN THREADS:", captured["prompt"])
         self.assertIn("T01 | Red Blade", captured["prompt"])
+        self.assertIn("Wszystkie pola tekstowe w JSON pisz po polsku.", captured["prompt"])
 
     def test_ingest_session_and_sync_returns_patch_and_sync_result(self):
         original_generate = main.gemini_generate
