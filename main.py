@@ -436,30 +436,35 @@ def gemini_generate_stream(
         raise RuntimeError(f"Gemini stream error: {response.status_code} {response.text}")
 
     seen_text = ""
-    event_lines: List[str] = []
+    json_buffer = ""
 
     def iter_chunks():
-        nonlocal seen_text, event_lines
+        nonlocal seen_text, json_buffer
         try:
             for raw_line in response.iter_lines(decode_unicode=True):
                 if raw_line is None:
                     continue
                 line = raw_line.strip()
                 if not line:
-                    if event_lines:
-                        chunk = _parse_gemini_stream_event("\n".join(event_lines), seen_text)
+                    if json_buffer:
+                        try:
+                            chunk = _parse_gemini_stream_event(json_buffer, seen_text)
+                        except json.JSONDecodeError:
+                            continue
                         if chunk:
                             seen_text += chunk
                             yield chunk
-                        event_lines = []
+                        json_buffer = ""
                     continue
                 if line.startswith("data:"):
                     data_line = line[5:].strip()
-                    if data_line and data_line != "[DONE]":
-                        event_lines.append(data_line)
+                    if data_line == "[DONE]":
+                        break
+                    if data_line:
+                        json_buffer += data_line
 
-            if event_lines:
-                chunk = _parse_gemini_stream_event("\n".join(event_lines), seen_text)
+            if json_buffer:
+                chunk = _parse_gemini_stream_event(json_buffer, seen_text)
                 if chunk:
                     yield chunk
         finally:
