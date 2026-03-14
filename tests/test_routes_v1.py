@@ -31,6 +31,7 @@ from app.models_v2 import (
     WorldThreadRecord,
 )
 from app.routes_v1 import build_v1_router
+from app.chat_service import DirectChatStream
 
 
 class FakeDriveStore:
@@ -270,12 +271,23 @@ class FakeConversationStore:
     def list_messages(self, conversation_id, limit=100):
         return self.messages.get(conversation_id, [])[:limit]
 
+    def update_conversation_metadata(self, conversation_id, *, metadata_patch):
+        conversation = self.conversations.get(conversation_id)
+        if not conversation:
+            return None
+        conversation.metadata = {
+            **(conversation.metadata or {}),
+            **(metadata_patch or {}),
+        }
+        return conversation
+
 
 class RoutesV1Test(unittest.TestCase):
-    def build_router(self, chat_fn=None, workflow_store=None, conversation_store=None):
+    def build_router(self, chat_fn=None, chat_stream_fn=None, workflow_store=None, conversation_store=None):
         return build_v1_router(
             chat_request_cls=ChatRequest,
             chat_fn=chat_fn or (lambda req: ChatResponse(kind="answer", reply="OK", references=[])),
+            chat_stream_fn=chat_stream_fn,
             health_fn=lambda: {"ok": True, "campaign_id": "kng", "revision": "rev-1"},
             drive_store=FakeDriveStore(),
             planner=FakePlanner(),
@@ -394,6 +406,28 @@ class RoutesV1Test(unittest.TestCase):
         self.assertIn("event: delta", body)
         self.assertIn("event: complete", body)
         self.assertIn("Pierwszy akapit.", body)
+
+    def test_v1_chat_stream_uses_direct_stream_when_available(self):
+        seen = {}
+
+        def fake_stream(req):
+            seen["message"] = req.message
+            return DirectChatStream(chunks=iter(["Pierwszy ", "token ", "streamu."]))
+
+        def fail_chat(_req):
+            raise AssertionError("chat_fn should not be called for direct stream")
+
+        router = self.build_router(chat_fn=fail_chat, chat_stream_fn=fake_stream)
+
+        response = self.route_endpoint(router, "/v1/chat", "POST")(
+            request=V1ChatRequest(message="Opowiedz krotko o idei tego API.", stream=True)
+        )
+        body = asyncio.run(self.collect_stream(response))
+
+        self.assertEqual(seen["message"], "Opowiedz krotko o idei tego API.")
+        self.assertIn('"stream_mode": "direct"', body)
+        self.assertIn("Pierwszy token streamu.", body)
+        self.assertIn("event: complete", body)
 
     def test_v1_guard_mode_returns_guard_report_without_calling_chat(self):
         def fail_chat(_req):

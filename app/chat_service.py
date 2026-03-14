@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import Callable, Optional, Type
+from dataclasses import dataclass, field
+from typing import Callable, Iterable, Optional, Type
 
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
@@ -25,6 +26,10 @@ from .world_model_store import NullWorldModelStore, WorldModelStore
 MAX_HISTORY_MESSAGES = 8
 MAX_HISTORY_CHARS = 4000
 STREAM_CHUNK_CHARS = 500
+SUMMARY_TRIGGER_MESSAGES = 10
+SUMMARY_KEEP_RECENT_MESSAGES = 6
+SUMMARY_MAX_LINES = 8
+SUMMARY_MAX_CHARS = 1200
 
 
 def _api_error(status_code: int, *, request_trace: RequestTrace, code: str, message: str) -> HTTPException:
@@ -37,6 +42,15 @@ def _api_error(status_code: int, *, request_trace: RequestTrace, code: str, mess
             "trace_id": request_trace.trace_id,
         },
     )
+
+
+@dataclass
+class DirectChatStream:
+    chunks: Iterable[str]
+    kind: str = "answer"
+    artifact_type: Optional[str] = None
+    references: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def _saved_output_from_chat(response: ChatResponse) -> Optional[SavedOutputRef]:
@@ -257,11 +271,63 @@ def _prompt_history(messages: list[ConversationMessageRecord]) -> list[Conversat
     return selected
 
 
-def _compose_message_with_history(message: str, history: list[ConversationMessageRecord]) -> str:
-    if not history or len(message) > MAX_HISTORY_CHARS:
+def _compact_summary_text(text: str, *, limit: int = 160) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _summarize_messages(messages: list[ConversationMessageRecord]) -> str:
+    if not messages:
+        return ""
+
+    selected = messages
+    if len(messages) > SUMMARY_MAX_LINES:
+        head = messages[:2]
+        tail = messages[-(SUMMARY_MAX_LINES - 3) :]
+        selected = head + [ConversationMessageRecord(
+            message_id=0,
+            conversation_id=messages[0].conversation_id,
+            campaign_id=messages[0].campaign_id,
+            role="system",
+            content="Pominieto starsze wiadomosci.",
+            created_at=messages[0].created_at,
+            metadata={},
+        )] + tail
+
+    lines = ["PODSUMOWANIE ROZMOWY:"]
+    for item in selected:
+        if item.role == "system":
+            lines.append("- " + item.content)
+            continue
+        role_label = "U" if item.role == "user" else "A" if item.role == "assistant" else item.role[:1].upper()
+        kind_suffix = f" ({item.kind})" if item.kind else ""
+        lines.append(f"- {role_label}{kind_suffix}: {_compact_summary_text(item.content)}")
+
+    summary = "\n".join(lines).strip()
+    if len(summary) <= SUMMARY_MAX_CHARS:
+        return summary
+    return summary[: SUMMARY_MAX_CHARS - 3].rstrip() + "..."
+
+
+def _compose_message_with_history(
+    message: str,
+    history: list[ConversationMessageRecord],
+    *,
+    summary_text: Optional[str] = None,
+) -> str:
+    if not history and not summary_text:
         return message
 
-    lines = ["KONTEKST ROZMOWY:"]
+    if not history and len(message) > MAX_HISTORY_CHARS:
+        return message
+
+    lines = []
+    if summary_text:
+        lines.extend([summary_text.strip(), ""])
+
+    lines.append("KONTEKST ROZMOWY:")
     for item in history:
         role_label = "Uzytkownik" if item.role == "user" else "Asystent" if item.role == "assistant" else item.role.title()
         lines.append(f"{role_label}: {item.content}")
@@ -299,6 +365,7 @@ class ChatService:
         *,
         chat_request_cls: Type[ChatRequest],
         chat_fn: Callable[[ChatRequest], ChatResponse],
+        chat_stream_fn: Optional[Callable[[ChatRequest], Optional[DirectChatStream]]] = None,
         drive_store,
         planner,
         consistency_planner=None,
@@ -307,6 +374,7 @@ class ChatService:
     ):
         self.chat_request_cls = chat_request_cls
         self.chat_fn = chat_fn
+        self.chat_stream_fn = chat_stream_fn
         self.drive_store = drive_store
         self.planner = planner
         self.consistency_planner = consistency_planner or planner
@@ -332,6 +400,118 @@ class ChatService:
 
     def list_messages(self, conversation_id: str, limit: int = 100) -> list[ConversationMessageRecord]:
         return self.conversation_store.list_messages(conversation_id, limit=limit)
+
+    def _conversation_summary_state(self, conversation: ConversationRecord) -> tuple[str, int]:
+        metadata = conversation.metadata or {}
+        summary_text = str(metadata.get("summary_text") or "").strip()
+        try:
+            summary_message_count = int(metadata.get("summary_message_count") or 0)
+        except (TypeError, ValueError):
+            summary_message_count = 0
+        return summary_text, max(0, summary_message_count)
+
+    def _prepare_conversation_context(
+        self,
+        *,
+        trace: RequestTrace,
+        message: str,
+        conversation_id: Optional[str],
+        conversation_title: Optional[str],
+    ) -> tuple[Optional[ConversationRecord], str]:
+        conversation = self._resolve_conversation(
+            trace=trace,
+            conversation_id=conversation_id,
+            conversation_title=conversation_title,
+            seed_message=message,
+        )
+        if not conversation:
+            return None, message
+
+        existing_messages = self.conversation_store.list_messages(conversation.conversation_id, limit=200)
+        summary_text, summary_message_count = self._conversation_summary_state(conversation)
+        if summary_message_count > 0 and summary_message_count < len(existing_messages):
+            recent_messages = existing_messages[summary_message_count:]
+        elif summary_message_count >= len(existing_messages):
+            recent_messages = []
+        else:
+            recent_messages = existing_messages
+
+        history = _prompt_history(recent_messages)
+        composed_message = _compose_message_with_history(
+            message,
+            history,
+            summary_text=summary_text or None,
+        )
+        return conversation, composed_message
+
+    def _append_user_message(
+        self,
+        conversation: Optional[ConversationRecord],
+        *,
+        message: str,
+        artifact_type: Optional[str],
+        source_title: Optional[str],
+        assistant_mode: AssistantMode,
+        candidate_text: Optional[str],
+    ) -> None:
+        if not conversation:
+            return
+        self.conversation_store.append_message(
+            conversation.conversation_id,
+            role="user",
+            content=message,
+            kind="input",
+            artifact_type=artifact_type,
+            metadata={
+                "source_title": source_title,
+                "assistant_mode": assistant_mode.value,
+                "candidate_text": candidate_text,
+            },
+        )
+
+    def _append_assistant_message(
+        self,
+        conversation: Optional[ConversationRecord],
+        *,
+        response: V1ChatResponse,
+    ) -> None:
+        if not conversation:
+            return
+        self.conversation_store.append_message(
+            conversation.conversation_id,
+            role="assistant",
+            content=response.reply_markdown,
+            kind=response.kind,
+            artifact_type=response.artifact_type,
+            metadata={
+                "proposal_id": response.proposal_id,
+                "session_id": response.session_id,
+                "continuity_ok": response.continuity.ok if response.continuity else None,
+                "assistant_mode": response.mode.value,
+            },
+        )
+
+    def _refresh_conversation_summary(self, conversation: Optional[ConversationRecord]) -> None:
+        if not conversation or not self.conversation_storage_enabled():
+            return
+        messages = self.conversation_store.list_messages(conversation.conversation_id, limit=200)
+        if len(messages) <= SUMMARY_TRIGGER_MESSAGES:
+            if (conversation.metadata or {}).get("summary_text"):
+                self.conversation_store.update_conversation_metadata(
+                    conversation.conversation_id,
+                    metadata_patch={"summary_text": "", "summary_message_count": 0},
+                )
+            return
+
+        summary_cutoff = max(0, len(messages) - SUMMARY_KEEP_RECENT_MESSAGES)
+        summary_text = _summarize_messages(messages[:summary_cutoff])
+        self.conversation_store.update_conversation_metadata(
+            conversation.conversation_id,
+            metadata_patch={
+                "summary_text": summary_text,
+                "summary_message_count": summary_cutoff,
+            },
+        )
 
     def _resolve_conversation(
         self,
@@ -477,29 +657,20 @@ class ChatService:
         conversation_id: Optional[str],
         conversation_title: Optional[str],
     ) -> V1ChatResponse:
-        conversation = self._resolve_conversation(
+        conversation, composed_message = self._prepare_conversation_context(
             trace=trace,
+            message=message,
             conversation_id=conversation_id,
             conversation_title=conversation_title,
-            seed_message=message,
         )
-        history: list[ConversationMessageRecord] = []
-        if conversation:
-            history = _prompt_history(self.conversation_store.list_messages(conversation.conversation_id, limit=50))
-            self.conversation_store.append_message(
-                conversation.conversation_id,
-                role="user",
-                content=message,
-                kind="input",
-                artifact_type=artifact_type,
-                metadata={
-                    "source_title": source_title,
-                    "assistant_mode": assistant_mode.value,
-                    "candidate_text": candidate_text,
-                },
-            )
-
-        composed_message = _compose_message_with_history(message, history)
+        self._append_user_message(
+            conversation,
+            message=message,
+            artifact_type=artifact_type,
+            source_title=source_title,
+            assistant_mode=assistant_mode,
+            candidate_text=candidate_text,
+        )
 
         if assistant_mode == AssistantMode.guard:
             checked_text = (candidate_text or message).strip()
@@ -542,22 +713,128 @@ class ChatService:
                 conversation_title=conversation.title if conversation else None,
             )
 
-        if conversation:
-            self.conversation_store.append_message(
-                conversation.conversation_id,
-                role="assistant",
-                content=rendered.reply_markdown,
-                kind=rendered.kind,
-                artifact_type=rendered.artifact_type,
-                metadata={
-                    "proposal_id": rendered.proposal_id,
-                    "session_id": rendered.session_id,
-                    "continuity_ok": rendered.continuity.ok if rendered.continuity else None,
-                    "assistant_mode": rendered.mode.value,
+        self._append_assistant_message(conversation, response=rendered)
+        self._refresh_conversation_summary(conversation)
+        return rendered
+
+    def stream_run(
+        self,
+        *,
+        trace: RequestTrace,
+        message: str,
+        assistant_mode: AssistantMode,
+        intent: str,
+        artifact_type: Optional[str],
+        source_title: Optional[str],
+        candidate_text: Optional[str],
+        include_sources: bool,
+        include_telemetry: bool,
+        save_output: bool,
+        output_title: Optional[str],
+        conversation_id: Optional[str],
+        conversation_title: Optional[str],
+    ) -> StreamingResponse:
+        conversation, composed_message = self._prepare_conversation_context(
+            trace=trace,
+            message=message,
+            conversation_id=conversation_id,
+            conversation_title=conversation_title,
+        )
+
+        handle: Optional[DirectChatStream] = None
+        if self.chat_stream_fn and assistant_mode == AssistantMode.create:
+            handle = self.chat_stream_fn(
+                self.chat_request_cls(
+                    message=composed_message,
+                    intent=intent,
+                    artifact_type=artifact_type,
+                    source_title=source_title,
+                    conversation_id=conversation.conversation_id if conversation else None,
+                    conversation_title=conversation.title if conversation else conversation_title,
+                    include_sources=include_sources,
+                    include_telemetry=include_telemetry,
+                    save_output=save_output,
+                    output_title=output_title,
+                )
+            )
+
+        if not handle:
+            response = self.run(
+                trace=trace,
+                message=message,
+                assistant_mode=assistant_mode,
+                intent=intent,
+                artifact_type=artifact_type,
+                source_title=source_title,
+                candidate_text=candidate_text,
+                include_sources=include_sources,
+                include_telemetry=include_telemetry,
+                save_output=save_output,
+                output_title=output_title,
+                conversation_id=conversation_id,
+                conversation_title=conversation_title,
+            )
+            return self.stream(response)
+
+        self._append_user_message(
+            conversation,
+            message=message,
+            artifact_type=artifact_type,
+            source_title=source_title,
+            assistant_mode=assistant_mode,
+            candidate_text=candidate_text,
+        )
+
+        def iterator():
+            yield _sse_event(
+                "start",
+                {
+                    "request_id": trace.request_id,
+                    "trace_id": trace.trace_id,
+                    "conversation_id": conversation.conversation_id if conversation else None,
+                    "title": "Odpowiedz",
+                    "stream_mode": "direct",
                 },
             )
 
-        return rendered
+            try:
+                parts: list[str] = []
+                for chunk in handle.chunks:
+                    if not chunk:
+                        continue
+                    parts.append(chunk)
+                    yield _sse_event("delta", {"text": chunk})
+
+                final_text = "".join(parts).strip()
+                final_response = self._response_from_chat(
+                    trace=trace,
+                    message=message,
+                    response=ChatResponse(
+                        kind=handle.kind,  # type: ignore[arg-type]
+                        reply=final_text,
+                        artifact_type=handle.artifact_type,
+                        artifact_text=final_text if handle.artifact_type else None,
+                        references=handle.references,
+                        warnings=handle.warnings,
+                    ),
+                    mode=assistant_mode,
+                    conversation_id=conversation.conversation_id if conversation else None,
+                    conversation_title=conversation.title if conversation else None,
+                )
+                self._append_assistant_message(conversation, response=final_response)
+                self._refresh_conversation_summary(conversation)
+                yield _sse_event("complete", final_response.model_dump(mode="json"))
+            except Exception as exc:
+                yield _sse_event(
+                    "error",
+                    {
+                        "request_id": trace.request_id,
+                        "trace_id": trace.trace_id,
+                        "message": str(exc),
+                    },
+                )
+
+        return StreamingResponse(iterator(), media_type="text/event-stream")
 
     def stream(self, response: V1ChatResponse) -> StreamingResponse:
         payload = response.model_dump(mode="json")
@@ -570,6 +847,7 @@ class ChatService:
                     "trace_id": response.trace_id,
                     "conversation_id": response.conversation_id,
                     "title": response.title,
+                    "stream_mode": "buffered",
                 },
             )
             for chunk in _stream_chunks(response.reply_markdown):

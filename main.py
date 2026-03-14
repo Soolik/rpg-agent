@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from app.applier import ProposalApplier
+from app.chat_service import DirectChatStream
 from app.chat_models import (
     ArtifactType,
     AskRequest,
@@ -395,8 +396,97 @@ def gemini_generate(
             "response_preview": out[:200],
         },
     )
-    if out:
-        return out
+    return out
+
+
+def gemini_generate_stream(
+    prompt: str,
+    *,
+    response_mime_type: str = "text/plain",
+    temperature: float = 0.6,
+    max_output_tokens: int = 2500,
+    thinking_budget: Optional[int] = None,
+):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Brak GEMINI_API_KEY")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/{GEN_MODEL}:streamGenerateContent?alt=sse"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_output_tokens,
+            "responseMimeType": response_mime_type,
+        },
+    }
+    if thinking_budget is not None:
+        payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": thinking_budget}
+
+    response = requests.post(
+        f"{url}?key={GEMINI_API_KEY}",
+        json=payload,
+        timeout=90,
+        stream=True,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Gemini stream error: {response.status_code} {response.text}")
+
+    seen_text = ""
+    event_lines: List[str] = []
+
+    def iter_chunks():
+        nonlocal seen_text, event_lines
+        try:
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if raw_line is None:
+                    continue
+                line = raw_line.strip()
+                if not line:
+                    if event_lines:
+                        chunk = _parse_gemini_stream_event("\n".join(event_lines), seen_text)
+                        if chunk:
+                            seen_text += chunk
+                            yield chunk
+                        event_lines = []
+                    continue
+                if line.startswith("data:"):
+                    data_line = line[5:].strip()
+                    if data_line and data_line != "[DONE]":
+                        event_lines.append(data_line)
+
+            if event_lines:
+                chunk = _parse_gemini_stream_event("\n".join(event_lines), seen_text)
+                if chunk:
+                    yield chunk
+        finally:
+            response.close()
+
+    return iter_chunks()
+
+
+def _parse_gemini_stream_event(payload_text: str, seen_text: str) -> str:
+    if not payload_text:
+        return ""
+    payload = json.loads(payload_text)
+    candidate = ((payload.get("candidates") or [{}])[0]) if isinstance(payload, dict) else {}
+    parts = ((candidate.get("content") or {}).get("parts") or []) if isinstance(candidate, dict) else []
+    texts: List[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get("thought"):
+            continue
+        text = part.get("text") or ""
+        if text:
+            texts.append(text)
+    current_text = normalize_text_artifacts("".join(texts))
+    if not current_text:
+        return ""
+    if current_text.startswith(seen_text):
+        return current_text[len(seen_text) :]
+    if seen_text.endswith(current_text):
+        return ""
+    return current_text
     return str(data)
 
 
@@ -2690,6 +2780,7 @@ app.include_router(
     build_v1_router(
         chat_request_cls=ChatRequest,
         chat_fn=lambda req: chat(req),
+        chat_stream_fn=lambda req: stream_chat(req),
         health_fn=lambda: health(),
         drive_store=drive_store_v2,
         planner=planner_v2,
@@ -2845,6 +2936,28 @@ POPRAWNY OUTPUT (tylko JSON):
 def ask_text(req: AskRequest):
     resp = ask(req)
     return resp.answer + "\n"
+
+
+def stream_chat(req: ChatRequest) -> Optional[DirectChatStream]:
+    resolved_artifact_type = infer_artifact_type(req.message, req.artifact_type)
+    explicit_intent = req.intent != "auto"
+    resolved_intent = req.intent if explicit_intent else detect_chat_intent(req.message)
+    if not explicit_intent and is_creative_artifact_type(resolved_artifact_type):
+        resolved_intent = "creative"
+
+    if resolved_intent != "answer":
+        return None
+    if req.include_sources or req.include_telemetry or req.save_output or resolved_artifact_type or req.source_title:
+        return None
+    if "KONTEKST ROZMOWY:" in req.message or "PODSUMOWANIE ROZMOWY:" in req.message:
+        return None
+    if is_campaign_question(req.message):
+        return None
+
+    return DirectChatStream(
+        chunks=gemini_generate_stream(build_general_prompt(req.message.strip())),
+        kind="answer",
+    )
 
 
 @app.post("/chat", response_model=ChatResponse)

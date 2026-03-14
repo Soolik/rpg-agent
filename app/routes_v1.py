@@ -36,14 +36,13 @@ from .api_models import (
     WorldModelThreadListResponse,
 )
 from .applier import ProposalApplier
-from .chat_service import ChatService
+from .chat_service import ChatService, DirectChatStream
 from .canon_guard import normalize_key
 from .chat_models import ChatRequest, ChatResponse
 from .conversation_store import ConversationStore, NullConversationStore
-from .models_v2 import ApplyChangesRequest, ChangeProposal, ProposeChangesRequest
-from .routes_v2 import build_context_for_planner
 from .world_model_store import NullWorldModelStore, WorldModelStore
 from .workflow_store import NullWorkflowStore, WorkflowStore
+from .workflow_service import WorkflowService
 
 
 def _new_trace() -> RequestTrace:
@@ -61,35 +60,6 @@ def _api_error(status_code: int, *, request_trace: RequestTrace, code: str, mess
             "trace_id": request_trace.trace_id,
         },
     )
-
-
-def _proposal_view_from_detail(detail) -> WorldModelChangeView:
-    payload = detail.proposal or {}
-    proposal = ChangeProposal.model_validate(payload)
-    proposal_type = payload.get("proposal_type", ProposalType.general.value)
-    proposal_status = payload.get("proposal_status", ProposalStatus.proposed.value)
-    return WorldModelChangeView(
-        proposal_id=payload.get("proposal_id") or detail.id,
-        proposal_type=ProposalType(proposal_type),
-        status=ProposalStatus(proposal_status),
-        summary=detail.summary,
-        user_goal=detail.user_goal,
-        assumptions=proposal.assumptions,
-        impacted_docs=proposal.impacted_docs,
-        actions=proposal.actions,
-        needs_confirmation=proposal.needs_confirmation,
-        approved=detail.approved,
-        approved_by=detail.approved_by,
-        created_at=detail.created_at,
-        updated_at=detail.updated_at,
-        supersedes_proposal_id=payload.get("supersedes_proposal_id"),
-        accepted_apply_run_id=payload.get("accepted_apply_run_id"),
-        rejected_reason=payload.get("rejected_reason"),
-        reviewed_by=payload.get("reviewed_by"),
-        request=detail.request,
-        raw_proposal=payload,
-    )
-
 
 def _search_world_model(
     query: str,
@@ -159,6 +129,7 @@ def build_v1_router(
     *,
     chat_request_cls: Type[ChatRequest],
     chat_fn: Callable[[ChatRequest], ChatResponse],
+    chat_stream_fn: Optional[Callable[[ChatRequest], Optional[DirectChatStream]]] = None,
     health_fn: Callable[[], dict],
     drive_store,
     planner,
@@ -177,11 +148,18 @@ def build_v1_router(
     chat_service = ChatService(
         chat_request_cls=chat_request_cls,
         chat_fn=chat_fn,
+        chat_stream_fn=chat_stream_fn,
         drive_store=drive_store,
         planner=planner,
         consistency_planner=guard_planner,
         world_model_store=model_store,
         conversation_store=convo_store,
+    )
+    workflow_service = WorkflowService(
+        drive_store=drive_store,
+        planner=planner,
+        workflow_store=store,
+        applier=proposal_applier,
     )
 
     @router.get("/health", response_model=V1HealthResponse)
@@ -287,6 +265,22 @@ def build_v1_router(
     @router.post("/chat", response_model=V1ChatResponse)
     def v1_chat(request: V1ChatRequest):
         trace = _new_trace()
+        if request.stream:
+            return chat_service.stream_run(
+                trace=trace,
+                message=request.message,
+                assistant_mode=request.mode,
+                intent=request.intent,
+                artifact_type=request.artifact_type,
+                source_title=request.source_title,
+                candidate_text=request.candidate_text,
+                include_sources=request.include_sources,
+                include_telemetry=request.include_telemetry,
+                save_output=request.save_output,
+                output_title=request.output_title,
+                conversation_id=request.conversation_id,
+                conversation_title=request.conversation_title,
+            )
         response = chat_service.run(
             trace=trace,
             message=request.message,
@@ -302,13 +296,27 @@ def build_v1_router(
             conversation_id=request.conversation_id,
             conversation_title=request.conversation_title,
         )
-        if request.stream:
-            return chat_service.stream(response)
         return response
 
     @router.post("/conversations/{conversation_id}/messages", response_model=V1ChatResponse)
     def v1_conversation_message(conversation_id: str, request: ConversationMessageCreateRequest):
         trace = _new_trace()
+        if request.stream:
+            return chat_service.stream_run(
+                trace=trace,
+                message=request.message,
+                assistant_mode=request.mode,
+                intent=request.intent,
+                artifact_type=request.artifact_type,
+                source_title=request.source_title,
+                candidate_text=request.candidate_text,
+                include_sources=request.include_sources,
+                include_telemetry=request.include_telemetry,
+                save_output=request.save_output,
+                output_title=request.output_title,
+                conversation_id=conversation_id,
+                conversation_title=None,
+            )
         response = chat_service.run(
             trace=trace,
             message=request.message,
@@ -324,13 +332,27 @@ def build_v1_router(
             conversation_id=conversation_id,
             conversation_title=None,
         )
-        if request.stream:
-            return chat_service.stream(response)
         return response
 
     @router.post("/artifacts/generate", response_model=V1ChatResponse)
     def v1_generate_artifact(request: V1ArtifactGenerateRequest):
         trace = _new_trace()
+        if request.stream:
+            return chat_service.stream_run(
+                trace=trace,
+                message=request.message,
+                assistant_mode=AssistantMode.create,
+                intent="auto",
+                artifact_type=request.artifact_type,
+                source_title=None,
+                candidate_text=None,
+                include_sources=request.include_sources,
+                include_telemetry=request.include_telemetry,
+                save_output=request.save_output,
+                output_title=request.output_title,
+                conversation_id=request.conversation_id,
+                conversation_title=request.conversation_title,
+            )
         response = chat_service.run(
             trace=trace,
             message=request.message,
@@ -346,13 +368,27 @@ def build_v1_router(
             conversation_id=request.conversation_id,
             conversation_title=request.conversation_title,
         )
-        if request.stream:
-            return chat_service.stream(response)
         return response
 
     @router.post("/sessions/prep", response_model=V1ChatResponse)
     def v1_prepare_session(request: V1SessionPrepRequest):
         trace = _new_trace()
+        if request.stream:
+            return chat_service.stream_run(
+                trace=trace,
+                message=request.message,
+                assistant_mode=AssistantMode.create,
+                intent="auto",
+                artifact_type="pre_session_brief",
+                source_title=None,
+                candidate_text=None,
+                include_sources=False,
+                include_telemetry=request.include_telemetry,
+                save_output=request.save_output,
+                output_title=request.output_title,
+                conversation_id=request.conversation_id,
+                conversation_title=request.conversation_title,
+            )
         response = chat_service.run(
             trace=trace,
             message=request.message,
@@ -368,8 +404,6 @@ def build_v1_router(
             conversation_id=request.conversation_id,
             conversation_title=request.conversation_title,
         )
-        if request.stream:
-            return chat_service.stream(response)
         return response
 
     @router.post("/assistant/actions", response_model=AssistantActionResponse)
@@ -513,51 +547,27 @@ def build_v1_router(
         actor: Optional[str],
         reindex_after_apply: bool,
     ) -> WorldModelChangeApplyResponse:
-        detail = store.get_proposal(proposal_id)
-        if not detail:
+        accepted = workflow_service.accept_change(
+            proposal_id=proposal_id,
+            actor=actor,
+            reindex_after_apply=reindex_after_apply,
+        )
+        if not accepted:
             raise _api_error(
                 404,
                 request_trace=trace,
                 code="proposal_not_found",
                 message="World model change proposal not found.",
             )
-
-        proposal = ChangeProposal.model_validate(detail.proposal)
-        apply_request = ApplyChangesRequest(
-            proposal_id=proposal_id,
-            proposal=proposal,
-            approved=True,
-            approved_by=actor,
-            reindex_after_apply=reindex_after_apply,
-        )
-        apply_response = proposal_applier.apply(apply_request)
-        apply_response.proposal_id = proposal_id
-        apply_run_id = store.save_apply_run(apply_request, apply_response)
-
-        updated_detail = detail
-        if apply_response.ok:
-            updated_detail = store.update_proposal_state(
-                proposal_id,
-                proposal_status=ProposalStatus.accepted.value,
-                reviewed_by=actor,
-                accepted_apply_run_id=apply_run_id,
-            ) or detail
-            supersedes_proposal_id = detail.proposal.get("supersedes_proposal_id")
-            if supersedes_proposal_id:
-                store.update_proposal_state(
-                    int(supersedes_proposal_id),
-                    proposal_status=ProposalStatus.superseded.value,
-                    reviewed_by=actor,
-                )
         return WorldModelChangeApplyResponse(
             request_id=trace.request_id,
             trace_id=trace.trace_id,
-            proposal=_proposal_view_from_detail(updated_detail),
-            apply_run_id=apply_run_id,
-            ok=apply_response.ok,
-            summary=apply_response.summary,
-            results=apply_response.results,
-            reindex_result=apply_response.reindex_result,
+            proposal=accepted.proposal,
+            apply_run_id=accepted.apply_run_id,
+            ok=accepted.ok,
+            summary=accepted.summary,
+            results=accepted.results,
+            reindex_result=accepted.reindex_result,
         )
 
     def reject_world_model_change_impl(
@@ -567,13 +577,12 @@ def build_v1_router(
         actor: Optional[str],
         reason: Optional[str],
     ) -> WorldModelChangeResponse:
-        updated_detail = store.update_proposal_state(
-            proposal_id,
-            proposal_status=ProposalStatus.rejected.value,
-            reviewed_by=actor,
-            rejected_reason=reason,
+        rejected = workflow_service.reject_change(
+            proposal_id=proposal_id,
+            actor=actor,
+            reason=reason,
         )
-        if not updated_detail:
+        if not rejected:
             raise _api_error(
                 404,
                 request_trace=trace,
@@ -583,39 +592,30 @@ def build_v1_router(
         return WorldModelChangeResponse(
             request_id=trace.request_id,
             trace_id=trace.trace_id,
-            proposal=_proposal_view_from_detail(updated_detail),
+            proposal=rejected,
         )
 
     @router.post("/world-model/changes/propose", response_model=WorldModelChangeResponse)
     def v1_propose_world_model_change(request: WorldModelChangeProposalRequest):
         trace = _new_trace()
-        docs = drive_store.list_world_docs()
-        context = build_context_for_planner(drive_store)
-        proposal_request = ProposeChangesRequest(
-            instruction=request.instruction,
-            mode=request.mode,
-            dry_run=request.dry_run,
-        )
-        proposal = planner.propose(request=proposal_request, world_docs=docs, world_context=context)
-        proposal_id = store.save_proposal(
-            proposal_request,
-            proposal,
-            proposal_type=ProposalType.world_model_change.value,
-            proposal_status=ProposalStatus.proposed.value,
-            supersedes_proposal_id=request.supersedes_proposal_id,
-        )
-        detail = store.get_proposal(proposal_id)
-        if not detail:
+        try:
+            proposal = workflow_service.propose_change(
+                instruction=request.instruction,
+                mode=request.mode,
+                dry_run=request.dry_run,
+                supersedes_proposal_id=request.supersedes_proposal_id,
+            )
+        except RuntimeError as exc:
             raise _api_error(
                 500,
                 request_trace=trace,
                 code="proposal_not_persisted",
-                message="Proposal was generated but could not be loaded back from workflow store.",
+                message=str(exc),
             )
         return WorldModelChangeResponse(
             request_id=trace.request_id,
             trace_id=trace.trace_id,
-            proposal=_proposal_view_from_detail(detail),
+            proposal=proposal,
         )
 
     @router.get("/world-model/changes", response_model=WorldModelChangeListResponse)
@@ -625,22 +625,17 @@ def build_v1_router(
     ):
         trace = _new_trace()
         safe_limit = max(1, min(limit, 100))
-        details = store.list_proposal_details(
-            limit=safe_limit,
-            proposal_type=ProposalType.world_model_change.value,
-            proposal_status=status.value if status else None,
-        )
         return WorldModelChangeListResponse(
             request_id=trace.request_id,
             trace_id=trace.trace_id,
-            items=[_proposal_view_from_detail(detail) for detail in details],
+            items=workflow_service.list_changes(limit=safe_limit, status=status),
         )
 
     @router.get("/world-model/changes/{proposal_id}", response_model=WorldModelChangeResponse)
     def v1_get_world_model_change(proposal_id: int):
         trace = _new_trace()
-        detail = store.get_proposal(proposal_id)
-        if not detail:
+        proposal = workflow_service.get_change(proposal_id)
+        if not proposal:
             raise _api_error(
                 404,
                 request_trace=trace,
@@ -650,7 +645,7 @@ def build_v1_router(
         return WorldModelChangeResponse(
             request_id=trace.request_id,
             trace_id=trace.trace_id,
-            proposal=_proposal_view_from_detail(detail),
+            proposal=proposal,
         )
 
     @router.post("/world-model/changes/{proposal_id}/accept", response_model=WorldModelChangeApplyResponse)

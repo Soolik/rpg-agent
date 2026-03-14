@@ -29,6 +29,12 @@ Nowy kontrakt dla klienta chatowego i UI worldbuildingu:
 - `GET /v1/conversations/{conversation_id}/messages`
 - `POST /v1/conversations/{conversation_id}/messages`
 
+Streaming:
+
+- `stream=true` zwraca SSE z eventami `start`, `delta`, `complete`
+- dla prostych odpowiedzi bez RAG/artefaktow backend uzywa bezposredniego streamingu modelu
+- dla flow zlozonych (`guard`, `editor`, creative artifacts, save_output, telemetry, continuity checks) backend spada do buffered SSE i streamuje gotowa odpowiedz
+
 Przykladowy request `create`:
 
 ```json

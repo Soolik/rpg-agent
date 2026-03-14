@@ -110,6 +110,25 @@ class ConversationStoreTest(unittest.TestCase):
         self.assertEqual(rows[1].content, "Dowodzi garnizonem.")
         self.assertIn("from conversation_messages", cursor.statements[0][0].lower())
 
+    def test_update_conversation_metadata_merges_patch(self):
+        now = datetime.now(timezone.utc)
+        cursor = FakeCursor(
+            fetchone_values=[
+                ("conv-1", "kng", "Plan sesji", {"source": "test"}, now, now, None, 2),
+                ("conv-1", "kng", "Plan sesji", {"source": "test", "summary_text": "PODSUMOWANIE"}, now, now, None, 2),
+            ]
+        )
+        connection = FakeConnection(cursor)
+        store = ConversationStore(campaign_id="kng", connection_factory=lambda: connection)
+        store._schema_ready = True
+
+        record = store.update_conversation_metadata("conv-1", metadata_patch={"summary_text": "PODSUMOWANIE"})
+
+        self.assertEqual(record.metadata["source"], "test")
+        self.assertEqual(record.metadata["summary_text"], "PODSUMOWANIE")
+        self.assertEqual(connection.commit_called, 1)
+        self.assertIn("update conversations", cursor.statements[1][0].lower())
+
 
 if __name__ == "__main__":
     unittest.main()

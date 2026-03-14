@@ -269,6 +269,41 @@ class ConversationStore:
             for row in rows
         ]
 
+    def update_conversation_metadata(
+        self,
+        conversation_id: str,
+        *,
+        metadata_patch: Dict[str, Any],
+    ) -> Optional[ConversationRecord]:
+        self.ensure_schema()
+        current = self.get_conversation(conversation_id)
+        if not current:
+            return None
+
+        merged_metadata = {
+            **(current.metadata or {}),
+            **(metadata_patch or {}),
+        }
+
+        with self.connection_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    update conversations
+                    set metadata = %s::jsonb,
+                        updated_at = now()
+                    where campaign_id = %s and id = %s
+                    """,
+                    (
+                        json.dumps(merged_metadata),
+                        self.campaign_id,
+                        conversation_id,
+                    ),
+                )
+            conn.commit()
+
+        return self.get_conversation(conversation_id)
+
 
 class NullConversationStore:
     def ensure_schema(self) -> None:
@@ -302,3 +337,11 @@ class NullConversationStore:
 
     def list_messages(self, conversation_id: str, limit: int = 100) -> List[ConversationMessageRecord]:
         return []
+
+    def update_conversation_metadata(
+        self,
+        conversation_id: str,
+        *,
+        metadata_patch: Dict[str, Any],
+    ) -> Optional[ConversationRecord]:
+        return None
