@@ -424,6 +424,85 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("Relacje:", markers)
         self.assertIn("Jak uzyc tej postaci na sesji:", markers)
 
+    def test_markers_requiring_fill_detects_empty_bullet_items(self):
+        markers = main.markers_requiring_fill(
+            "Imie: Kael\n\n"
+            "Rola w kampanii:\nDowodca Red Blade, ktory naciska Captain Mira.\n\n"
+            "Relacje:\n* Captain Mira: uwaza ja za zbyt miekka.\n*",
+            "npc_brief",
+        )
+
+        self.assertIn("Relacje:", markers)
+
+    def test_sanitize_generated_section_flattens_multiline_title(self):
+        sanitized = main.sanitize_generated_section(
+            "Tytul:",
+            "Tytul:\nMira i Red Blade: trudne wybory.\nRed Blade zada swojej ceny.",
+        )
+
+        self.assertEqual(sanitized, "Mira i Red Blade: trudne wybory.")
+
+    def test_generate_creative_section_repairs_truncated_hook(self):
+        original_generate = main.gemini_generate
+        outputs = iter(
+            [
+                "Captain Mira odkrywa zdrade i prz",
+                "Captain Mira odkrywa zdrade i prz",
+                "Captain Mira odkrywa, ze Red Blade testuje jej lojalnosc. Bohaterowie musza szybko wybrac strone konfliktu.",
+            ]
+        )
+
+        try:
+            main.gemini_generate = lambda *args, **kwargs: next(outputs)
+            section = main.generate_creative_section(
+                artifact_type="session_hooks",
+                marker="Hook 3:",
+                instruction="Napisz 2-4 zdania. Ten hook ma byc wyraznie inny od poprzednich.",
+                message="Wymysl 3 hooki na sesje zwiazane z Red Blade i Captain Mira.",
+                world_context="Kontekst kampanii o Red Blade.",
+                structured_context="KNOWN ENTITIES:\n- Captain Mira\nKNOWN THREADS:\n- T01 | Red Blade",
+                recent_sessions_context="Session 05: Mira ujawnila kontakt.",
+                canonical_names=["Captain Mira", "Red Blade"],
+                prior_sections_text="Tytul: Cienie Red Blade",
+                require_canonical_name=True,
+            )
+        finally:
+            main.gemini_generate = original_generate
+
+        self.assertIn("Captain Mira", section)
+        self.assertIn("Red Blade", section)
+        self.assertTrue(section.endswith("."))
+
+    def test_generate_creative_section_repairs_incomplete_npc_list(self):
+        original_generate = main.gemini_generate
+        outputs = iter(
+            [
+                "* Captain Mira: uwaza ja za przeszkode.\n*",
+                "* Captain Mira: uwaza ja za przeszkode.\n*",
+                "* Captain Mira: uwaza ja za przeszkode w planach Red Blade.\n* Red Blade: ma tam lojalistow gotowych wykonywac rozkazy.",
+            ]
+        )
+
+        try:
+            main.gemini_generate = lambda *args, **kwargs: next(outputs)
+            section = main.generate_creative_section(
+                artifact_type="npc_brief",
+                marker="Relacje:",
+                instruction="Daj 3-5 bulletow zaczynajacych sie od '* ' o relacjach postaci.",
+                message="Stworz nowego NPC powiazanego z Red Blade, ktory moze wejsc w konflikt z Captain Mira.",
+                world_context="Kontekst kampanii o Red Blade.",
+                structured_context="KNOWN ENTITIES:\n- Captain Mira\nKNOWN THREADS:\n- T01 | Red Blade",
+                recent_sessions_context="Session 05: Mira ujawnila kontakt.",
+                canonical_names=["Captain Mira", "Red Blade"],
+                prior_sections_text="Imie: Kael",
+                require_canonical_name=True,
+            )
+        finally:
+            main.gemini_generate = original_generate
+
+        self.assertIn("* Captain Mira:", section)
+        self.assertIn("* Red Blade:", section)
+
     def test_chat_answer_can_save_output_doc(self):
         original_ask = main.ask
         original_drive_store = main.drive_store_v2

@@ -1456,6 +1456,75 @@ def ends_with_sentence_punctuation(content: str) -> bool:
     return bool(re.search(r"[.!?\)\]\"']\s*$", (content or "").strip()))
 
 
+def extract_bullet_items(content: str) -> List[str]:
+    items: List[str] = []
+    current: List[str] = []
+
+    for raw_line in (content or "").splitlines():
+        line = raw_line.rstrip()
+        bullet_match = re.match(r"^\s*[\*\-]\s+(.*)$", line)
+        if bullet_match:
+            if current:
+                items.append(" ".join(part for part in current if part).strip())
+            current = [bullet_match.group(1).strip()]
+            continue
+        if current and line.strip():
+            current.append(line.strip())
+
+    if current:
+        items.append(" ".join(part for part in current if part).strip())
+    return [item for item in items if item]
+
+
+def complete_bullet_count(content: str, minimum_length: int = 12) -> int:
+    count = 0
+    for item in extract_bullet_items(content):
+        normalized = normalize_section_body(item)
+        if (
+            len(normalized) >= minimum_length
+            and "do doprecyzowania" not in normalized.lower()
+            and ends_with_sentence_punctuation(item)
+        ):
+            count += 1
+    return count
+
+
+def trim_to_complete_sentences(content: str) -> str:
+    raw = (content or "").strip()
+    if not raw or ends_with_sentence_punctuation(raw):
+        return raw
+
+    matches = list(re.finditer(r"[.!?](?=(?:[\"')\]]*)?(?:\s|$))", raw))
+    if not matches:
+        return raw
+
+    trimmed = raw[:matches[-1].end()].strip()
+    if len(normalize_section_body(trimmed)) >= max(20, len(normalize_section_body(raw)) // 2):
+        return trimmed
+    return raw
+
+
+def normalize_single_line_section(content: str) -> str:
+    lines = [re.sub(r"^\s*[\*\-]\s+", "", line).strip() for line in (content or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    first_line = lines[0]
+    first_line = re.sub(r"\s+", " ", first_line).strip()
+    sentence_parts = re.split(r"(?<=[.!?])\s+", first_line)
+    return sentence_parts[0].strip() if sentence_parts else first_line
+
+
+def sanitize_generated_section(marker: str, content: str) -> str:
+    raw = strip_section_marker(content, marker)
+    if marker in {"Tytul:", "Tytul sceny:", "Imie:"}:
+        return normalize_single_line_section(raw)
+    if marker in {"Stawki:", "Co przygotowac:", "Relacje:", "Jak uzyc tej postaci na sesji:"}:
+        items = [trim_to_complete_sentences(item) for item in extract_bullet_items(raw)]
+        items = [re.sub(r"\s+", " ", item).strip() for item in items if item.strip()]
+        return "\n".join(f"* {item}" for item in items)
+    return trim_to_complete_sentences(raw)
+
+
 def section_min_length(artifact_type: ArtifactType, marker: str) -> int:
     if artifact_type == "pre_session_brief":
         return 60 if marker == "## Campaign State" else 35
@@ -1494,15 +1563,15 @@ def section_needs_fill(
         if marker in {"Hook 1:", "Hook 2:", "Hook 3:"}:
             return len(normalized) < section_min_length(artifact_type, marker) or not ends_with_sentence_punctuation(raw)
         if marker in {"Stawki:", "Co przygotowac:"}:
-            return bullet_count(raw) < 2
+            return complete_bullet_count(raw) < 2
     if artifact_type == "npc_brief":
         if marker == "Imie:":
             return "\n" in raw or len(normalized) < 2
         if marker in {"Relacje:", "Jak uzyc tej postaci na sesji:"}:
-            return bullet_count(raw) < 2
+            return complete_bullet_count(raw) < 2
         return len(normalized) < section_min_length(artifact_type, marker) or not ends_with_sentence_punctuation(raw)
     if artifact_type == "pre_session_brief" and marker.startswith("## "):
-        return bullet_count(raw) < 2
+        return complete_bullet_count(raw) < 2
     if len(normalized) < section_min_length(artifact_type, marker):
         return True
     if is_last_marker and artifact_type in {"pre_session_brief", "npc_brief"}:
@@ -1538,15 +1607,15 @@ def section_retry_rule(artifact_type: ArtifactType, marker: str) -> str:
         if marker in {"Hook 1:", "Hook 2:", "Hook 3:"}:
             return "Zwroc 2-4 pelne zdania i zakoncz sekcje pelnym zdaniem z kropka, pytajnikiem albo wykrzyknikiem."
         if marker in {"Stawki:", "Co przygotowac:"}:
-            return "Zwroc co najmniej 4 osobne bullety zaczynajace sie od '* '."
+            return "Zwroc co najmniej 2 osobne bullety zaczynajace sie od '* '. Kazdy bullet zakoncz pelnym zdaniem."
     if artifact_type == "npc_brief":
         if marker == "Imie:":
             return "Zwroc tylko imie albo imie i nazwisko w jednym wierszu."
         if marker in {"Relacje:", "Jak uzyc tej postaci na sesji:"}:
-            return "Zwroc co najmniej 3 osobne bullety zaczynajace sie od '* '."
+            return "Zwroc co najmniej 2 osobne bullety zaczynajace sie od '* '. Kazdy bullet zakoncz pelnym zdaniem."
         return "Zwroc 2-4 pelne zdania i zakoncz sekcje pelnym zdaniem."
     if artifact_type == "pre_session_brief" and marker.startswith("## "):
-        return "Zwroc co najmniej 3 osobne bullety zaczynajace sie od '* '."
+        return "Zwroc co najmniej 2 osobne bullety zaczynajace sie od '* '. Kazdy bullet zakoncz pelnym zdaniem."
     return "Uzupelnij sekcje pelna i konkretna trescia."
 
 
@@ -1736,6 +1805,81 @@ def strip_section_marker(text: str, marker: str) -> str:
     return stripped.strip()
 
 
+def repair_creative_section(
+    *,
+    artifact_type: ArtifactType,
+    marker: str,
+    instruction: str,
+    message: str,
+    world_context: str,
+    structured_context: str,
+    recent_sessions_context: str,
+    canonical_names: List[str],
+    prior_sections_text: str,
+    broken_content: str,
+    require_canonical_name: bool,
+) -> str:
+    canonical_context = build_canonical_names_context(canonical_names)
+    prompt = f"""
+Jestes wspolautorem kampanii RPG "Krew Na Gwiazdach". Pisz po polsku.
+
+Napraw tylko jedna sekcje artefaktu `{artifact_type}`. Obecna wersja jest urwana, za slaba albo ma zly format.
+Nie zwracaj JSON. Nie zwracaj code fence. Nie zwracaj nazwy sekcji.
+
+SEKCJA:
+{marker}
+
+INSTRUKCJA DLA SEKCJI:
+{instruction}
+
+ZASADY:
+- Zachowaj ton kampanii: smutne heroic fantasy, polityka, emocje, trudne wybory.
+- Pisz zwiezle i konkretnie.
+- Nie przeczyc twardym faktom z kontekstu.
+- Nie tlumacz nazw kanonicznych.
+- Zakoncz sekcje w pelnym, domknietym formacie.
+
+{canonical_context}
+
+AKTUALNY MODEL SWIATA:
+{structured_context}
+
+OSTATNIE SESJE:
+{recent_sessions_context}
+
+RELEWANTNY KONTEKST KAMPANII:
+{world_context}
+
+PROSBA UZYTKOWNIKA:
+{message}
+
+JUZ WYGNEROWANE SEKCJE:
+{prior_sections_text or '[brak]'}
+
+WADLIWA WERSJA TEJ SEKCJI:
+{broken_content or '[empty]'}
+
+DODATKOWA REGULA:
+{section_retry_rule(artifact_type, marker)}
+{" Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "." if require_canonical_name and canonical_names else ""}
+
+ZWROC TYLKO POPRAWIONA TRESC SEKCJI:
+""".strip()
+
+    try:
+        return sanitize_generated_section(
+            marker,
+            gemini_generate(
+                prompt,
+                response_mime_type="text/plain",
+                temperature=0.35,
+                max_output_tokens=900,
+            ).strip(),
+        )
+    except Exception:
+        return sanitize_generated_section(marker, broken_content)
+
+
 def generate_creative_section(
     *,
     artifact_type: ArtifactType,
@@ -1750,6 +1894,8 @@ def generate_creative_section(
     require_canonical_name: bool,
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
+    markers = artifact_required_markers(artifact_type)
+    is_last_marker = marker == markers[-1]
     prompt = f"""
 Jestes wspolautorem kampanii RPG "Krew Na Gwiazdach". Pisz po polsku.
 
@@ -1792,14 +1938,14 @@ ZWROC TYLKO TRESC SEKCJI:
         effective_prompt = prompt
         if extra_rule:
             effective_prompt = f"{prompt}\n\nDODATKOWA REGULA:\n{extra_rule}"
-        return strip_section_marker(
+        return sanitize_generated_section(
+            marker,
             gemini_generate(
                 effective_prompt,
                 response_mime_type="text/plain",
-                temperature=0.7,
-                max_output_tokens=1200,
+                temperature=0.45,
+                max_output_tokens=900,
             ).strip(),
-            marker,
         )
 
     try:
@@ -1811,7 +1957,7 @@ ZWROC TYLKO TRESC SEKCJI:
         artifact_type=artifact_type,
         marker=marker,
         content=candidate,
-        is_last_marker=marker == artifact_required_markers(artifact_type)[-1],
+        is_last_marker=is_last_marker,
     )
     missing_name = require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)
     if needs_retry or missing_name:
@@ -1824,7 +1970,26 @@ ZWROC TYLKO TRESC SEKCJI:
                 candidate = retry_candidate
         except Exception:
             pass
-    return candidate.strip()
+    if section_needs_fill(
+        artifact_type=artifact_type,
+        marker=marker,
+        content=candidate,
+        is_last_marker=is_last_marker,
+    ) or (require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)):
+        candidate = repair_creative_section(
+            artifact_type=artifact_type,
+            marker=marker,
+            instruction=instruction,
+            message=message,
+            world_context=world_context,
+            structured_context=structured_context,
+            recent_sessions_context=recent_sessions_context,
+            canonical_names=canonical_names,
+            prior_sections_text=prior_sections_text,
+            broken_content=candidate,
+            require_canonical_name=require_canonical_name,
+        )
+    return sanitize_generated_section(marker, candidate).strip()
 
 
 def generate_structured_creative_artifact(
