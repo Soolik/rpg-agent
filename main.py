@@ -32,6 +32,7 @@ from app.models_v2 import (
 )
 from app.planner import PlannerService
 from app.routes_v2 import build_context_for_planner, build_v2_router
+from app.text_normalization import normalize_text_artifacts
 from app.world_model_store import WorldModelStore
 from app.workflow_store import WorkflowStore
 from googleapiclient.discovery import build
@@ -419,7 +420,7 @@ def gemini_generate(
         finish_reason = candidate.get("finishReason")
         parts = candidate["content"]["parts"]
         texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
-        out = "\n".join([t for t in texts if t.strip()]).strip()
+        out = normalize_text_artifacts("\n".join([t for t in texts if t.strip()]).strip())
     except Exception:
         out = ""
 
@@ -809,7 +810,9 @@ def render_source_labels(sources: List[Dict[str, Any]]) -> List[str]:
     labels: List[str] = []
     seen = set()
     for source in sources:
-        label = " / ".join(filter(None, [source.get("folder"), source.get("title")])).strip()
+        folder = normalize_text_artifacts(source.get("folder") or "").strip()
+        title = normalize_text_artifacts(source.get("title") or "").strip()
+        label = " / ".join(filter(None, [folder, title])).strip()
         if not label:
             label = source.get("doc_id") or "unknown source"
         if label in seen:
@@ -829,9 +832,11 @@ def extract_titlecase_phrases(text: str) -> List[str]:
         "zrob",
         "opisz",
     }
+    titlecase_word = r"[A-ZĄĆĘŁŃÓŚŹŻ][A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż0-9'_-]*"
+    normalized_text = normalize_text_artifacts(text or "")
     matches = re.findall(
-        r"\b[A-Z][A-Za-z0-9'_-]+(?:\s+[A-Z][A-Za-z0-9'_-]+){0,3}\b",
-        text or "",
+        rf"\b{titlecase_word}(?:\s+{titlecase_word}){{0,3}}\b",
+        normalized_text,
     )
     phrases: List[str] = []
     seen = set()
@@ -850,10 +855,10 @@ def extract_titlecase_phrases(text: str) -> List[str]:
 def collect_canonical_names(message: str, hits: List[Dict[str, Any]], limit: int = 12) -> List[str]:
     names: List[str] = []
     seen = set()
-    normalized_message = normalize_world_model_key(message)
+    normalized_message = normalize_world_model_key(normalize_text_artifacts(message))
 
     def add_name(value: Optional[str]) -> None:
-        cleaned = (value or "").strip()
+        cleaned = normalize_text_artifacts(value or "").strip()
         key = normalize_world_model_key(cleaned)
         if not cleaned or not key or key in seen:
             return
@@ -895,6 +900,153 @@ def build_canonical_names_context(canonical_names: List[str]) -> str:
             "- Jesli uzywasz tych nazw, kopiuj je dokladnie w tej formie.",
         ]
     )
+
+
+PROPER_NOUN_IGNORE_KEYS = {
+    "active threads",
+    "campaign state",
+    "co przygotowac",
+    "hook",
+    "hooks",
+    "imie",
+    "jak uzyc tej postaci na sesji",
+    "key npcs and factions",
+    "mg",
+    "npc",
+    "pierwsze wrazenie",
+    "prep checklist",
+    "pre-session brief",
+    "pre session brief",
+    "relacje",
+    "risks and pressure points",
+    "rola w kampanii",
+    "scene opportunities",
+    "sekret",
+    "stawki",
+    "tytul",
+}
+
+
+def section_disallows_new_proper_nouns(artifact_type: ArtifactType, marker: str) -> bool:
+    return not (artifact_type == "npc_brief" and marker == "Imie:")
+
+
+def looks_like_proper_noun_label(value: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", (value or "").strip(" -*:;,.!?()[]{}\"'")).strip()
+    if not cleaned:
+        return False
+    key = normalize_world_model_key(cleaned)
+    if key in PROPER_NOUN_IGNORE_KEYS:
+        return False
+    if " " not in cleaned:
+        return True
+    words = cleaned.split()
+    return all(re.match(r"^[A-ZĄĆĘŁŃÓŚŹŻ][A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż0-9'_-]*$", word) for word in words)
+
+
+def extract_proper_noun_candidates(text: str) -> List[str]:
+    candidates: List[str] = []
+    seen = set()
+
+    def add_name(value: str) -> None:
+        cleaned = re.sub(r"\s+", " ", (value or "").strip()).strip(" -*:;,.!?()[]{}\"'")
+        key = normalize_world_model_key(cleaned)
+        if not cleaned or not key or key in seen:
+            return
+        seen.add(key)
+        candidates.append(cleaned)
+
+    for match in re.findall(r"\*\*([^*\n]{2,80})\*\*", text or ""):
+        if looks_like_proper_noun_label(match):
+            add_name(match)
+
+    for match in re.findall(
+        r"(?m)^\s*[\*\-]?\s*([A-ZĄĆĘŁŃÓŚŹŻ][A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż0-9'_-]{2,})\s*:",
+        text or "",
+    ):
+        if looks_like_proper_noun_label(match):
+            add_name(match)
+
+    for phrase in extract_titlecase_phrases(text):
+        if " " in phrase:
+            add_name(phrase)
+    return candidates
+
+
+def collect_allowed_proper_nouns(*parts: str, canonical_names: Optional[List[str]] = None) -> List[str]:
+    allowed: List[str] = []
+    seen = set()
+
+    def add_name(value: str) -> None:
+        cleaned = re.sub(r"\s+", " ", (value or "").strip()).strip(" -*:;,.!?()[]{}\"'")
+        key = normalize_world_model_key(cleaned)
+        if not cleaned or not key or key in seen or key in PROPER_NOUN_IGNORE_KEYS:
+            return
+        seen.add(key)
+        allowed.append(cleaned)
+
+    for name in canonical_names or []:
+        add_name(name)
+    for part in parts:
+        for phrase in extract_titlecase_phrases(part):
+            add_name(phrase)
+        for phrase in extract_proper_noun_candidates(part):
+            add_name(phrase)
+    return allowed
+
+
+def find_unknown_proper_nouns(text: str, allowed_names: List[str]) -> List[str]:
+    allowed_keys = [normalize_world_model_key(name) for name in allowed_names if name]
+    unknown: List[str] = []
+    for candidate in extract_proper_noun_candidates(text):
+        key = normalize_world_model_key(candidate)
+        if any(key == allowed or key in allowed or allowed in key for allowed in allowed_keys):
+            continue
+        unknown.append(candidate)
+    return unknown
+
+
+def build_proper_noun_guardrail(
+    artifact_type: ArtifactType,
+    marker: str,
+    allowed_names: List[str],
+) -> str:
+    if not section_disallows_new_proper_nouns(artifact_type, marker):
+        return ""
+    if not allowed_names:
+        return (
+            "Nie wprowadzaj nowych nazw wlasnych. Jesli potrzebujesz odniesienia do osoby, frakcji albo miejsca, "
+            "opisz je ogolnie bez nadawania nazwy."
+        )
+    allowed_names = allowed_names[:12]
+    return "\n".join(
+        [
+            "Nie wprowadzaj nowych nazw wlasnych spoza tej listy:",
+            *[f"- {name}" for name in allowed_names],
+            "Jesli potrzebujesz dodatkowej osoby, frakcji albo miejsca, opisz je ogolnie bez nadawania nowej nazwy.",
+        ]
+    )
+
+
+def collect_section_allowed_proper_nouns(
+    *,
+    message: str,
+    world_context: str,
+    structured_context: str,
+    recent_sessions_context: str,
+    prior_sections_text: str,
+    canonical_names: List[str],
+    extra_parts: Optional[List[str]] = None,
+) -> List[str]:
+    parts = [
+        message,
+        world_context,
+        structured_context,
+        recent_sessions_context,
+        prior_sections_text,
+        *(extra_parts or []),
+    ]
+    return collect_allowed_proper_nouns(*parts, canonical_names=canonical_names)
 
 
 def is_creative_artifact_type(artifact_type: Optional[ArtifactType]) -> bool:
@@ -1276,8 +1428,10 @@ def build_recent_sessions_context(limit: int = 5) -> str:
 
     lines = ["RECENT SESSIONS:"]
     for session in sessions:
+        source_title = normalize_text_artifacts(session.source_title or "n/a").strip()
+        summary = normalize_text_artifacts(session.session_summary or "").strip()
         lines.append(
-            f"- session_id={session.id} | source={session.source_title or 'n/a'} | summary={session.session_summary}"
+            f"- session_id={session.id} | source={source_title or 'n/a'} | summary={summary}"
         )
     return "\n".join(lines)
 
@@ -1984,6 +2138,19 @@ def generate_section_candidate(
     require_canonical_name: bool,
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
+    allowed_proper_nouns = collect_section_allowed_proper_nouns(
+        message=message,
+        world_context=world_context,
+        structured_context=structured_context,
+        recent_sessions_context=recent_sessions_context,
+        prior_sections_text=prior_sections_text,
+        canonical_names=canonical_names,
+    )
+    proper_noun_rule = build_proper_noun_guardrail(
+        artifact_type,
+        marker,
+        allowed_proper_nouns,
+    )
     markers = artifact_required_markers(artifact_type)
     is_last_marker = marker == markers[-1]
     attempts: List[Dict[str, Any]] = []
@@ -2006,6 +2173,9 @@ ZASADY:
 - Nie tlumacz nazw kanonicznych.
 
 {canonical_context}
+
+OGRANICZENIA DLA NAZW WLASNYCH:
+{proper_noun_rule or 'Brak dodatkowych ograniczen.'}
 
 AKTUALNY MODEL SWIATA:
 {structured_context}
@@ -2061,11 +2231,18 @@ ZWROC TYLKO TRESC SEKCJI:
         content=candidate,
         is_last_marker=is_last_marker,
     )
+    unknown_proper_nouns = (
+        find_unknown_proper_nouns(candidate, allowed_proper_nouns)
+        if section_disallows_new_proper_nouns(artifact_type, marker)
+        else []
+    )
     missing_name = require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)
-    if needs_retry or missing_name:
+    if needs_retry or missing_name or unknown_proper_nouns:
         retry_rule = section_retry_rule(artifact_type, marker)
         if require_canonical_name and canonical_names:
             retry_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
+        if unknown_proper_nouns:
+            retry_rule += " Usun nowe nazwy wlasne spoza dozwolonej listy, zwlaszcza: " + ", ".join(unknown_proper_nouns) + "."
         try:
             retry_candidate = run_prompt(retry_rule, temperature=0.35)
             if retry_candidate:
@@ -2080,12 +2257,17 @@ ZWROC TYLKO TRESC SEKCJI:
             )
         except Exception:
             attempts.append({"stage": "retry", "error": True})
+    unknown_proper_nouns = (
+        find_unknown_proper_nouns(candidate, allowed_proper_nouns)
+        if section_disallows_new_proper_nouns(artifact_type, marker)
+        else []
+    )
     if section_needs_fill(
         artifact_type=artifact_type,
         marker=marker,
         content=candidate,
         is_last_marker=is_last_marker,
-    ) or (require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)):
+    ) or (require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)) or unknown_proper_nouns:
         candidate = repair_creative_section(
             artifact_type=artifact_type,
             marker=marker,
@@ -2131,6 +2313,11 @@ ZWROC TYLKO TRESC SEKCJI:
         except Exception:
             attempts.append({"stage": "compact", "error": True})
     final_candidate = sanitize_generated_section(marker, candidate).strip()
+    final_unknown_proper_nouns = (
+        find_unknown_proper_nouns(final_candidate, allowed_proper_nouns)
+        if section_disallows_new_proper_nouns(artifact_type, marker)
+        else []
+    )
     record_telemetry(
         "sections",
         {
@@ -2148,6 +2335,7 @@ ZWROC TYLKO TRESC SEKCJI:
                 is_last_marker=is_last_marker,
             ),
             "contains_canonical_name": any(name in final_candidate for name in canonical_names) if canonical_names else False,
+            "unknown_proper_nouns": final_unknown_proper_nouns,
             "final_preview": final_candidate[:180],
         },
     )
@@ -2170,6 +2358,20 @@ def generate_bullet_item(
     target_index: int,
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
+    allowed_proper_nouns = collect_section_allowed_proper_nouns(
+        message=message,
+        world_context=world_context,
+        structured_context=structured_context,
+        recent_sessions_context=recent_sessions_context,
+        prior_sections_text=prior_sections_text,
+        canonical_names=canonical_names,
+        extra_parts=["\n".join(existing_items)],
+    )
+    proper_noun_rule = build_proper_noun_guardrail(
+        artifact_type,
+        marker,
+        allowed_proper_nouns,
+    )
     existing_items_text = "\n".join(f"* {item}" for item in existing_items) or "[brak]"
     prompt = f"""
 Jestes wspolautorem kampanii RPG "Krew Na Gwiazdach". Pisz po polsku.
@@ -2195,6 +2397,9 @@ ZASADY:
 - Nie powtarzaj juz istniejacych bulletow.
 
 {canonical_context}
+
+OGRANICZENIA DLA NAZW WLASNYCH:
+{proper_noun_rule or 'Brak dodatkowych ograniczen.'}
 
 AKTUALNY MODEL SWIATA:
 {structured_context}
@@ -2251,6 +2456,10 @@ ZWROC TYLKO NOWY BULLET:
             and len(normalize_section_body(candidate)) >= 12
             and ends_with_sentence_punctuation(candidate)
             and candidate not in existing_items
+            and (
+                not section_disallows_new_proper_nouns(artifact_type, marker)
+                or not find_unknown_proper_nouns(candidate, allowed_proper_nouns)
+            )
         ):
             return candidate
     return ""
@@ -2271,6 +2480,20 @@ def repair_creative_section(
     require_canonical_name: bool,
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
+    allowed_proper_nouns = collect_section_allowed_proper_nouns(
+        message=message,
+        world_context=world_context,
+        structured_context=structured_context,
+        recent_sessions_context=recent_sessions_context,
+        prior_sections_text=prior_sections_text,
+        canonical_names=canonical_names,
+        extra_parts=[broken_content],
+    )
+    proper_noun_rule = build_proper_noun_guardrail(
+        artifact_type,
+        marker,
+        allowed_proper_nouns,
+    )
     prompt = f"""
 Jestes wspolautorem kampanii RPG "Krew Na Gwiazdach". Pisz po polsku.
 
@@ -2291,6 +2514,9 @@ ZASADY:
 - Zakoncz sekcje w pelnym, domknietym formacie.
 
 {canonical_context}
+
+OGRANICZENIA DLA NAZW WLASNYCH:
+{proper_noun_rule or 'Brak dodatkowych ograniczen.'}
 
 AKTUALNY MODEL SWIATA:
 {structured_context}
@@ -2318,7 +2544,7 @@ ZWROC TYLKO POPRAWIONA TRESC SEKCJI:
 """.strip()
 
     try:
-        return sanitize_generated_section(
+        repaired = sanitize_generated_section(
             marker,
             gemini_generate(
                 prompt,
@@ -2329,6 +2555,11 @@ ZWROC TYLKO POPRAWIONA TRESC SEKCJI:
                 telemetry_label=f"repair:{artifact_type}:{marker}",
             ).strip(),
         )
+        if section_disallows_new_proper_nouns(artifact_type, marker):
+            unknown_proper_nouns = find_unknown_proper_nouns(repaired, allowed_proper_nouns)
+            if unknown_proper_nouns:
+                return ""
+        return repaired
     except Exception:
         return sanitize_generated_section(marker, broken_content)
 
@@ -2585,6 +2816,7 @@ ZASADY:
 7) Jesli format zawiera Hook 1/2/3 albo Twist 1/2/3, wypelnij wszystkie te sekcje.
 8) Pisz zwiezle i praktycznie. Unikaj jednego bardzo dlugiego akapitu kosztem pozostalych sekcji.
 9) Nie tlumacz nazw kanonicznych i nie zamieniaj ich na synonimy.
+10) Nie wprowadzaj nowych nazw wlasnych, jesli nie sa potrzebne do wykonania prosby. Gdy wystarczy opis ogolny, nie nadawaj nowej nazwy.
 
 WYTYCZNE STYLU:
 {artifact_style_guidance(artifact_type)}
@@ -2631,6 +2863,7 @@ ZASADY:
 6) Wypelnij wszystkie sekcje z wymaganego formatu.
 7) Pisz zwiezle i praktycznie. Lepiej dac krotsze sekcje niz urwac artefakt po pierwszej.
 8) Nie tlumacz nazw kanonicznych i nie zamieniaj ich na synonimy.
+9) Nie wprowadzaj nowych nazw wlasnych. Jesli brakuje nazwy, opisz osobe, frakcje albo miejsce ogolnie.
 
 WYTYCZNE STYLU:
 {artifact_style_guidance("pre_session_brief")}
@@ -2654,17 +2887,20 @@ ZWROC DOKLADNIE TEN FORMAT:
 """.strip()
 
 
-def generate_creative_artifact(
-    *,
+def load_creative_generation_context(
     message: str,
-    artifact_type: ArtifactType,
-) -> tuple[str, List[str]]:
-    structured_context = build_world_model_context(limit=30)
-    recent_sessions_context = build_recent_sessions_context(limit=5)
+    *,
+    structured_limit: int,
+    recent_sessions_limit: int,
+    vector_top_k: int,
+) -> Dict[str, Any]:
+    structured_context = build_world_model_context(limit=structured_limit)
+    recent_sessions_context = build_recent_sessions_context(limit=recent_sessions_limit)
     try:
-        hits = vector_search(message, 6)
+        hits = vector_search(message, vector_top_k)
     except Exception:
         hits = []
+
     if hits:
         world_context = build_campaign_context(hits)
     else:
@@ -2672,7 +2908,32 @@ def generate_creative_artifact(
             world_context = build_context_for_planner(drive_store_v2)
         except Exception:
             world_context = "Brak dodatkowego kontekstu kampanii."
-    canonical_names = collect_canonical_names(message, hits)
+
+    return {
+        "structured_context": structured_context,
+        "recent_sessions_context": recent_sessions_context,
+        "hits": hits,
+        "world_context": world_context,
+        "canonical_names": collect_canonical_names(message, hits),
+    }
+
+
+def generate_creative_artifact(
+    *,
+    message: str,
+    artifact_type: ArtifactType,
+) -> tuple[str, List[str]]:
+    creative_context = load_creative_generation_context(
+        message,
+        structured_limit=30,
+        recent_sessions_limit=5,
+        vector_top_k=6,
+    )
+    structured_context = creative_context["structured_context"]
+    recent_sessions_context = creative_context["recent_sessions_context"]
+    hits = creative_context["hits"]
+    world_context = creative_context["world_context"]
+    canonical_names = creative_context["canonical_names"]
     canonical_names_context = build_canonical_names_context(canonical_names)
 
     if artifact_type in {"session_hooks", "npc_brief"}:
@@ -2725,20 +2986,17 @@ def generate_creative_artifact(
 
 
 def generate_pre_session_brief(message: str) -> tuple[str, List[str]]:
-    structured_context = build_world_model_context(limit=40)
-    recent_sessions_context = build_recent_sessions_context(limit=6)
-    try:
-        hits = vector_search(message, 8)
-    except Exception:
-        hits = []
-    if hits:
-        world_context = build_campaign_context(hits)
-    else:
-        try:
-            world_context = build_context_for_planner(drive_store_v2)
-        except Exception:
-            world_context = "Brak dodatkowego kontekstu kampanii."
-    canonical_names = collect_canonical_names(message, hits)
+    creative_context = load_creative_generation_context(
+        message,
+        structured_limit=40,
+        recent_sessions_limit=6,
+        vector_top_k=8,
+    )
+    structured_context = creative_context["structured_context"]
+    recent_sessions_context = creative_context["recent_sessions_context"]
+    hits = creative_context["hits"]
+    world_context = creative_context["world_context"]
+    canonical_names = creative_context["canonical_names"]
 
     artifact_text = generate_structured_creative_artifact(
         artifact_type="pre_session_brief",
@@ -2753,7 +3011,7 @@ def generate_pre_session_brief(message: str) -> tuple[str, List[str]]:
 
 def ctx_slice(h: Dict[str, Any]) -> str:
     doc_type = h.get("doc_type", "")
-    text = h.get("chunk_text", "") or ""
+    text = normalize_text_artifacts(h.get("chunk_text", "") or "")
     if not text:
         return ""
 
@@ -2784,10 +3042,10 @@ def ctx_slice(h: Dict[str, Any]) -> str:
 def build_campaign_context(hits: List[Dict[str, Any]]) -> str:
     blocks: List[str] = []
     for idx, hit in enumerate(hits, start=1):
-        title = hit.get("title") or "unknown"
-        folder = hit.get("folder") or "unknown"
+        title = normalize_text_artifacts(hit.get("title") or "unknown")
+        folder = normalize_text_artifacts(hit.get("folder") or "unknown")
         doc_type = hit.get("doc_type") or "other"
-        path_hint = hit.get("path_hint") or ""
+        path_hint = normalize_text_artifacts(hit.get("path_hint") or "")
         label = f"[{idx}] title={title} | folder={folder} | doc_type={doc_type}"
         if path_hint:
             label += f" | path={path_hint}"
@@ -3452,14 +3710,16 @@ def build_world_model_context(limit: int = 50) -> str:
     if entities:
         lines.append("KNOWN ENTITIES:")
         for entity in entities:
-            lines.append(f"- {entity.entity_kind}: {entity.name}")
+            name = normalize_text_artifacts(entity.name or "").strip()
+            lines.append(f"- {entity.entity_kind}: {name}")
 
     if threads:
         lines.append("KNOWN THREADS:")
         for thread in threads:
             prefix = f"{thread.thread_id} | " if thread.thread_id else ""
             status = f" | status={thread.status}" if thread.status else ""
-            lines.append(f"- {prefix}{thread.title}{status}")
+            title = normalize_text_artifacts(thread.title or "").strip()
+            lines.append(f"- {prefix}{title}{status}")
 
     return "\n".join(lines) if lines else "No structured world model entries available yet."
 

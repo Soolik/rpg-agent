@@ -551,6 +551,40 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("* Red Blade:", section)
         self.assertIn("* BG:", section)
 
+    def test_generate_creative_section_retries_when_brief_introduces_unknown_name(self):
+        original_generate = main.gemini_generate
+        outputs = iter(
+            [
+                "* **Captain Mira** - Jej kontakt z Red Blade destabilizuje sytuacje.\n"
+                "* **Red Blade** - Frakcja naciska na szybkie decyzje.\n"
+                "* **Skup** - Reaguje na kryzys polityczny wokol Miry.",
+                "* **Captain Mira** - Jej kontakt z Red Blade destabilizuje sytuacje.\n"
+                "* **Red Blade** - Frakcja naciska na szybkie decyzje.\n"
+                "* Lokalne wladze obserwuja bohaterow i przygotowuja nacisk polityczny.",
+            ]
+        )
+
+        try:
+            main.gemini_generate = lambda *args, **kwargs: next(outputs)
+            section = main.generate_creative_section(
+                artifact_type="pre_session_brief",
+                marker="## Key NPCs and Factions",
+                instruction="Daj 3 krotkie bullety o kluczowych NPC i frakcjach istotnych przed kolejna sesja.",
+                message="Przygotuj briefing przed sesja o Red Blade i Captain Mira.",
+                world_context="Kontekst kampanii o Red Blade.",
+                structured_context="KNOWN ENTITIES:\n- Captain Mira\nKNOWN THREADS:\n- T01 | Red Blade",
+                recent_sessions_context="Session 05: Mira ujawnila kontakt.",
+                canonical_names=["Captain Mira", "Red Blade"],
+                prior_sections_text="# Pre-Session Brief\n\n## Campaign State\n* Captain Mira jest pod presja.",
+                require_canonical_name=True,
+            )
+        finally:
+            main.gemini_generate = original_generate
+
+        self.assertIn("Captain Mira", section)
+        self.assertIn("Red Blade", section)
+        self.assertNotIn("Skup", section)
+
     def test_chat_answer_can_save_output_doc(self):
         original_ask = main.ask
         original_drive_store = main.drive_store_v2
@@ -890,7 +924,10 @@ class ChatFlowTest(unittest.TestCase):
 
         try:
             main.gemini_generate = fake_generate
-            main.build_world_model_context = lambda limit=40: "WORLD MODEL"
+            main.build_world_model_context = (
+                lambda limit=40: "KNOWN ENTITIES:\n- npc: Captain Mira\n"
+                "KNOWN THREADS:\n- T01 | Red Blade\n- T02 | Walka o zasoby\n- T05 | Peknieta przysiega"
+            )
             main.build_recent_sessions_context = lambda limit=6: "RECENT SESSIONS"
             main.vector_search = lambda message, top_k: []
             main.build_context_for_planner = lambda drive_store: "CAMPAIGN CONTEXT"

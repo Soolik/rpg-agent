@@ -12,6 +12,13 @@ class DriveStoreSectionReplaceTest(unittest.TestCase):
 
         self.assertEqual(decoded, "Line 1\nLine 2\nLine 3")
 
+    def test_decode_google_export_text_repairs_common_mojibake(self):
+        raw = "Captain Mira \u00c5\u00bcada lojalnosci wobec Red Blade.\r\n".encode("utf-8")
+
+        decoded = decode_google_export_text(raw)
+
+        self.assertEqual(decoded, "Captain Mira \u017cada lojalnosci wobec Red Blade.\n")
+
     def test_replace_existing_section_body(self):
         original = (
             "# NPC\n\n"

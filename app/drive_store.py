@@ -8,6 +8,7 @@ import google.auth
 from googleapiclient.discovery import build
 
 from .models_v2 import DocumentRef, WorldDocInfo, WorldEntityType
+from .text_normalization import normalize_text_artifacts
 
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -18,8 +19,7 @@ HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 
 def decode_google_export_text(data: bytes) -> str:
     text = data.decode("utf-8-sig", errors="ignore")
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    return text.lstrip("\ufeff")
+    return normalize_text_artifacts(text)
 
 
 def normalize_section_name(section: str) -> str:
