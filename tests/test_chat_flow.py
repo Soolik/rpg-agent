@@ -17,6 +17,20 @@ class ChatFlowTest(unittest.TestCase):
         )
         self.assertEqual(intent, "creative")
 
+    def test_infer_artifact_type_recognizes_pre_session_brief(self):
+        artifact_type = main.infer_artifact_type(
+            "Przygotuj briefing przed sesja o Red Blade i Captain Mira.",
+            None,
+        )
+        self.assertEqual(artifact_type, "pre_session_brief")
+
+    def test_infer_artifact_type_recognizes_pre_session_brief_with_polish_inflection(self):
+        artifact_type = main.infer_artifact_type(
+            "Potrzebny brief przed sesją o Red Blade i Captain Mira.",
+            None,
+        )
+        self.assertEqual(artifact_type, "pre_session_brief")
+
     def test_chat_answer_returns_human_text_with_sources(self):
         original_ask = main.ask
         try:
@@ -120,6 +134,42 @@ class ChatFlowTest(unittest.TestCase):
         self.assertEqual(response.kind, "creative")
         self.assertEqual(response.artifact_type, "session_hooks")
         self.assertEqual(captured["artifact_type"], "session_hooks")
+
+    def test_ensure_artifact_shape_appends_missing_sections(self):
+        original_generate = main.gemini_generate
+        try:
+            main.gemini_generate = lambda *args, **kwargs: ""
+            shaped = main.ensure_artifact_shape(
+                artifact_type="session_hooks",
+                text="Tytul:\nCienie Red Blade\n\nHook 1:\nZaczepka na rynku.",
+                repair_context="Kontekst testowy.",
+            )
+        finally:
+            main.gemini_generate = original_generate
+
+        self.assertIn("Hook 2:", shaped)
+        self.assertIn("Hook 3:", shaped)
+        self.assertIn("Stawki:", shaped)
+        self.assertIn("Co przygotowac:", shaped)
+
+    def test_ensure_artifact_shape_falls_back_when_repair_fails(self):
+        original_generate = main.gemini_generate
+        try:
+            def fail_generate(*args, **kwargs):
+                raise RuntimeError("repair failed")
+
+            main.gemini_generate = fail_generate
+            shaped = main.ensure_artifact_shape(
+                artifact_type="npc_brief",
+                text="Imie:\nVarek Krwawy Szpon",
+                repair_context="Kontekst testowy.",
+            )
+        finally:
+            main.gemini_generate = original_generate
+
+        self.assertIn("Rola w kampanii:", shaped)
+        self.assertIn("Sekret:", shaped)
+        self.assertIn("Jak uzyc tej postaci na sesji:", shaped)
 
     def test_chat_answer_can_save_output_doc(self):
         original_ask = main.ask
@@ -412,6 +462,70 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("## Facts For Retrieval", response.artifact_text)
         self.assertIn("## Suggested Document Follow-ups", response.artifact_text)
         self.assertIn("## Prep For Next Session", response.artifact_text)
+
+    def test_chat_pre_session_brief_uses_brief_generator(self):
+        original_generate_pre_session_brief = main.generate_pre_session_brief
+        try:
+            main.generate_pre_session_brief = lambda message: (
+                "# Pre-Session Brief\n\n## Campaign State\nNapiecie rosnie.\n\n## Active Threads\n- T01 / Red Blade",
+                ["06 Threads / Thread Tracker"],
+            )
+
+            response = main.chat(
+                main.ChatRequest(
+                    message="Przygotuj briefing przed sesja o Red Blade i Captain Mira.",
+                )
+            )
+        finally:
+            main.generate_pre_session_brief = original_generate_pre_session_brief
+
+        self.assertEqual(response.kind, "answer")
+        self.assertEqual(response.artifact_type, "pre_session_brief")
+        self.assertIn("# Pre-Session Brief", response.artifact_text)
+        self.assertEqual(response.references, ["06 Threads / Thread Tracker"])
+
+    def test_generate_pre_session_brief_repairs_missing_sections(self):
+        original_generate = main.gemini_generate
+        original_build_world_model_context = main.build_world_model_context
+        original_build_recent_sessions_context = main.build_recent_sessions_context
+        original_vector_search = main.vector_search
+        original_build_context_for_planner = main.build_context_for_planner
+        original_render_source_labels = main.render_source_labels
+
+        calls = {"count": 0}
+
+        def fake_generate(prompt, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return "# Pre-Session Brief\n\n## Campaign State\nNapiecie rosnie."
+            return ""
+
+        try:
+            main.gemini_generate = fake_generate
+            main.build_world_model_context = lambda limit=40: "WORLD MODEL"
+            main.build_recent_sessions_context = lambda limit=6: "RECENT SESSIONS"
+            main.vector_search = lambda message, top_k: []
+            main.build_context_for_planner = lambda drive_store: "CAMPAIGN CONTEXT"
+            main.render_source_labels = lambda hits: []
+
+            artifact_text, references = main.generate_pre_session_brief(
+                "Przygotuj briefing przed sesja o Red Blade."
+            )
+        finally:
+            main.gemini_generate = original_generate
+            main.build_world_model_context = original_build_world_model_context
+            main.build_recent_sessions_context = original_build_recent_sessions_context
+            main.vector_search = original_vector_search
+            main.build_context_for_planner = original_build_context_for_planner
+            main.render_source_labels = original_render_source_labels
+
+        self.assertEqual(references, [])
+        self.assertIn("# Pre-Session Brief", artifact_text)
+        self.assertIn("## Active Threads", artifact_text)
+        self.assertIn("## Key NPCs and Factions", artifact_text)
+        self.assertIn("## Risks and Pressure Points", artifact_text)
+        self.assertIn("## Scene Opportunities", artifact_text)
+        self.assertIn("## Prep Checklist", artifact_text)
 
     def test_chat_proposal_returns_human_summary(self):
         original_drive_store = main.drive_store_v2

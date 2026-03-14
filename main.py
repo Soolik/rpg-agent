@@ -88,6 +88,7 @@ ArtifactType = Literal[
     "gm_brief",
     "session_report",
     "player_summary",
+    "pre_session_brief",
     "session_hooks",
     "scene_seed",
     "npc_brief",
@@ -745,6 +746,33 @@ def resolved_creative_artifact_type(artifact_type: Optional[ArtifactType]) -> Ar
     return "session_hooks"
 
 
+def infer_artifact_type(message: str, requested: Optional[ArtifactType]) -> Optional[ArtifactType]:
+    if requested:
+        return requested
+
+    lowered = (message or "").strip().lower()
+    if not lowered:
+        return None
+
+    if ("briefing" in lowered or "brief" in lowered) and "sesj" in lowered:
+        return "pre_session_brief"
+    if "raport sesji" in lowered or "raport z sesji" in lowered or "session report" in lowered:
+        return "session_report"
+    if "player summary" in lowered or "podsumowanie dla graczy" in lowered:
+        return "player_summary"
+    if "gm brief" in lowered or "briefing mg" in lowered:
+        return "gm_brief"
+    if "hook" in lowered:
+        return "session_hooks"
+    if "scene seed" in lowered or ("scene" in lowered and "seed" in lowered):
+        return "scene_seed"
+    if "npc brief" in lowered or "nowego npc" in lowered or "nowy npc" in lowered:
+        return "npc_brief"
+    if "twist" in lowered:
+        return "twist_pack"
+    return None
+
+
 def render_session_sync_reply(
     patch: SessionPatch,
     sync: SyncSessionPatchResponse,
@@ -792,6 +820,8 @@ def default_output_title(
         return f"Session Report - {stamp}"
     if artifact_type == "player_summary":
         return f"Player Summary - {stamp}"
+    if artifact_type == "pre_session_brief":
+        return f"Pre-Session Brief - {stamp}"
     if artifact_type == "session_hooks":
         return f"Session Hooks - {stamp}"
     if artifact_type == "scene_seed":
@@ -1072,6 +1102,49 @@ def render_player_summary(
     return "\n".join(lines).strip()
 
 
+def build_recent_sessions_context(limit: int = 5) -> str:
+    if not world_model_store_v2:
+        return "No recent sessions available."
+    try:
+        sessions = world_model_store_v2.list_sessions(limit=limit)
+    except Exception:
+        return "Recent sessions unavailable."
+
+    if not sessions:
+        return "No recent sessions available."
+
+    lines = ["RECENT SESSIONS:"]
+    for session in sessions:
+        lines.append(
+            f"- session_id={session.id} | source={session.source_title or 'n/a'} | summary={session.session_summary}"
+        )
+    return "\n".join(lines)
+
+
+def render_pre_session_brief_placeholder() -> str:
+    return """
+# Pre-Session Brief
+
+## Campaign State
+Do doprecyzowania.
+
+## Active Threads
+- Do doprecyzowania.
+
+## Key NPCs and Factions
+- Do doprecyzowania.
+
+## Risks and Pressure Points
+- Do doprecyzowania.
+
+## Scene Opportunities
+- Do doprecyzowania.
+
+## Prep Checklist
+- Do doprecyzowania.
+""".strip()
+
+
 def build_chat_artifact(
     *,
     artifact_type: ArtifactType,
@@ -1105,6 +1178,8 @@ def build_chat_artifact(
             source_title=source_title,
             session_id=session_id,
         )
+    if artifact_type == "pre_session_brief":
+        return render_pre_session_brief_placeholder()
     return render_player_summary(
         message=message,
         reply=reply,
@@ -1113,6 +1188,22 @@ def build_chat_artifact(
 
 
 def build_creative_artifact_sections(artifact_type: ArtifactType) -> str:
+    if artifact_type == "pre_session_brief":
+        return """
+# Pre-Session Brief
+
+## Campaign State
+
+## Active Threads
+
+## Key NPCs and Factions
+
+## Risks and Pressure Points
+
+## Scene Opportunities
+
+## Prep Checklist
+""".strip()
     if artifact_type == "session_hooks":
         return """
 Tytul:
@@ -1172,6 +1263,107 @@ Ryzyko dla kampanii:
 """.strip()
 
 
+def artifact_required_markers(artifact_type: ArtifactType) -> List[str]:
+    if artifact_type == "pre_session_brief":
+        return [
+            "# Pre-Session Brief",
+            "## Campaign State",
+            "## Active Threads",
+            "## Key NPCs and Factions",
+            "## Risks and Pressure Points",
+            "## Scene Opportunities",
+            "## Prep Checklist",
+        ]
+    if artifact_type == "session_hooks":
+        return ["Tytul:", "Hook 1:", "Hook 2:", "Hook 3:", "Stawki:", "Co przygotowac:"]
+    if artifact_type == "scene_seed":
+        return [
+            "Tytul sceny:",
+            "Cel sceny:",
+            "Miejsce:",
+            "Zaangazowane postacie:",
+            "Przebieg:",
+            "Komplikacja:",
+            "Mozliwe skutki:",
+        ]
+    if artifact_type == "npc_brief":
+        return [
+            "Imie:",
+            "Rola w kampanii:",
+            "Pierwsze wrazenie:",
+            "Motywacja:",
+            "Sekret:",
+            "Relacje:",
+            "Jak uzyc tej postaci na sesji:",
+        ]
+    if artifact_type == "twist_pack":
+        return ["Twist 1:", "Twist 2:", "Twist 3:", "Foreshadowing:", "Ryzyko dla kampanii:"]
+    return []
+
+
+def missing_artifact_markers(text: str, artifact_type: ArtifactType) -> List[str]:
+    lowered = (text or "").lower()
+    return [marker for marker in artifact_required_markers(artifact_type) if marker.lower() not in lowered]
+
+
+def append_missing_artifact_sections(text: str, artifact_type: ArtifactType) -> str:
+    missing = missing_artifact_markers(text, artifact_type)
+    if not missing:
+        return text.strip()
+
+    lines = [text.rstrip()]
+    for marker in missing:
+        lines.extend(["", marker])
+        if marker.startswith("## "):
+            lines.append("- Do doprecyzowania.")
+        else:
+            lines.append("Do doprecyzowania.")
+    return "\n".join(lines).strip()
+
+
+def ensure_artifact_shape(
+    *,
+    artifact_type: ArtifactType,
+    text: str,
+    repair_context: str,
+) -> str:
+    cleaned = (text or "").strip()
+    if cleaned and not missing_artifact_markers(cleaned, artifact_type):
+        return cleaned
+
+    repair_prompt = f"""
+Napraw artefakt tekstowy. Zwracaj tylko finalny artefakt tekstowy.
+Nie zwracaj JSON. Nie zwracaj code fence.
+Wszystkie tresci maja byc po polsku.
+Artefakt musi zawierac wszystkie wymagane znaczniki:
+{chr(10).join(f"- {marker}" for marker in artifact_required_markers(artifact_type))}
+
+DOCZELOWY FORMAT:
+{build_creative_artifact_sections(artifact_type)}
+
+KONTEKST:
+{repair_context}
+
+ZLY ARTEFAKT:
+{cleaned or '[empty]'}
+
+POPRAWIONY ARTEFAKT:
+""".strip()
+
+    try:
+        repaired = gemini_generate(
+            repair_prompt,
+            response_mime_type="text/plain",
+            temperature=0.2,
+            max_output_tokens=2500,
+        ).strip()
+    except Exception:
+        repaired = ""
+
+    candidate = repaired or cleaned
+    return append_missing_artifact_sections(candidate, artifact_type)
+
+
 def build_creative_prompt(
     *,
     message: str,
@@ -1195,9 +1387,52 @@ ZASADY:
 3) Zwracaj tylko finalny artefakt tekstowy.
 4) Korzystaj z dokladnych nazw encji, watkow i miejsc, jesli sa znane.
 5) Zachowaj ton kampanii: smutne heroic fantasy, polityka, emocje, trudne wybory.
+6) Uzyj wszystkich wymaganych sekcji z formatu i nie pomijaj zadnej.
+7) Jesli format zawiera Hook 1/2/3 albo Twist 1/2/3, wypelnij wszystkie te sekcje.
 
 AKTUALNY MODEL SWIATA:
 {structured_context}
+
+RELEWANTNY KONTEKST KAMPANII:
+{world_context}
+
+PROSBA UZYTKOWNIKA:
+{message}
+
+ZWROC DOKLADNIE TEN FORMAT:
+{format_instructions}
+""".strip()
+
+
+def build_pre_session_brief_prompt(
+    *,
+    message: str,
+    world_context: str,
+    structured_context: str,
+    recent_sessions_context: str,
+) -> str:
+    format_instructions = build_creative_artifact_sections("pre_session_brief")
+    return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Pisz po polsku.
+
+CEL:
+- Przygotuj praktyczny briefing przed kolejna sesja.
+- Nie wymyslaj twardych faktow sprzecznych z kontekstem.
+- Mozesz proponowac sceny, ryzyka i checklisty MG, jesli wynikaja logicznie z kontekstu.
+
+ZASADY:
+1) Zwracaj tylko finalny artefakt tekstowy.
+2) Nie zwracaj JSON.
+3) Nie zwracaj code fence.
+4) Uzywaj dokladnych nazw encji, watkow i dokumentow, jesli sa znane.
+5) W sekcjach "Scene Opportunities" i "Prep Checklist" dawaj konkretne, praktyczne propozycje MG.
+6) Wypelnij wszystkie sekcje z wymaganego formatu.
+
+AKTUALNY MODEL SWIATA:
+{structured_context}
+
+OSTATNIE SESJE:
+{recent_sessions_context}
 
 RELEWANTNY KONTEKST KAMPANII:
 {world_context}
@@ -1239,6 +1474,73 @@ def generate_creative_artifact(
         temperature=0.8,
         max_output_tokens=2500,
     ).strip()
+    repair_context = "\n\n".join(
+        [
+            "AKTUALNY MODEL SWIATA:",
+            structured_context,
+            "",
+            "RELEWANTNY KONTEKST KAMPANII:",
+            world_context,
+            "",
+            "PROSBA UZYTKOWNIKA:",
+            message,
+        ]
+    ).strip()
+    artifact_text = ensure_artifact_shape(
+        artifact_type=artifact_type,
+        text=artifact_text,
+        repair_context=repair_context,
+    )
+    return artifact_text, render_source_labels(hits)
+
+
+def generate_pre_session_brief(message: str) -> tuple[str, List[str]]:
+    structured_context = build_world_model_context(limit=40)
+    recent_sessions_context = build_recent_sessions_context(limit=6)
+    try:
+        hits = vector_search(message, 8)
+    except Exception:
+        hits = []
+    if hits:
+        world_context = build_campaign_context(hits)
+    else:
+        try:
+            world_context = build_context_for_planner(drive_store_v2)
+        except Exception:
+            world_context = "Brak dodatkowego kontekstu kampanii."
+
+    prompt = build_pre_session_brief_prompt(
+        message=message,
+        world_context=world_context,
+        structured_context=structured_context,
+        recent_sessions_context=recent_sessions_context,
+    )
+    artifact_text = gemini_generate(
+        prompt,
+        response_mime_type="text/plain",
+        temperature=0.5,
+        max_output_tokens=2500,
+    ).strip()
+    repair_context = "\n\n".join(
+        [
+            "AKTUALNY MODEL SWIATA:",
+            structured_context,
+            "",
+            "OSTATNIE SESJE:",
+            recent_sessions_context,
+            "",
+            "RELEWANTNY KONTEKST KAMPANII:",
+            world_context,
+            "",
+            "PROSBA UZYTKOWNIKA:",
+            message,
+        ]
+    ).strip()
+    artifact_text = ensure_artifact_shape(
+        artifact_type="pre_session_brief",
+        text=artifact_text,
+        repair_context=repair_context,
+    )
     return artifact_text, render_source_labels(hits)
 
 
@@ -1703,13 +2005,38 @@ def ask_text(req: AskRequest):
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     try:
+        resolved_artifact_type = infer_artifact_type(req.message, req.artifact_type)
         resolved_intent = req.intent if req.intent != "auto" else detect_chat_intent(req.message)
-        if is_creative_artifact_type(req.artifact_type):
+        if is_creative_artifact_type(resolved_artifact_type):
             resolved_intent = "creative"
         warnings: List[str] = []
 
+        if resolved_artifact_type == "pre_session_brief":
+            artifact_text, references = generate_pre_session_brief(req.message)
+            output_doc = None
+            if req.save_output:
+                output_doc, warning = try_save_chat_output(
+                    kind="answer",
+                    content=artifact_text,
+                    requested_title=req.output_title,
+                    artifact_type=resolved_artifact_type,
+                )
+                if warning:
+                    warnings.append(warning)
+            return ChatResponse(
+                kind="answer",
+                reply=artifact_text,
+                artifact_type=resolved_artifact_type,
+                artifact_text=artifact_text,
+                references=references,
+                warnings=warnings,
+                output_doc_id=output_doc.doc_id if output_doc else None,
+                output_title=output_doc.title if output_doc else None,
+                output_path=output_doc.path_hint if output_doc else None,
+            )
+
         if resolved_intent == "creative":
-            creative_artifact_type = resolved_creative_artifact_type(req.artifact_type)
+            creative_artifact_type = resolved_creative_artifact_type(resolved_artifact_type)
             artifact_text, references = generate_creative_artifact(
                 message=req.message,
                 artifact_type=creative_artifact_type,
@@ -1750,13 +2077,13 @@ def chat(req: ChatRequest):
                 reply = reply + "\n\nZrodla:\n" + "\n".join(f"- {label}" for label in references)
             artifact_text = (
                 build_chat_artifact(
-                    artifact_type=req.artifact_type,
+                    artifact_type=resolved_artifact_type,
                     kind="answer",
                     message=req.message,
                     reply=reply,
                     references=references,
                 )
-                if req.artifact_type
+                if resolved_artifact_type
                 else None
             )
             output_doc = None
@@ -1765,14 +2092,14 @@ def chat(req: ChatRequest):
                     kind="answer",
                     content=artifact_text or reply,
                     requested_title=req.output_title,
-                    artifact_type=req.artifact_type,
+                    artifact_type=resolved_artifact_type,
                 )
                 if warning:
                     warnings.append(warning)
             return ChatResponse(
                 kind="answer",
                 reply=reply,
-                artifact_type=req.artifact_type,
+                artifact_type=resolved_artifact_type,
                 artifact_text=artifact_text,
                 references=references,
                 warnings=warnings,
@@ -1795,7 +2122,7 @@ def chat(req: ChatRequest):
             )
             artifact_text = (
                 build_chat_artifact(
-                    artifact_type=req.artifact_type,
+                    artifact_type=resolved_artifact_type,
                     kind="session_sync",
                     message=req.message,
                     reply=reply,
@@ -1803,7 +2130,7 @@ def chat(req: ChatRequest):
                     source_title=req.source_title,
                     session_id=sync_response.sync.session_id,
                 )
-                if req.artifact_type
+                if resolved_artifact_type
                 else None
             )
             output_doc = None
@@ -1812,14 +2139,14 @@ def chat(req: ChatRequest):
                     kind="session_sync",
                     content=artifact_text or reply,
                     requested_title=req.output_title,
-                    artifact_type=req.artifact_type,
+                    artifact_type=resolved_artifact_type,
                 )
                 if warning:
                     warnings.append(warning)
             return ChatResponse(
                 kind="session_sync",
                 reply=reply,
-                artifact_type=req.artifact_type,
+                artifact_type=resolved_artifact_type,
                 artifact_text=artifact_text,
                 session_id=sync_response.sync.session_id,
                 warnings=warnings,
@@ -1844,14 +2171,14 @@ def chat(req: ChatRequest):
         reply = render_proposal_reply(proposal)
         artifact_text = (
             build_chat_artifact(
-                artifact_type=req.artifact_type,
+                artifact_type=resolved_artifact_type,
                 kind="proposal",
                 message=req.message,
                 reply=reply,
                 proposal=proposal,
                 proposal_id=proposal.proposal_id,
             )
-            if req.artifact_type
+            if resolved_artifact_type
             else None
         )
         output_doc = None
@@ -1860,14 +2187,14 @@ def chat(req: ChatRequest):
                 kind="proposal",
                 content=artifact_text or reply,
                 requested_title=req.output_title,
-                artifact_type=req.artifact_type,
+                artifact_type=resolved_artifact_type,
             )
             if warning:
                 warnings.append(warning)
         return ChatResponse(
             kind="proposal",
             reply=reply,
-            artifact_type=req.artifact_type,
+            artifact_type=resolved_artifact_type,
             artifact_text=artifact_text,
             proposal_id=proposal.proposal_id,
             warnings=warnings,
