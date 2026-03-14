@@ -18,9 +18,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from app.drive_store import DriveStore, decode_google_export_text
-from app.models_v2 import DocumentRef, SessionPatchPayload, SyncSessionPatchRequest, SyncSessionPatchResponse, WorldDocInfo
+from app.models_v2 import (
+    ChangeProposal,
+    DocumentRef,
+    ProposeChangesRequest,
+    SessionPatchPayload,
+    SyncSessionPatchRequest,
+    SyncSessionPatchResponse,
+    WorldDocInfo,
+)
 from app.planner import PlannerService
-from app.routes_v2 import build_v2_router
+from app.routes_v2 import build_context_for_planner, build_v2_router
 from app.world_model_store import WorldModelStore
 from app.workflow_store import WorkflowStore
 from googleapiclient.discovery import build
@@ -71,6 +79,7 @@ CORE_WORLD_DOC_MAP = {
 # -------------------------
 
 AskMode = Literal["auto", "campaign", "general", "scene"]
+ChatIntent = Literal["auto", "answer", "proposal", "session_sync"]
 
 
 class AskRequest(BaseModel):
@@ -83,6 +92,21 @@ class AskRequest(BaseModel):
 class AskResponse(BaseModel):
     answer: str
     sources: List[Dict[str, Any]] = []
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+    intent: ChatIntent = "auto"
+    source_title: Optional[str] = None
+    include_sources: bool = False
+
+
+class ChatResponse(BaseModel):
+    kind: Literal["answer", "proposal", "session_sync"]
+    reply: str
+    proposal_id: Optional[int] = None
+    session_id: Optional[int] = None
+    references: List[str] = []
 
 
 class ReindexRequest(BaseModel):
@@ -618,6 +642,90 @@ ODPOWIEDŹ:
 """.strip()
 
 
+def detect_chat_intent(message: str) -> Literal["answer", "proposal", "session_sync"]:
+    text = (message or "").strip()
+    lowered = text.lower()
+
+    proposal_markers = [
+        "dodaj ",
+        "podmien ",
+        "podmień ",
+        "zamien ",
+        "zamień ",
+        "zmien ",
+        "zmień ",
+        "utworz ",
+        "utwórz ",
+        "stworz ",
+        "stwórz ",
+        "uzupelnij ",
+        "uzupełnij ",
+        "w dokumencie ",
+        "sekcje ",
+        "sekcję ",
+    ]
+    if any(marker in lowered for marker in proposal_markers):
+        return "proposal"
+
+    line_count = len([line for line in text.splitlines() if line.strip()])
+    sentence_count = len(re.findall(r"[.!?]+", text))
+    if "?" in text:
+        return "answer"
+    if line_count >= 3 or sentence_count >= 2 or len(text) >= 180:
+        return "session_sync"
+    return "answer"
+
+
+def render_source_labels(sources: List[Dict[str, Any]]) -> List[str]:
+    labels: List[str] = []
+    seen = set()
+    for source in sources:
+        label = " / ".join(filter(None, [source.get("folder"), source.get("title")])).strip()
+        if not label:
+            label = source.get("doc_id") or "unknown source"
+        if label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    return labels
+
+
+def render_session_sync_reply(
+    patch: SessionPatch,
+    sync: SyncSessionPatchResponse,
+    *,
+    source_title: Optional[str] = None,
+) -> str:
+    lines = ["Zaktualizowalem model swiata z notatek."]
+    if source_title:
+        lines.append(f"Zrodlo: {source_title}.")
+    lines.append(f"Podsumowanie: {patch.session_summary}")
+    if patch.entities_patch:
+        lines.append("Encje:")
+        for entity in patch.entities_patch[:5]:
+            lines.append(f"- {entity.kind}: {entity.name} - {entity.description}")
+    if patch.thread_tracker_patch:
+        lines.append("Watki:")
+        for thread in patch.thread_tracker_patch[:5]:
+            prefix = f"{thread.thread_id} / " if thread.thread_id else ""
+            lines.append(f"- {prefix}{thread.title}: {thread.change}")
+    lines.append(f"Session ID: {sync.session_id}")
+    return "\n".join(lines)
+
+
+def render_proposal_reply(proposal: ChangeProposal) -> str:
+    lines = ["Przygotowalem propozycje zmiany.", f"Podsumowanie: {proposal.summary}"]
+    if proposal.impacted_docs:
+        lines.append("Dokumenty:")
+        for doc in proposal.impacted_docs[:5]:
+            lines.append(f"- {doc.folder} / {doc.title}")
+    if proposal.proposal_id:
+        lines.append(f"Proposal ID: {proposal.proposal_id}")
+    if proposal.needs_confirmation:
+        lines.append("Ta zmiana wymaga akceptacji przed apply.")
+    return "\n".join(lines)
+
+
 def ctx_slice(h: Dict[str, Any]) -> str:
     doc_type = h.get("doc_type", "")
     text = h.get("chunk_text", "") or ""
@@ -1074,6 +1182,73 @@ POPRAWNY OUTPUT (tylko JSON):
 def ask_text(req: AskRequest):
     resp = ask(req)
     return resp.answer + "\n"
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    try:
+        resolved_intent = req.intent if req.intent != "auto" else detect_chat_intent(req.message)
+
+        if resolved_intent == "answer":
+            ask_response = ask(
+                AskRequest(
+                    question=req.message,
+                    include_sources=req.include_sources,
+                    mode="auto",
+                )
+            )
+            references = render_source_labels(ask_response.sources)
+            reply = ask_response.answer.strip()
+            if references:
+                reply = reply + "\n\nZrodla:\n" + "\n".join(f"- {label}" for label in references)
+            return ChatResponse(kind="answer", reply=reply, references=references)
+
+        if resolved_intent == "session_sync":
+            sync_response = ingest_session_and_sync(
+                IngestAndSyncSessionRequest(
+                    raw_notes=req.message,
+                    source_title=req.source_title,
+                )
+            )
+            return ChatResponse(
+                kind="session_sync",
+                reply=render_session_sync_reply(
+                    sync_response.patch,
+                    sync_response.sync,
+                    source_title=req.source_title,
+                ),
+                session_id=sync_response.sync.session_id,
+            )
+
+        docs = drive_store_v2.list_world_docs()
+        context = build_context_for_planner(drive_store_v2)
+        proposal_request = ProposeChangesRequest(instruction=req.message, mode="auto", dry_run=True)
+        proposal = planner_v2.propose(request=proposal_request, world_docs=docs, world_context=context)
+        proposal_id = workflow_store_v2.save_proposal(proposal_request, proposal)
+        if proposal_id is not None:
+            proposal = ChangeProposal.model_validate(
+                {
+                    **proposal.model_dump(mode="json"),
+                    "proposal_id": proposal_id,
+                }
+            )
+
+        return ChatResponse(
+            kind="proposal",
+            reply=render_proposal_reply(proposal),
+            proposal_id=proposal.proposal_id,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chat_text", response_class=PlainTextResponse)
+def chat_text(req: ChatRequest):
+    response = chat(req)
+    return response.reply + "\n"
 
 
 def build_world_model_context(limit: int = 50) -> str:
