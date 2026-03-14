@@ -48,6 +48,9 @@ GLOSSARY_DOC_ID = os.getenv("GLOSSARY_DOC_ID")
 THREADS_DOC_ID = os.getenv("THREADS_DOC_ID")
 DB_URL = os.getenv("DB_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OUTPUT_ROLLUP_DOC_ID = os.getenv("OUTPUT_ROLLUP_DOC_ID")
+OUTPUT_ROLLUP_DOC_TITLE = os.getenv("OUTPUT_ROLLUP_DOC_TITLE")
+OUTPUT_ROLLUP_MODE = os.getenv("OUTPUT_ROLLUP_MODE", "replace").strip().lower()
 
 # Models
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")
@@ -81,6 +84,7 @@ CORE_WORLD_DOC_MAP = {
 
 AskMode = Literal["auto", "campaign", "general", "scene"]
 ChatIntent = Literal["auto", "answer", "proposal", "session_sync"]
+ArtifactType = Literal["gm_brief", "session_report", "player_summary"]
 
 
 class AskRequest(BaseModel):
@@ -98,6 +102,7 @@ class AskResponse(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
     intent: ChatIntent = "auto"
+    artifact_type: Optional[ArtifactType] = None
     source_title: Optional[str] = None
     include_sources: bool = False
     save_output: bool = False
@@ -107,6 +112,8 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     kind: Literal["answer", "proposal", "session_sync"]
     reply: str
+    artifact_type: Optional[ArtifactType] = None
+    artifact_text: Optional[str] = None
     proposal_id: Optional[int] = None
     session_id: Optional[int] = None
     references: List[str] = []
@@ -733,8 +740,17 @@ def render_proposal_reply(proposal: ChangeProposal) -> str:
     return "\n".join(lines)
 
 
-def default_output_title(kind: Literal["answer", "proposal", "session_sync"]) -> str:
+def default_output_title(
+    kind: Literal["answer", "proposal", "session_sync"],
+    artifact_type: Optional[ArtifactType] = None,
+) -> str:
     stamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+    if artifact_type == "gm_brief":
+        return f"GM Brief - {stamp}"
+    if artifact_type == "session_report":
+        return f"Session Report - {stamp}"
+    if artifact_type == "player_summary":
+        return f"Player Summary - {stamp}"
     if kind == "answer":
         return f"Chat Answer - {stamp}"
     if kind == "proposal":
@@ -747,11 +763,12 @@ def save_chat_output(
     kind: Literal["answer", "proposal", "session_sync"],
     content: str,
     requested_title: Optional[str] = None,
+    artifact_type: Optional[ArtifactType] = None,
 ) -> Optional[WorldDocInfo]:
     if not drive_store_v2:
         return None
 
-    title = (requested_title or "").strip() or default_output_title(kind)
+    title = (requested_title or "").strip() or default_output_title(kind, artifact_type)
     existing = drive_store_v2.find_doc(folder="08 Outputs", title=title)
     doc_ref = DocumentRef(folder="08 Outputs", title=title, doc_id=existing.doc_id if existing else None)
 
@@ -774,18 +791,219 @@ def format_exception_message(error: Exception) -> str:
     return f"{type(error).__name__} without detail"
 
 
+def is_storage_quota_error(error: Exception) -> bool:
+    return "storagequotaexceeded" in format_exception_message(error).lower()
+
+
+def resolve_output_rollup_doc() -> Optional[WorldDocInfo]:
+    if not drive_store_v2:
+        return None
+
+    if OUTPUT_ROLLUP_DOC_ID:
+        found = drive_store_v2.find_doc(doc_id=OUTPUT_ROLLUP_DOC_ID)
+        if found:
+            return found
+        title = (OUTPUT_ROLLUP_DOC_TITLE or "Output Rollup").strip() or "Output Rollup"
+        return WorldDocInfo(
+            folder="08 Outputs",
+            title=title,
+            doc_id=OUTPUT_ROLLUP_DOC_ID,
+            path_hint=f"08 Outputs/{title}",
+            entity_type=WorldEntityType.output,
+        )
+
+    if OUTPUT_ROLLUP_DOC_TITLE:
+        found = drive_store_v2.find_doc(folder="08 Outputs", title=OUTPUT_ROLLUP_DOC_TITLE)
+        if found:
+            return found
+
+    return None
+
+
+def save_to_output_rollup(content: str) -> Optional[WorldDocInfo]:
+    fallback_doc = resolve_output_rollup_doc()
+    if not fallback_doc:
+        return None
+
+    doc_ref = DocumentRef(
+        folder=fallback_doc.folder,
+        title=fallback_doc.title,
+        doc_id=fallback_doc.doc_id,
+        path_hint=fallback_doc.path_hint,
+    )
+    if OUTPUT_ROLLUP_MODE == "append":
+        drive_store_v2.append_doc(doc_ref, content)
+    else:
+        drive_store_v2.replace_doc(doc_ref, content)
+    return fallback_doc
+
+
 def try_save_chat_output(
     *,
     kind: Literal["answer", "proposal", "session_sync"],
     content: str,
     requested_title: Optional[str] = None,
+    artifact_type: Optional[ArtifactType] = None,
 ) -> tuple[Optional[WorldDocInfo], Optional[str]]:
     try:
-        return save_chat_output(kind=kind, content=content, requested_title=requested_title), None
+        return (
+            save_chat_output(
+                kind=kind,
+                content=content,
+                requested_title=requested_title,
+                artifact_type=artifact_type,
+            ),
+            None,
+        )
     except Exception as e:
+        if is_storage_quota_error(e):
+            try:
+                fallback_doc = save_to_output_rollup(content)
+            except Exception as fallback_error:
+                detail = format_exception_message(fallback_error)
+                warning = f"Nie udalo sie zapisac outputu do Google Docs: {detail}"
+                return None, warning
+            if fallback_doc:
+                warning = f"Quota zablokowala nowy plik; zapisano do fallback dokumentu {fallback_doc.path_hint}."
+                return fallback_doc, warning
         detail = format_exception_message(e)
         warning = f"Nie udalo sie zapisac outputu do Google Docs: {detail}"
         return None, warning
+
+
+def render_gm_brief(
+    *,
+    message: str,
+    kind: Literal["answer", "proposal", "session_sync"],
+    reply: str,
+    references: Optional[List[str]] = None,
+    proposal: Optional[ChangeProposal] = None,
+    patch: Optional[SessionPatch] = None,
+    source_title: Optional[str] = None,
+    proposal_id: Optional[int] = None,
+    session_id: Optional[int] = None,
+) -> str:
+    lines = ["# GM Brief", ""]
+    lines.extend(["## Input", message.strip(), "", "## Result", reply.strip()])
+
+    if proposal_id:
+        lines.extend(["", "## Proposal", f"Proposal ID: {proposal_id}"])
+    if session_id:
+        lines.extend(["", "## Session Sync", f"Session ID: {session_id}"])
+    if source_title:
+        lines.extend(["", "## Source", source_title])
+    if proposal and proposal.impacted_docs:
+        lines.append("")
+        lines.append("## Impacted Documents")
+        for doc in proposal.impacted_docs[:10]:
+            lines.append(f"- {doc.folder} / {doc.title}")
+    if patch and patch.thread_tracker_patch:
+        lines.append("")
+        lines.append("## Threads")
+        for thread in patch.thread_tracker_patch[:10]:
+            prefix = f"{thread.thread_id} / " if thread.thread_id else ""
+            lines.append(f"- {prefix}{thread.title}: {thread.change}")
+    if patch and patch.entities_patch:
+        lines.append("")
+        lines.append("## Entities")
+        for entity in patch.entities_patch[:10]:
+            lines.append(f"- {entity.kind}: {entity.name} - {entity.description}")
+    if references:
+        lines.append("")
+        lines.append("## Sources")
+        for ref in references[:10]:
+            lines.append(f"- {ref}")
+    return "\n".join(lines).strip()
+
+
+def render_session_report(
+    *,
+    message: str,
+    reply: str,
+    patch: Optional[SessionPatch] = None,
+    source_title: Optional[str] = None,
+    session_id: Optional[int] = None,
+) -> str:
+    lines = ["# Session Report", ""]
+    if source_title:
+        lines.extend(["## Source", source_title, ""])
+    if session_id:
+        lines.extend(["## Session ID", str(session_id), ""])
+
+    if patch:
+        lines.extend(["## Summary", patch.session_summary, ""])
+        if patch.entities_patch:
+            lines.append("## Entities")
+            for entity in patch.entities_patch[:10]:
+                lines.append(f"- {entity.kind}: {entity.name} - {entity.description}")
+            lines.append("")
+        if patch.thread_tracker_patch:
+            lines.append("## Threads")
+            for thread in patch.thread_tracker_patch[:10]:
+                prefix = f"{thread.thread_id} / " if thread.thread_id else ""
+                lines.append(f"- {prefix}{thread.title}: {thread.change}")
+            lines.append("")
+        if patch.rag_additions:
+            lines.append("## Facts For Retrieval")
+            for item in patch.rag_additions[:10]:
+                lines.append(f"- {item}")
+    else:
+        lines.extend(["## Input Notes", message.strip(), "", "## Result", reply.strip()])
+
+    return "\n".join(lines).strip()
+
+
+def render_player_summary(
+    *,
+    message: str,
+    reply: str,
+    source_title: Optional[str] = None,
+) -> str:
+    lines = ["# Player Summary", "", "## Summary", reply.strip()]
+    if source_title:
+        lines.extend(["", "## Source", source_title])
+    lines.extend(["", "## Note", "Wymaga przegladu MG przed udostepnieniem graczom."])
+    return "\n".join(lines).strip()
+
+
+def build_chat_artifact(
+    *,
+    artifact_type: ArtifactType,
+    kind: Literal["answer", "proposal", "session_sync"],
+    message: str,
+    reply: str,
+    references: Optional[List[str]] = None,
+    proposal: Optional[ChangeProposal] = None,
+    patch: Optional[SessionPatch] = None,
+    source_title: Optional[str] = None,
+    proposal_id: Optional[int] = None,
+    session_id: Optional[int] = None,
+) -> str:
+    if artifact_type == "gm_brief":
+        return render_gm_brief(
+            message=message,
+            kind=kind,
+            reply=reply,
+            references=references,
+            proposal=proposal,
+            patch=patch,
+            source_title=source_title,
+            proposal_id=proposal_id,
+            session_id=session_id,
+        )
+    if artifact_type == "session_report":
+        return render_session_report(
+            message=message,
+            reply=reply,
+            patch=patch,
+            source_title=source_title,
+            session_id=session_id,
+        )
+    return render_player_summary(
+        message=message,
+        reply=reply,
+        source_title=source_title,
+    )
 
 
 def ctx_slice(h: Dict[str, Any]) -> str:
@@ -1264,18 +1482,32 @@ def chat(req: ChatRequest):
             reply = ask_response.answer.strip()
             if references:
                 reply = reply + "\n\nZrodla:\n" + "\n".join(f"- {label}" for label in references)
+            artifact_text = (
+                build_chat_artifact(
+                    artifact_type=req.artifact_type,
+                    kind="answer",
+                    message=req.message,
+                    reply=reply,
+                    references=references,
+                )
+                if req.artifact_type
+                else None
+            )
             output_doc = None
             if req.save_output:
                 output_doc, warning = try_save_chat_output(
                     kind="answer",
-                    content=reply,
+                    content=artifact_text or reply,
                     requested_title=req.output_title,
+                    artifact_type=req.artifact_type,
                 )
                 if warning:
                     warnings.append(warning)
             return ChatResponse(
                 kind="answer",
                 reply=reply,
+                artifact_type=req.artifact_type,
+                artifact_text=artifact_text,
                 references=references,
                 warnings=warnings,
                 output_doc_id=output_doc.doc_id if output_doc else None,
@@ -1295,18 +1527,34 @@ def chat(req: ChatRequest):
                 sync_response.sync,
                 source_title=req.source_title,
             )
+            artifact_text = (
+                build_chat_artifact(
+                    artifact_type=req.artifact_type,
+                    kind="session_sync",
+                    message=req.message,
+                    reply=reply,
+                    patch=sync_response.patch,
+                    source_title=req.source_title,
+                    session_id=sync_response.sync.session_id,
+                )
+                if req.artifact_type
+                else None
+            )
             output_doc = None
             if req.save_output:
                 output_doc, warning = try_save_chat_output(
                     kind="session_sync",
-                    content=reply,
+                    content=artifact_text or reply,
                     requested_title=req.output_title,
+                    artifact_type=req.artifact_type,
                 )
                 if warning:
                     warnings.append(warning)
             return ChatResponse(
                 kind="session_sync",
                 reply=reply,
+                artifact_type=req.artifact_type,
+                artifact_text=artifact_text,
                 session_id=sync_response.sync.session_id,
                 warnings=warnings,
                 output_doc_id=output_doc.doc_id if output_doc else None,
@@ -1328,18 +1576,33 @@ def chat(req: ChatRequest):
             )
 
         reply = render_proposal_reply(proposal)
+        artifact_text = (
+            build_chat_artifact(
+                artifact_type=req.artifact_type,
+                kind="proposal",
+                message=req.message,
+                reply=reply,
+                proposal=proposal,
+                proposal_id=proposal.proposal_id,
+            )
+            if req.artifact_type
+            else None
+        )
         output_doc = None
         if req.save_output:
             output_doc, warning = try_save_chat_output(
                 kind="proposal",
-                content=reply,
+                content=artifact_text or reply,
                 requested_title=req.output_title,
+                artifact_type=req.artifact_type,
             )
             if warning:
                 warnings.append(warning)
         return ChatResponse(
             kind="proposal",
             reply=reply,
+            artifact_type=req.artifact_type,
+            artifact_text=artifact_text,
             proposal_id=proposal.proposal_id,
             warnings=warnings,
             output_doc_id=output_doc.doc_id if output_doc else None,
@@ -1356,7 +1619,9 @@ def chat(req: ChatRequest):
 @app.post("/chat_text", response_class=PlainTextResponse)
 def chat_text(req: ChatRequest):
     response = chat(req)
-    text = response.reply
+    text = response.artifact_text or response.reply
+    if response.output_path:
+        text = text + "\n\nZapisano do:\n- " + response.output_path
     if response.warnings:
         text = text + "\n\nUwagi:\n" + "\n".join(f"- {warning}" for warning in response.warnings)
     return text + "\n"
