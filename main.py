@@ -447,14 +447,9 @@ def gemini_generate_stream(
                 line = raw_line.strip()
                 if not line:
                     if json_buffer:
-                        try:
-                            chunk = _parse_gemini_stream_event(json_buffer, seen_text)
-                        except json.JSONDecodeError:
-                            continue
-                        if chunk:
-                            seen_text += chunk
+                        chunks, json_buffer, seen_text = _consume_gemini_stream_buffer(json_buffer, seen_text)
+                        for chunk in chunks:
                             yield chunk
-                        json_buffer = ""
                     continue
                 if line.startswith("data:"):
                     data_line = line[5:].strip()
@@ -464,8 +459,8 @@ def gemini_generate_stream(
                         json_buffer += data_line
 
             if json_buffer:
-                chunk = _parse_gemini_stream_event(json_buffer, seen_text)
-                if chunk:
+                chunks, json_buffer, seen_text = _consume_gemini_stream_buffer(json_buffer, seen_text)
+                for chunk in chunks:
                     yield chunk
         finally:
             response.close()
@@ -473,10 +468,26 @@ def gemini_generate_stream(
     return iter_chunks()
 
 
-def _parse_gemini_stream_event(payload_text: str, seen_text: str) -> str:
-    if not payload_text:
-        return ""
-    payload = json.loads(payload_text)
+def _consume_gemini_stream_buffer(payload_text: str, seen_text: str) -> tuple[List[str], str, str]:
+    decoder = json.JSONDecoder()
+    remaining = payload_text.lstrip()
+    chunks: List[str] = []
+
+    while remaining:
+        try:
+            payload, index = decoder.raw_decode(remaining)
+        except json.JSONDecodeError:
+            break
+        chunk = _parse_gemini_stream_payload(payload, seen_text)
+        if chunk:
+            seen_text += chunk
+            chunks.append(chunk)
+        remaining = remaining[index:].lstrip()
+
+    return chunks, remaining, seen_text
+
+
+def _parse_gemini_stream_payload(payload: dict, seen_text: str) -> str:
     candidate = ((payload.get("candidates") or [{}])[0]) if isinstance(payload, dict) else {}
     parts = ((candidate.get("content") or {}).get("parts") or []) if isinstance(candidate, dict) else []
     texts: List[str] = []
