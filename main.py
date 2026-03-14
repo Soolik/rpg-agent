@@ -1139,13 +1139,26 @@ def reconcile_session_patch_with_world_model(patch: SessionPatch) -> SessionPatc
                 if known.thread_id and normalize_world_model_key(known.thread_id) == normalized_thread_id:
                     return known
 
+        haystack = normalize_world_model_key(" ".join(filter(None, [thread.title, thread.change, thread.status or ""])))
+        ranked_matches = []
+
+        if not thread.thread_id:
+            for known in known_threads:
+                if known.thread_id:
+                    candidates = [
+                        normalize_world_model_key(known.title),
+                        normalize_world_model_key(known.thread_key),
+                        normalize_world_model_key(known.thread_id),
+                    ]
+                    matched_lengths = [len(candidate) for candidate in candidates if candidate and candidate in haystack]
+                    if matched_lengths:
+                        ranked_matches.append((1000 + max(matched_lengths), known))
+
         normalized_title = normalize_world_model_key(thread.title)
         for known in known_threads:
             if normalize_world_model_key(known.title) == normalized_title:
-                return known
+                ranked_matches.append((800 if known.thread_id else 500, known))
 
-        haystack = normalize_world_model_key(" ".join(filter(None, [thread.title, thread.change, thread.status or ""])))
-        ranked_matches = []
         for known in known_threads:
             candidates = [
                 normalize_world_model_key(known.title),
@@ -1181,9 +1194,25 @@ def reconcile_session_patch_with_world_model(patch: SessionPatch) -> SessionPatc
         seen_thread_keys.add(dedupe_key)
         reconciled_threads.append(resolved)
 
+    final_threads: List[ThreadPatch] = []
+    for thread in reconciled_threads:
+        if thread.thread_id:
+            final_threads.append(thread)
+            continue
+
+        haystack = normalize_world_model_key(" ".join(filter(None, [thread.title, thread.change, thread.status or ""])))
+        overlaps_keyed_thread = any(
+            existing.thread_id
+            and normalize_world_model_key(existing.title) in haystack
+            for existing in final_threads
+        )
+        if overlaps_keyed_thread:
+            continue
+        final_threads.append(thread)
+
     return SessionPatch(
         session_summary=patch.session_summary,
-        thread_tracker_patch=reconciled_threads,
+        thread_tracker_patch=final_threads,
         entities_patch=reconciled_entities,
         rag_additions=patch.rag_additions,
     )

@@ -148,6 +148,17 @@ class SessionSyncFlowTest(unittest.TestCase):
             def list_threads(self, limit=50, status=None):
                 return [
                     WorldThreadRecord(
+                        id=2,
+                        campaign_id="kng",
+                        thread_key="mira's allegiances",
+                        thread_id=None,
+                        title="Mira's Allegiances",
+                        status="Updated",
+                        last_change="Old duplicate change",
+                        last_session_id=None,
+                        updated_at="2026-03-14T00:00:00+00:00",
+                    ),
+                    WorldThreadRecord(
                         id=1,
                         campaign_id="kng",
                         thread_key="T01",
@@ -178,6 +189,7 @@ class SessionSyncFlowTest(unittest.TestCase):
             main.gemini_generate = original_generate
             main.world_model_store_v2 = original_store
 
+        self.assertEqual(len(patch.thread_tracker_patch), 1)
         self.assertEqual(patch.thread_tracker_patch[0].thread_id, "T01")
         self.assertEqual(patch.thread_tracker_patch[0].title, "Red Blade")
 
