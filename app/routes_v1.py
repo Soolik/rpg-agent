@@ -1,26 +1,23 @@
 from __future__ import annotations
 
-import json
 import uuid
 from typing import Callable, Optional, Type
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
 
 from .api_models import (
+    AssistantActionRequest,
+    AssistantActionResponse,
+    AssistantActionType,
     AssistantMode,
-    ChatArtifact,
-    ContinuityReport,
     ConversationCreateRequest,
     ConversationListResponse,
     ConversationMessageCreateRequest,
     ConversationMessageListResponse,
     ConversationResponse,
-    NextAction,
     ProposalStatus,
     ProposalType,
     RequestTrace,
-    SavedOutputRef,
     V1ArtifactGenerateRequest,
     V1ChatRequest,
     V1ChatResponse,
@@ -39,18 +36,14 @@ from .api_models import (
     WorldModelThreadListResponse,
 )
 from .applier import ProposalApplier
-from .canon_guard import build_continuity_report, normalize_key
+from .chat_service import ChatService
+from .canon_guard import normalize_key
 from .chat_models import ChatRequest, ChatResponse
-from .conversation_store import ConversationMessageRecord, ConversationRecord, ConversationStore, NullConversationStore
+from .conversation_store import ConversationStore, NullConversationStore
 from .models_v2 import ApplyChangesRequest, ChangeProposal, ProposeChangesRequest
 from .routes_v2 import build_context_for_planner
 from .world_model_store import NullWorldModelStore, WorldModelStore
 from .workflow_store import NullWorkflowStore, WorkflowStore
-
-
-MAX_HISTORY_MESSAGES = 8
-MAX_HISTORY_CHARS = 4000
-STREAM_CHUNK_CHARS = 500
 
 
 def _new_trace() -> RequestTrace:
@@ -68,80 +61,6 @@ def _api_error(status_code: int, *, request_trace: RequestTrace, code: str, mess
             "trace_id": request_trace.trace_id,
         },
     )
-
-
-def _saved_output_from_chat(response: ChatResponse) -> Optional[SavedOutputRef]:
-    if not (response.output_doc_id and response.output_title and response.output_path):
-        return None
-    return SavedOutputRef(
-        doc_id=response.output_doc_id,
-        title=response.output_title,
-        path=response.output_path,
-    )
-
-
-def _artifact_from_chat(response: ChatResponse) -> Optional[ChatArtifact]:
-    if not (response.artifact_type and response.artifact_text):
-        return None
-    return ChatArtifact(
-        artifact_type=response.artifact_type,
-        text=response.artifact_text,
-        format="markdown",
-    )
-
-
-def _continuity_for_response(
-    *,
-    message: str,
-    response: ChatResponse,
-    world_model_store: WorldModelStore | NullWorldModelStore,
-) -> Optional[ContinuityReport]:
-    text = response.artifact_text or response.reply
-    if not text:
-        return None
-    entities = world_model_store.list_entities(limit=200)
-    threads = world_model_store.list_threads(limit=200)
-    allow_new_names = response.artifact_type == "npc_brief"
-    return build_continuity_report(
-        message=message,
-        generated_text=text,
-        known_entity_names=[entity.name for entity in entities],
-        known_thread_names=[thread.title for thread in threads],
-        extra_allowed_names=response.references,
-        allow_proposed_new_names=allow_new_names,
-    )
-
-
-def _first_nonempty_line(text: str) -> str:
-    for line in text.splitlines():
-        candidate = line.strip()
-        if candidate:
-            return candidate
-    return ""
-
-
-def _compact_title(value: str, *, fallback: str) -> str:
-    text = " ".join((value or "").strip().split())
-    if not text:
-        return fallback
-    text = text.lstrip("#*- ").strip()
-    if ":" in text and len(text.split(":", 1)[0]) <= 24:
-        text = text.split(":", 1)[1].strip() or text
-    return text[:96].rstrip(" .:-") or fallback
-
-
-def _derive_conversation_title(message: str, explicit_title: Optional[str]) -> str:
-    if explicit_title and explicit_title.strip():
-        return explicit_title.strip()[:96]
-    return _compact_title(_first_nonempty_line(message), fallback="Nowa rozmowa")
-
-
-def _derive_response_title(response: ChatResponse) -> str:
-    if response.artifact_text:
-        return _compact_title(_first_nonempty_line(response.artifact_text), fallback="Odpowiedz")
-    if response.artifact_type:
-        return response.artifact_type.replace("_", " ").title()
-    return _compact_title(_first_nonempty_line(response.reply), fallback="Odpowiedz")
 
 
 def _proposal_view_from_detail(detail) -> WorldModelChangeView:
@@ -169,258 +88,6 @@ def _proposal_view_from_detail(detail) -> WorldModelChangeView:
         reviewed_by=payload.get("reviewed_by"),
         request=detail.request,
         raw_proposal=payload,
-    )
-
-
-def _next_actions_for_response(
-    *,
-    response: ChatResponse,
-    continuity: Optional[ContinuityReport],
-    conversation_id: Optional[str],
-) -> list[NextAction]:
-    actions: list[NextAction] = [
-        NextAction(
-            type="continue_conversation",
-            label="Kontynuuj rozmowe",
-            payload={"conversation_id": conversation_id} if conversation_id else {},
-        )
-    ]
-
-    if response.kind == "proposal" and response.proposal_id is not None:
-        actions.append(
-            NextAction(
-                type="accept_world_change",
-                label="Zaakceptuj zmiane",
-                payload={"proposal_id": response.proposal_id},
-            )
-        )
-        actions.append(
-            NextAction(
-                type="reject_world_change",
-                label="Odrzuc zmiane",
-                payload={"proposal_id": response.proposal_id},
-            )
-        )
-
-    if response.artifact_type:
-        actions.append(
-            NextAction(
-                type="revise",
-                label="Przerob odpowiedz",
-                payload={"artifact_type": response.artifact_type},
-            )
-        )
-
-    if continuity and not continuity.ok:
-        actions.append(
-            NextAction(
-                type="review_continuity",
-                label="Sprawdz ciaglosc",
-                payload={"issue_count": len(continuity.issues)},
-            )
-        )
-
-    if response.output_doc_id and response.output_path:
-        actions.append(
-            NextAction(
-                type="open_output_doc",
-                label="Otworz zapisany output",
-                payload={"doc_id": response.output_doc_id, "path": response.output_path},
-            )
-        )
-
-    deduped: list[NextAction] = []
-    seen: set[tuple[str, str]] = set()
-    for action in actions:
-        key = (action.type, json.dumps(action.payload, ensure_ascii=False, sort_keys=True))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(action)
-    return deduped
-
-
-def _chat_response_v1(
-    *,
-    trace: RequestTrace,
-    message: str,
-    response: ChatResponse,
-    world_model_store: WorldModelStore | NullWorldModelStore,
-    mode: AssistantMode = AssistantMode.create,
-    conversation_id: Optional[str] = None,
-    conversation_title: Optional[str] = None,
-) -> V1ChatResponse:
-    continuity = _continuity_for_response(
-        message=message,
-        response=response,
-        world_model_store=world_model_store,
-    )
-    reply_markdown = response.artifact_text or response.reply
-    return V1ChatResponse(
-        request_id=trace.request_id,
-        trace_id=trace.trace_id,
-        kind=response.kind,
-        mode=mode,
-        reply=response.reply,
-        reply_markdown=reply_markdown,
-        title=_derive_response_title(response),
-        conversation_id=conversation_id,
-        conversation_title=conversation_title,
-        artifact_type=response.artifact_type,
-        artifact_text=response.artifact_text,
-        artifact=_artifact_from_chat(response),
-        proposal_id=response.proposal_id,
-        session_id=response.session_id,
-        citations=response.references,
-        warnings=response.warnings,
-        next_actions=_next_actions_for_response(
-            response=response,
-            continuity=continuity,
-            conversation_id=conversation_id,
-        ),
-        output=_saved_output_from_chat(response),
-        telemetry=response.telemetry,
-        continuity=continuity,
-    )
-
-
-def _guard_context_instruction(message: str, candidate_text: str) -> str:
-    return (
-        f"{message.strip()}\n\n"
-        "KANDYDAT DO WALIDACJI:\n"
-        f"{candidate_text.strip()}"
-    ).strip()
-
-
-def _render_guard_reply(
-    *,
-    candidate_text: str,
-    continuity: ContinuityReport,
-    planner_notes: Optional[str],
-) -> str:
-    lines = ["# Guard Report", ""]
-
-    if continuity.ok:
-        lines.extend(
-            [
-                "## Werdykt",
-                "",
-                "- Nie wykryto oczywistych konfliktow z kanonem ani nowych nazw wlasnych wymagajacych decyzji.",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "## Werdykt",
-                "",
-                f"- Wykryto {len(continuity.issues)} sygnalow do sprawdzenia.",
-            ]
-        )
-        for issue in continuity.issues[:8]:
-            lines.append(f"- [{issue.severity}] {issue.message}")
-
-    if continuity.source_backed_names:
-        lines.extend(
-            [
-                "",
-                "## Nazwy Potwierdzone",
-                "",
-            ]
-        )
-        lines.extend(f"- {name}" for name in continuity.source_backed_names[:10])
-
-    if continuity.proposed_new_names:
-        lines.extend(
-            [
-                "",
-                "## Nowe Nazwy",
-                "",
-            ]
-        )
-        lines.extend(f"- {name}" for name in continuity.proposed_new_names[:10])
-
-    if continuity.possible_conflicts:
-        lines.extend(
-            [
-                "",
-                "## Mozliwe Konflikty",
-                "",
-            ]
-        )
-        lines.extend(f"- {item}" for item in continuity.possible_conflicts[:10])
-
-    if planner_notes:
-        lines.extend(
-            [
-                "",
-                "## Notatki Guard",
-                "",
-                planner_notes.strip(),
-            ]
-        )
-
-    lines.extend(
-        [
-            "",
-            "## Sprawdzany Tekst",
-            "",
-            candidate_text.strip(),
-        ]
-    )
-    return "\n".join(lines).strip()
-
-
-def _build_guard_response(
-    *,
-    trace: RequestTrace,
-    message: str,
-    candidate_text: str,
-    world_model_store: WorldModelStore | NullWorldModelStore,
-    planner_notes: Optional[str],
-    conversation_id: Optional[str] = None,
-    conversation_title: Optional[str] = None,
-) -> V1ChatResponse:
-    entities = world_model_store.list_entities(limit=200)
-    threads = world_model_store.list_threads(limit=200)
-    continuity = build_continuity_report(
-        message=message,
-        generated_text=candidate_text,
-        known_entity_names=[entity.name for entity in entities],
-        known_thread_names=[thread.title for thread in threads],
-        extra_allowed_names=[],
-        allow_proposed_new_names=False,
-    )
-    reply_markdown = _render_guard_reply(
-        candidate_text=candidate_text,
-        continuity=continuity,
-        planner_notes=planner_notes,
-    )
-    pseudo_response = ChatResponse(
-        kind="answer",
-        reply=reply_markdown,
-        references=[],
-        warnings=[],
-    )
-    return V1ChatResponse(
-        request_id=trace.request_id,
-        trace_id=trace.trace_id,
-        kind="answer",
-        mode=AssistantMode.guard,
-        reply=reply_markdown,
-        reply_markdown=reply_markdown,
-        title="Guard Report",
-        conversation_id=conversation_id,
-        conversation_title=conversation_title,
-        citations=[],
-        warnings=[],
-        next_actions=_next_actions_for_response(
-            response=pseudo_response,
-            continuity=continuity,
-            conversation_id=conversation_id,
-        ),
-        output=None,
-        telemetry=None,
-        continuity=continuity,
     )
 
 
@@ -488,227 +155,6 @@ def _search_world_model(
     return items[:limit]
 
 
-def _conversation_storage_enabled(store: ConversationStore | NullConversationStore) -> bool:
-    return not isinstance(store, NullConversationStore)
-
-
-def _resolve_conversation(
-    *,
-    trace: RequestTrace,
-    conversation_store: ConversationStore | NullConversationStore,
-    conversation_id: Optional[str],
-    conversation_title: Optional[str],
-    seed_message: str,
-) -> Optional[ConversationRecord]:
-    if not conversation_id:
-        if not _conversation_storage_enabled(conversation_store):
-            return None
-        return conversation_store.create_conversation(
-            title=_derive_conversation_title(seed_message, conversation_title),
-            metadata={"source": "v1_chat"},
-        )
-
-    if not _conversation_storage_enabled(conversation_store):
-        raise _api_error(
-            503,
-            request_trace=trace,
-            code="conversation_store_unavailable",
-            message="Conversation storage is not configured for this deployment.",
-        )
-
-    conversation = conversation_store.get_conversation(conversation_id)
-    if not conversation:
-        raise _api_error(
-            404,
-            request_trace=trace,
-            code="conversation_not_found",
-            message="Conversation not found.",
-        )
-    return conversation
-
-
-def _prompt_history(messages: list[ConversationMessageRecord]) -> list[ConversationMessageRecord]:
-    if not messages:
-        return []
-
-    selected: list[ConversationMessageRecord] = []
-    total_chars = 0
-    for message in reversed(messages):
-        rendered = f"{message.role}: {message.content}"
-        if selected and total_chars + len(rendered) > MAX_HISTORY_CHARS:
-            break
-        selected.append(message)
-        total_chars += len(rendered)
-        if len(selected) >= MAX_HISTORY_MESSAGES:
-            break
-    selected.reverse()
-    return selected
-
-
-def _compose_message_with_history(message: str, history: list[ConversationMessageRecord]) -> str:
-    if not history or len(message) > MAX_HISTORY_CHARS:
-        return message
-
-    lines = ["KONTEKST ROZMOWY:"]
-    for item in history:
-        role_label = "Uzytkownik" if item.role == "user" else "Asystent" if item.role == "assistant" else item.role.title()
-        lines.append(f"{role_label}: {item.content}")
-    lines.extend(
-        [
-            "",
-            "NOWA WIADOMOSC UZYTKOWNIKA:",
-            message,
-            "",
-            "Odpowiedz na ostatnia wiadomosc, zachowujac ciaglosc rozmowy i kanonu.",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def _stream_chunks(text: str) -> list[str]:
-    compact = text or ""
-    if not compact:
-        return []
-    chunks: list[str] = []
-    cursor = 0
-    while cursor < len(compact):
-        chunks.append(compact[cursor : cursor + STREAM_CHUNK_CHARS])
-        cursor += STREAM_CHUNK_CHARS
-    return chunks
-
-
-def _sse_event(event: str, payload: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def _stream_chat_response(response: V1ChatResponse) -> StreamingResponse:
-    payload = response.model_dump(mode="json")
-
-    def iterator():
-        yield _sse_event(
-            "start",
-            {
-                "request_id": response.request_id,
-                "trace_id": response.trace_id,
-                "conversation_id": response.conversation_id,
-                "title": response.title,
-            },
-        )
-        for chunk in _stream_chunks(response.reply_markdown):
-            yield _sse_event("delta", {"text": chunk})
-        yield _sse_event("complete", payload)
-
-    return StreamingResponse(iterator(), media_type="text/event-stream")
-
-
-def _run_chat_request(
-    *,
-    trace: RequestTrace,
-    chat_request_cls: Type[ChatRequest],
-    chat_fn: Callable[[ChatRequest], ChatResponse],
-    drive_store,
-    consistency_planner,
-    world_model_store: WorldModelStore | NullWorldModelStore,
-    conversation_store: ConversationStore | NullConversationStore,
-    message: str,
-    assistant_mode: AssistantMode,
-    intent: str,
-    artifact_type: Optional[str],
-    source_title: Optional[str],
-    candidate_text: Optional[str],
-    include_sources: bool,
-    include_telemetry: bool,
-    save_output: bool,
-    output_title: Optional[str],
-    conversation_id: Optional[str],
-    conversation_title: Optional[str],
-) -> V1ChatResponse:
-    conversation = _resolve_conversation(
-        trace=trace,
-        conversation_store=conversation_store,
-        conversation_id=conversation_id,
-        conversation_title=conversation_title,
-        seed_message=message,
-    )
-    history: list[ConversationMessageRecord] = []
-    if conversation:
-        history = _prompt_history(conversation_store.list_messages(conversation.conversation_id, limit=50))
-        conversation_store.append_message(
-            conversation.conversation_id,
-            role="user",
-            content=message,
-            kind="input",
-            artifact_type=artifact_type,
-            metadata={
-                "source_title": source_title,
-                "assistant_mode": assistant_mode.value,
-                "candidate_text": candidate_text,
-            },
-        )
-
-    composed_message = _compose_message_with_history(message, history)
-
-    if assistant_mode == AssistantMode.guard:
-        checked_text = (candidate_text or message).strip()
-        planner_notes = None
-        if consistency_planner and hasattr(consistency_planner, "consistency_check"):
-            planner_notes = consistency_planner.consistency_check(
-                instruction=_guard_context_instruction(composed_message, checked_text),
-                world_context=build_context_for_planner(drive_store),
-            )
-        rendered = _build_guard_response(
-            trace=trace,
-            message=message,
-            candidate_text=checked_text,
-            world_model_store=world_model_store,
-            planner_notes=planner_notes,
-            conversation_id=conversation.conversation_id if conversation else None,
-            conversation_title=conversation.title if conversation else None,
-        )
-    else:
-        effective_intent = "proposal" if assistant_mode == AssistantMode.editor else intent
-        response = chat_fn(
-            chat_request_cls(
-                message=composed_message,
-                intent=effective_intent,
-                artifact_type=artifact_type,
-                source_title=source_title,
-                conversation_id=conversation.conversation_id if conversation else None,
-                conversation_title=conversation.title if conversation else conversation_title,
-                include_sources=include_sources,
-                include_telemetry=include_telemetry,
-                save_output=save_output,
-                output_title=output_title,
-            )
-        )
-        rendered = _chat_response_v1(
-            trace=trace,
-            message=message,
-            response=response,
-            world_model_store=world_model_store,
-            mode=assistant_mode,
-            conversation_id=conversation.conversation_id if conversation else None,
-            conversation_title=conversation.title if conversation else None,
-        )
-
-    if conversation:
-        conversation_store.append_message(
-            conversation.conversation_id,
-            role="assistant",
-            content=rendered.reply_markdown,
-            kind=rendered.kind,
-            artifact_type=rendered.artifact_type,
-            metadata={
-                "proposal_id": rendered.proposal_id,
-                "session_id": rendered.session_id,
-                "continuity_ok": rendered.continuity.ok if rendered.continuity else None,
-                "assistant_mode": rendered.mode.value,
-            },
-        )
-
-    return rendered
-
-
 def build_v1_router(
     *,
     chat_request_cls: Type[ChatRequest],
@@ -728,6 +174,15 @@ def build_v1_router(
     convo_store = conversation_store or NullConversationStore()
     guard_planner = consistency_planner or planner
     proposal_applier = applier or ProposalApplier(drive_store=drive_store)
+    chat_service = ChatService(
+        chat_request_cls=chat_request_cls,
+        chat_fn=chat_fn,
+        drive_store=drive_store,
+        planner=planner,
+        consistency_planner=guard_planner,
+        world_model_store=model_store,
+        conversation_store=convo_store,
+    )
 
     @router.get("/health", response_model=V1HealthResponse)
     def v1_health():
@@ -744,7 +199,7 @@ def build_v1_router(
     @router.get("/conversations", response_model=ConversationListResponse)
     def v1_list_conversations(limit: int = 20):
         trace = _new_trace()
-        if not _conversation_storage_enabled(convo_store):
+        if not chat_service.conversation_storage_enabled():
             raise _api_error(
                 503,
                 request_trace=trace,
@@ -755,21 +210,22 @@ def build_v1_router(
         return ConversationListResponse(
             request_id=trace.request_id,
             trace_id=trace.trace_id,
-            items=convo_store.list_conversations(limit=safe_limit),
+            items=chat_service.list_conversations(limit=safe_limit),
         )
 
     @router.post("/conversations", response_model=ConversationResponse)
     def v1_create_conversation(request: ConversationCreateRequest):
         trace = _new_trace()
-        if not _conversation_storage_enabled(convo_store):
+        if not chat_service.conversation_storage_enabled():
             raise _api_error(
                 503,
                 request_trace=trace,
                 code="conversation_store_unavailable",
                 message="Conversation storage is not configured for this deployment.",
             )
-        conversation = convo_store.create_conversation(
-            title=_derive_conversation_title("", request.title),
+        conversation = chat_service.create_conversation(
+            title=request.title,
+            seed_message="",
             metadata={"source": "v1_conversations"},
         )
         return ConversationResponse(
@@ -781,14 +237,14 @@ def build_v1_router(
     @router.get("/conversations/{conversation_id}", response_model=ConversationResponse)
     def v1_get_conversation(conversation_id: str):
         trace = _new_trace()
-        if not _conversation_storage_enabled(convo_store):
+        if not chat_service.conversation_storage_enabled():
             raise _api_error(
                 503,
                 request_trace=trace,
                 code="conversation_store_unavailable",
                 message="Conversation storage is not configured for this deployment.",
             )
-        conversation = convo_store.get_conversation(conversation_id)
+        conversation = chat_service.get_conversation(conversation_id)
         if not conversation:
             raise _api_error(
                 404,
@@ -805,14 +261,14 @@ def build_v1_router(
     @router.get("/conversations/{conversation_id}/messages", response_model=ConversationMessageListResponse)
     def v1_list_conversation_messages(conversation_id: str, limit: int = 100):
         trace = _new_trace()
-        if not _conversation_storage_enabled(convo_store):
+        if not chat_service.conversation_storage_enabled():
             raise _api_error(
                 503,
                 request_trace=trace,
                 code="conversation_store_unavailable",
                 message="Conversation storage is not configured for this deployment.",
             )
-        conversation = convo_store.get_conversation(conversation_id)
+        conversation = chat_service.get_conversation(conversation_id)
         if not conversation:
             raise _api_error(
                 404,
@@ -825,20 +281,14 @@ def build_v1_router(
             request_id=trace.request_id,
             trace_id=trace.trace_id,
             conversation_id=conversation_id,
-            items=convo_store.list_messages(conversation_id, limit=safe_limit),
+            items=chat_service.list_messages(conversation_id, limit=safe_limit),
         )
 
     @router.post("/chat", response_model=V1ChatResponse)
     def v1_chat(request: V1ChatRequest):
         trace = _new_trace()
-        response = _run_chat_request(
+        response = chat_service.run(
             trace=trace,
-            chat_request_cls=chat_request_cls,
-            chat_fn=chat_fn,
-            drive_store=drive_store,
-            consistency_planner=guard_planner,
-            world_model_store=model_store,
-            conversation_store=convo_store,
             message=request.message,
             assistant_mode=request.mode,
             intent=request.intent,
@@ -853,20 +303,14 @@ def build_v1_router(
             conversation_title=request.conversation_title,
         )
         if request.stream:
-            return _stream_chat_response(response)
+            return chat_service.stream(response)
         return response
 
     @router.post("/conversations/{conversation_id}/messages", response_model=V1ChatResponse)
     def v1_conversation_message(conversation_id: str, request: ConversationMessageCreateRequest):
         trace = _new_trace()
-        response = _run_chat_request(
+        response = chat_service.run(
             trace=trace,
-            chat_request_cls=chat_request_cls,
-            chat_fn=chat_fn,
-            drive_store=drive_store,
-            consistency_planner=guard_planner,
-            world_model_store=model_store,
-            conversation_store=convo_store,
             message=request.message,
             assistant_mode=request.mode,
             intent=request.intent,
@@ -881,20 +325,14 @@ def build_v1_router(
             conversation_title=None,
         )
         if request.stream:
-            return _stream_chat_response(response)
+            return chat_service.stream(response)
         return response
 
     @router.post("/artifacts/generate", response_model=V1ChatResponse)
     def v1_generate_artifact(request: V1ArtifactGenerateRequest):
         trace = _new_trace()
-        response = _run_chat_request(
+        response = chat_service.run(
             trace=trace,
-            chat_request_cls=chat_request_cls,
-            chat_fn=chat_fn,
-            drive_store=drive_store,
-            consistency_planner=guard_planner,
-            world_model_store=model_store,
-            conversation_store=convo_store,
             message=request.message,
             assistant_mode=AssistantMode.create,
             intent="auto",
@@ -909,20 +347,14 @@ def build_v1_router(
             conversation_title=request.conversation_title,
         )
         if request.stream:
-            return _stream_chat_response(response)
+            return chat_service.stream(response)
         return response
 
     @router.post("/sessions/prep", response_model=V1ChatResponse)
     def v1_prepare_session(request: V1SessionPrepRequest):
         trace = _new_trace()
-        response = _run_chat_request(
+        response = chat_service.run(
             trace=trace,
-            chat_request_cls=chat_request_cls,
-            chat_fn=chat_fn,
-            drive_store=drive_store,
-            consistency_planner=guard_planner,
-            world_model_store=model_store,
-            conversation_store=convo_store,
             message=request.message,
             assistant_mode=AssistantMode.create,
             intent="auto",
@@ -937,8 +369,100 @@ def build_v1_router(
             conversation_title=request.conversation_title,
         )
         if request.stream:
-            return _stream_chat_response(response)
+            return chat_service.stream(response)
         return response
+
+    @router.post("/assistant/actions", response_model=AssistantActionResponse)
+    def v1_assistant_action(request: AssistantActionRequest):
+        trace = _new_trace()
+
+        if request.action_type == AssistantActionType.accept_world_change:
+            if request.proposal_id is None:
+                raise _api_error(
+                    400,
+                    request_trace=trace,
+                    code="missing_proposal_id",
+                    message="proposal_id is required for accept_world_change.",
+                )
+            accepted = accept_world_model_change_impl(
+                trace=trace,
+                proposal_id=request.proposal_id,
+                actor=request.actor,
+                reindex_after_apply=request.reindex_after_apply,
+            )
+            return AssistantActionResponse(
+                request_id=trace.request_id,
+                trace_id=trace.trace_id,
+                action_type=request.action_type,
+                proposal=accepted.proposal,
+                apply_run_id=accepted.apply_run_id,
+                ok=accepted.ok,
+                summary=accepted.summary,
+                results=accepted.results,
+                reindex_result=accepted.reindex_result,
+            )
+
+        if request.action_type == AssistantActionType.reject_world_change:
+            if request.proposal_id is None:
+                raise _api_error(
+                    400,
+                    request_trace=trace,
+                    code="missing_proposal_id",
+                    message="proposal_id is required for reject_world_change.",
+                )
+            rejected = reject_world_model_change_impl(
+                trace=trace,
+                proposal_id=request.proposal_id,
+                actor=request.actor,
+                reason=request.reason,
+            )
+            return AssistantActionResponse(
+                request_id=trace.request_id,
+                trace_id=trace.trace_id,
+                action_type=request.action_type,
+                proposal=rejected.proposal,
+                ok=True,
+                summary="World model change rejected.",
+            )
+
+        if request.action_type == AssistantActionType.revise:
+            if not request.message:
+                raise _api_error(
+                    400,
+                    request_trace=trace,
+                    code="missing_message",
+                    message="message is required for revise.",
+                )
+            chat_response = chat_service.run(
+                trace=trace,
+                message=request.message,
+                assistant_mode=request.mode,
+                intent="auto",
+                artifact_type=request.artifact_type,
+                source_title=request.source_title,
+                candidate_text=request.candidate_text,
+                include_sources=request.include_sources,
+                include_telemetry=request.include_telemetry,
+                save_output=request.save_output,
+                output_title=request.output_title,
+                conversation_id=request.conversation_id,
+                conversation_title=None,
+            )
+            return AssistantActionResponse(
+                request_id=trace.request_id,
+                trace_id=trace.trace_id,
+                action_type=request.action_type,
+                ok=True,
+                summary="Revision response generated.",
+                chat=chat_response,
+            )
+
+        raise _api_error(
+            400,
+            request_trace=trace,
+            code="unsupported_action",
+            message="Unsupported assistant action.",
+        )
 
     @router.get("/world-model/entities", response_model=WorldModelEntityListResponse)
     def v1_list_entities(limit: int = 20, kind: Optional[str] = None):
@@ -980,6 +504,86 @@ def build_v1_router(
             trace_id=trace.trace_id,
             query=q,
             items=items,
+        )
+
+    def accept_world_model_change_impl(
+        *,
+        trace: RequestTrace,
+        proposal_id: int,
+        actor: Optional[str],
+        reindex_after_apply: bool,
+    ) -> WorldModelChangeApplyResponse:
+        detail = store.get_proposal(proposal_id)
+        if not detail:
+            raise _api_error(
+                404,
+                request_trace=trace,
+                code="proposal_not_found",
+                message="World model change proposal not found.",
+            )
+
+        proposal = ChangeProposal.model_validate(detail.proposal)
+        apply_request = ApplyChangesRequest(
+            proposal_id=proposal_id,
+            proposal=proposal,
+            approved=True,
+            approved_by=actor,
+            reindex_after_apply=reindex_after_apply,
+        )
+        apply_response = proposal_applier.apply(apply_request)
+        apply_response.proposal_id = proposal_id
+        apply_run_id = store.save_apply_run(apply_request, apply_response)
+
+        updated_detail = detail
+        if apply_response.ok:
+            updated_detail = store.update_proposal_state(
+                proposal_id,
+                proposal_status=ProposalStatus.accepted.value,
+                reviewed_by=actor,
+                accepted_apply_run_id=apply_run_id,
+            ) or detail
+            supersedes_proposal_id = detail.proposal.get("supersedes_proposal_id")
+            if supersedes_proposal_id:
+                store.update_proposal_state(
+                    int(supersedes_proposal_id),
+                    proposal_status=ProposalStatus.superseded.value,
+                    reviewed_by=actor,
+                )
+        return WorldModelChangeApplyResponse(
+            request_id=trace.request_id,
+            trace_id=trace.trace_id,
+            proposal=_proposal_view_from_detail(updated_detail),
+            apply_run_id=apply_run_id,
+            ok=apply_response.ok,
+            summary=apply_response.summary,
+            results=apply_response.results,
+            reindex_result=apply_response.reindex_result,
+        )
+
+    def reject_world_model_change_impl(
+        *,
+        trace: RequestTrace,
+        proposal_id: int,
+        actor: Optional[str],
+        reason: Optional[str],
+    ) -> WorldModelChangeResponse:
+        updated_detail = store.update_proposal_state(
+            proposal_id,
+            proposal_status=ProposalStatus.rejected.value,
+            reviewed_by=actor,
+            rejected_reason=reason,
+        )
+        if not updated_detail:
+            raise _api_error(
+                404,
+                request_trace=trace,
+                code="proposal_not_found",
+                message="World model change proposal not found.",
+            )
+        return WorldModelChangeResponse(
+            request_id=trace.request_id,
+            trace_id=trace.trace_id,
+            proposal=_proposal_view_from_detail(updated_detail),
         )
 
     @router.post("/world-model/changes/propose", response_model=WorldModelChangeResponse)
@@ -1052,73 +656,21 @@ def build_v1_router(
     @router.post("/world-model/changes/{proposal_id}/accept", response_model=WorldModelChangeApplyResponse)
     def v1_accept_world_model_change(proposal_id: int, request: WorldModelChangeDecisionRequest):
         trace = _new_trace()
-        detail = store.get_proposal(proposal_id)
-        if not detail:
-            raise _api_error(
-                404,
-                request_trace=trace,
-                code="proposal_not_found",
-                message="World model change proposal not found.",
-            )
-
-        proposal = ChangeProposal.model_validate(detail.proposal)
-        apply_request = ApplyChangesRequest(
+        return accept_world_model_change_impl(
+            trace=trace,
             proposal_id=proposal_id,
-            proposal=proposal,
-            approved=True,
-            approved_by=request.actor,
+            actor=request.actor,
             reindex_after_apply=request.reindex_after_apply,
-        )
-        apply_response = proposal_applier.apply(apply_request)
-        apply_response.proposal_id = proposal_id
-        apply_run_id = store.save_apply_run(apply_request, apply_response)
-
-        updated_detail = detail
-        if apply_response.ok:
-            updated_detail = store.update_proposal_state(
-                proposal_id,
-                proposal_status=ProposalStatus.accepted.value,
-                reviewed_by=request.actor,
-                accepted_apply_run_id=apply_run_id,
-            ) or detail
-            supersedes_proposal_id = detail.proposal.get("supersedes_proposal_id")
-            if supersedes_proposal_id:
-                store.update_proposal_state(
-                    int(supersedes_proposal_id),
-                    proposal_status=ProposalStatus.superseded.value,
-                    reviewed_by=request.actor,
-                )
-        return WorldModelChangeApplyResponse(
-            request_id=trace.request_id,
-            trace_id=trace.trace_id,
-            proposal=_proposal_view_from_detail(updated_detail),
-            apply_run_id=apply_run_id,
-            ok=apply_response.ok,
-            summary=apply_response.summary,
-            results=apply_response.results,
-            reindex_result=apply_response.reindex_result,
         )
 
     @router.post("/world-model/changes/{proposal_id}/reject", response_model=WorldModelChangeResponse)
     def v1_reject_world_model_change(proposal_id: int, request: WorldModelChangeDecisionRequest):
         trace = _new_trace()
-        updated_detail = store.update_proposal_state(
-            proposal_id,
-            proposal_status=ProposalStatus.rejected.value,
-            reviewed_by=request.actor,
-            rejected_reason=request.reason,
-        )
-        if not updated_detail:
-            raise _api_error(
-                404,
-                request_trace=trace,
-                code="proposal_not_found",
-                message="World model change proposal not found.",
-            )
-        return WorldModelChangeResponse(
-            request_id=trace.request_id,
-            trace_id=trace.trace_id,
-            proposal=_proposal_view_from_detail(updated_detail),
+        return reject_world_model_change_impl(
+            trace=trace,
+            proposal_id=proposal_id,
+            actor=request.actor,
+            reason=request.reason,
         )
 
     return router

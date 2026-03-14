@@ -28,6 +28,12 @@ class AssistantMode(str, Enum):
     editor = "editor"
 
 
+class AssistantActionType(str, Enum):
+    accept_world_change = "accept_world_change"
+    reject_world_change = "reject_world_change"
+    revise = "revise"
+
+
 class RequestTrace(BaseModel):
     request_id: str
     trace_id: str
@@ -250,3 +256,33 @@ class WorldModelChangeApplyResponse(RequestTrace):
     summary: str = ""
     results: List[AppliedActionResult] = Field(default_factory=list)
     reindex_result: Optional[Dict[str, Any]] = None
+
+
+class AssistantActionRequest(BaseModel):
+    action_type: AssistantActionType
+    conversation_id: Optional[str] = None
+    proposal_id: Optional[int] = None
+    actor: Optional[str] = None
+    reason: Optional[str] = None
+    reindex_after_apply: bool = True
+    message: Optional[str] = None
+    mode: AssistantMode = AssistantMode.create
+    artifact_type: Optional[ArtifactType] = None
+    candidate_text: Optional[str] = None
+    source_title: Optional[str] = None
+    include_sources: bool = False
+    include_telemetry: bool = False
+    save_output: bool = False
+    output_title: Optional[str] = None
+
+
+class AssistantActionResponse(RequestTrace):
+    action_type: AssistantActionType
+    status: Literal["completed"] = "completed"
+    proposal: Optional[WorldModelChangeView] = None
+    apply_run_id: Optional[int] = None
+    ok: Optional[bool] = None
+    summary: str = ""
+    results: List[AppliedActionResult] = Field(default_factory=list)
+    reindex_result: Optional[Dict[str, Any]] = None
+    chat: Optional[V1ChatResponse] = None

@@ -18,6 +18,95 @@ Backend agenta AI do worldbuildingu RPG zintegrowanego z Google Docs/Drive, Supa
 - `POST /propose_changes` - plan zmian
 - `POST /apply_changes` - wykonanie zatwierdzonych zmian
 
+## V1 chat API
+
+Nowy kontrakt dla klienta chatowego i UI worldbuildingu:
+
+- `POST /v1/chat` - glowny endpoint asystenta z trybami `create`, `guard`, `editor`
+- `POST /v1/assistant/actions` - wykonanie akcji zwrotnych z `next_actions`
+- `GET /v1/conversations`
+- `POST /v1/conversations`
+- `GET /v1/conversations/{conversation_id}/messages`
+- `POST /v1/conversations/{conversation_id}/messages`
+
+Przykladowy request `create`:
+
+```json
+{
+  "message": "Przygotuj 3 hooki na kolejna sesje o Red Blade i Captain Mira.",
+  "mode": "create",
+  "artifact_type": "session_hooks",
+  "save_output": true
+}
+```
+
+Przykladowy request `guard`:
+
+```json
+{
+  "message": "Sprawdz zgodnosc z kanonem.",
+  "mode": "guard",
+  "candidate_text": "* Captain Mira wspolpracuje z Red Blade.\n* Skup pojawia sie jako nowa frakcja."
+}
+```
+
+Przykladowy request `editor`:
+
+```json
+{
+  "message": "Dodaj nowego NPC powiazanego z Red Blade.",
+  "mode": "editor"
+}
+```
+
+Przykladowa odpowiedz `v1/chat`:
+
+```json
+{
+  "request_id": "req_123",
+  "trace_id": "req_123",
+  "kind": "creative",
+  "mode": "create",
+  "reply_markdown": "## Hook 1\n...",
+  "conversation_id": "conv_123",
+  "artifact": {
+    "artifact_type": "session_hooks",
+    "text": "Tytul: ...",
+    "format": "markdown"
+  },
+  "continuity": {
+    "ok": false,
+    "proposed_new_names": ["Skup"],
+    "issues": [
+      {
+        "code": "new_proper_noun",
+        "severity": "warning",
+        "message": "Nowa nazwa wlasna: Skup"
+      }
+    ]
+  },
+  "next_actions": [
+    {
+      "type": "revise",
+      "label": "Przerob odpowiedz",
+      "payload": {
+        "artifact_type": "session_hooks"
+      }
+    }
+  ]
+}
+```
+
+Przykladowy request do wykonania `next_actions`:
+
+```json
+{
+  "action_type": "accept_world_change",
+  "proposal_id": 42,
+  "actor": "mg"
+}
+```
+
 ## Lokalne uruchomienie
 
 1. Skopiuj `.env.example` do `.env` i uzupełnij wartości.

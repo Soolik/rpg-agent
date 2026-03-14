@@ -1,7 +1,11 @@
 import asyncio
 import unittest
 
+from fastapi import HTTPException
+
 from app.api_models import (
+    AssistantActionRequest,
+    AssistantActionType,
     AssistantMode,
     ConversationCreateRequest,
     ConversationMessageCreateRequest,
@@ -12,6 +16,7 @@ from app.api_models import (
     WorldModelChangeProposalRequest,
 )
 from app.conversation_store import ConversationMessageRecord, ConversationRecord
+from app.conversation_store import NullConversationStore
 from app.chat_models import ChatRequest, ChatResponse
 from app.models_v2 import (
     ApplyChangesResponse,
@@ -119,8 +124,19 @@ class FakeWorkflowStore:
                     "proposal_status": "proposed",
                     "summary": "Stara propozycja",
                     "user_goal": "Poprzednia wersja",
-                    "impacted_docs": [],
-                    "actions": [],
+                    "impacted_docs": [
+                        {"folder": "03 NPC", "title": "Captain Mira", "doc_id": "npc-1"}
+                    ],
+                    "actions": [
+                        {
+                            "action_type": "replace_section",
+                            "entity_type": "npc",
+                            "target": {"folder": "03 NPC", "title": "Captain Mira", "doc_id": "npc-1"},
+                            "section": "## Notes",
+                            "content": "Stara notatka.",
+                            "reason": "Fixture testowa",
+                        }
+                    ],
                     "needs_confirmation": True,
                 },
             )
@@ -336,6 +352,34 @@ class RoutesV1Test(unittest.TestCase):
         self.assertIn("Powiedz mi o Red Blade.", seen["message"])
         self.assertIn("A jak to sie ma do Captain Mira?", seen["message"])
 
+    def test_v1_chat_with_unknown_conversation_returns_404(self):
+        router = self.build_router(conversation_store=FakeConversationStore())
+
+        with self.assertRaises(HTTPException) as caught:
+            self.route_endpoint(router, "/v1/chat", "POST")(
+                request=V1ChatRequest(
+                    conversation_id="missing-conversation",
+                    message="Kontynuuj ten watek.",
+                )
+            )
+
+        self.assertEqual(caught.exception.status_code, 404)
+        self.assertEqual(caught.exception.detail["code"], "conversation_not_found")
+
+    def test_v1_chat_with_conversation_id_without_storage_returns_503(self):
+        router = self.build_router(conversation_store=NullConversationStore())
+
+        with self.assertRaises(HTTPException) as caught:
+            self.route_endpoint(router, "/v1/chat", "POST")(
+                request=V1ChatRequest(
+                    conversation_id="conv-1",
+                    message="Kontynuuj ten watek.",
+                )
+            )
+
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertEqual(caught.exception.detail["code"], "conversation_store_unavailable")
+
     def test_v1_chat_stream_returns_sse_events(self):
         router = self.build_router(
             chat_fn=lambda req: ChatResponse(kind="answer", reply="Pierwszy akapit.\n\nDrugi akapit.", references=[])
@@ -424,6 +468,42 @@ class RoutesV1Test(unittest.TestCase):
         self.assertEqual(len(message_body["items"]), 2)
         self.assertEqual(message_body["items"][0]["role"], "user")
         self.assertEqual(message_body["items"][1]["role"], "assistant")
+
+    def test_v1_assistant_action_accept_executes_proposal(self):
+        workflow_store = FakeWorkflowStore()
+        router = self.build_router(workflow_store=workflow_store)
+
+        body = self.route_endpoint(router, "/v1/assistant/actions", "POST")(
+            request=AssistantActionRequest(
+                action_type=AssistantActionType.accept_world_change,
+                proposal_id=12,
+                actor="mg",
+            )
+        ).model_dump(mode="json")
+
+        self.assertEqual(body["action_type"], AssistantActionType.accept_world_change.value)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["proposal"]["status"], ProposalStatus.accepted.value)
+        self.assertIsNotNone(body["apply_run_id"])
+
+    def test_v1_assistant_action_revise_uses_chat_service(self):
+        router = self.build_router(
+            chat_fn=lambda req: ChatResponse(kind="creative", reply="Nowa wersja.", references=[], artifact_type="scene_seed", artifact_text="## Scena\nNowa wersja.")
+        )
+
+        body = self.route_endpoint(router, "/v1/assistant/actions", "POST")(
+            request=AssistantActionRequest(
+                action_type=AssistantActionType.revise,
+                message="Przerob to na ostrzejsza scene.",
+                mode=AssistantMode.create,
+                artifact_type="scene_seed",
+            )
+        ).model_dump(mode="json")
+
+        self.assertEqual(body["action_type"], AssistantActionType.revise.value)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["chat"]["kind"], "creative")
+        self.assertEqual(body["chat"]["artifact_type"], "scene_seed")
 
     def test_v1_artifact_generate_returns_continuity_report(self):
         def fake_chat(req):
