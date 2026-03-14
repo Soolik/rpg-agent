@@ -222,11 +222,11 @@ class ChatFlowTest(unittest.TestCase):
         outputs = iter(
             [
                 "Cienie Red Blade",
-                "Captain Mira prosi BG o dyskretne spotkanie z emisariuszem Red Blade.",
-                "Dowody wskazuja, ze Red Blade testuje lojalnosc Captain Mira.",
-                "BG odkrywaja, ze magazyn zaopatrzenia Red Blade zostal okradziony przez kogos z otoczenia Miry.",
-                "* Utrata zaufania do Captain Mira.\n* Eskalacja konfliktu o zasoby.",
-                "* Przygotuj emisariusza Red Blade.\n* Przygotuj magazyn i tropy po wlamaniu.",
+                "Captain Mira prosi BG o dyskretne spotkanie z emisariuszem Red Blade. To spotkanie moze uruchomic otwarty konflikt z wladzami.",
+                "Dowody wskazuja, ze Red Blade testuje lojalnosc Captain Mira. Bohaterowie musza zdecydowac, czy wejda w te gre.",
+                "BG odkrywaja, ze magazyn zaopatrzenia Red Blade zostal okradziony przez kogos z otoczenia Miry. Kradziez grozi eskalacja paniki i przemocy.",
+                "* Utrata zaufania do Captain Mira.\n* Eskalacja konfliktu o zasoby.\n* Red Blade zyska przewage polityczna.\n* Bohaterowie straca wiarygodnosc wobec wladz.",
+                "* Przygotuj emisariusza Red Blade.\n* Przygotuj magazyn i tropy po wlamaniu.\n* Przygotuj reakcje strazy miejskiej.\n* Przygotuj dowody laczace Mirę z Red Blade.",
             ]
         )
 
@@ -280,8 +280,8 @@ class ChatFlowTest(unittest.TestCase):
                 "Surowy, spokojny i stale gotowy do wydania rozkazu.",
                 "Wierzy, ze tylko brutalna skutecznosc uratuje ludzi przed katastrofa.",
                 "Ukrywa, ze juz poswiecil niewinnych w imie planu Red Blade.",
-                "* Captain Mira: uwaza ja za zbyt miekka.\n* Red Blade: ma w frakcji lojalistow.",
-                "* Moze zlecic BG moralnie watpliwa misje.\n* Moze podwazyc autorytet Captain Mira.",
+                "* Captain Mira: uwaza ja za zbyt miekka.\n* Red Blade: ma w frakcji lojalistow.\n* BG: chce wykorzystac ich jako narzedzie nacisku.",
+                "* Moze zlecic BG moralnie watpliwa misje.\n* Moze podwazyc autorytet Captain Mira.\n* Moze doprowadzic do otwartego konfliktu w Red Blade.",
             ]
         )
 
@@ -480,6 +480,7 @@ class ChatFlowTest(unittest.TestCase):
                 "* Captain Mira: uwaza ja za przeszkode.\n*",
                 "* Captain Mira: uwaza ja za przeszkode.\n*",
                 "* Captain Mira: uwaza ja za przeszkode w planach Red Blade.\n* Red Blade: ma tam lojalistow gotowych wykonywac rozkazy.",
+                "BG: chce ich ustawic przeciwko Captain Mira i wymusic szybki wybor lojalnosci.",
             ]
         )
 
@@ -502,6 +503,7 @@ class ChatFlowTest(unittest.TestCase):
 
         self.assertIn("* Captain Mira:", section)
         self.assertIn("* Red Blade:", section)
+        self.assertIn("* BG:", section)
 
     def test_chat_answer_can_save_output_doc(self):
         original_ask = main.ask
@@ -816,7 +818,7 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("# Pre-Session Brief", response.artifact_text)
         self.assertEqual(response.references, ["06 Threads / Thread Tracker"])
 
-    def test_generate_pre_session_brief_repairs_missing_sections(self):
+    def test_generate_pre_session_brief_uses_structured_sections(self):
         original_generate = main.gemini_generate
         original_build_world_model_context = main.build_world_model_context
         original_build_recent_sessions_context = main.build_recent_sessions_context
@@ -824,19 +826,19 @@ class ChatFlowTest(unittest.TestCase):
         original_build_context_for_planner = main.build_context_for_planner
         original_render_source_labels = main.render_source_labels
 
-        calls = {"count": 0}
+        outputs = iter(
+            [
+                "* T01 / Red Blade nabiera znaczenia.\n* Captain Mira jest pod presja polityczna.\n* Bohaterowie sa w centrum konfliktu lojalnosci.",
+                "* T01 / Red Blade nabiera znaczenia.\n* T02 / Walka o zasoby eskaluje.\n* T05 / Peknieta przysiega wraca jako zagrozenie.",
+                "* Captain Mira jest kluczowa dla kolejnej sesji.\n* Red Blade naciska na szybkie decyzje.\n* Wladze miasta obserwuja bohaterow.",
+                "* Wyciek informacji rozbije sojusze.\n* Red Blade moze wymusic brutalne ruchy.\n* Bohaterowie zaplaca za zly wybor polityczny.",
+                "* Przesluchanie poslanca Red Blade.\n* Konfrontacja z Captain Mira.\n* Spotkanie z rada miasta po ujawnieniu kontaktu.",
+                "* Przygotuj reakcje Red Blade.\n* Przygotuj konsekwencje polityczne.\n* Przygotuj sceny nacisku na bohaterow.",
+            ]
+        )
 
         def fake_generate(prompt, **kwargs):
-            calls["count"] += 1
-            if calls["count"] == 1:
-                return "# Pre-Session Brief\n\n## Campaign State\nNapiecie rosnie."
-            return (
-                "## Active Threads\n- T01 / Red Blade nabiera znaczenia.\n\n"
-                "## Key NPCs and Factions\n- Captain Mira.\n- Red Blade.\n\n"
-                "## Risks and Pressure Points\n- Wyciek informacji rozbije sojusze.\n\n"
-                "## Scene Opportunities\n- Przesluchanie poslanca Red Blade.\n\n"
-                "## Prep Checklist\n- Przygotuj konsekwencje polityczne."
-            )
+            return next(outputs)
 
         try:
             main.gemini_generate = fake_generate
@@ -865,6 +867,7 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("## Scene Opportunities", artifact_text)
         self.assertIn("## Prep Checklist", artifact_text)
         self.assertIn("T01 / Red Blade nabiera znaczenia.", artifact_text)
+        self.assertNotIn("Do doprecyzowania.", artifact_text)
 
     def test_chat_proposal_returns_human_summary(self):
         original_drive_store = main.drive_store_v2

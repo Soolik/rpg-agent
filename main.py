@@ -1456,6 +1456,10 @@ def ends_with_sentence_punctuation(content: str) -> bool:
     return bool(re.search(r"[.!?\)\]\"']\s*$", (content or "").strip()))
 
 
+def sentence_count(content: str) -> int:
+    return len(re.findall(r"[.!?](?=(?:[\"')\]]*)?(?:\s|$))", (content or "").strip()))
+
+
 def extract_bullet_items(content: str) -> List[str]:
     items: List[str] = []
     current: List[str] = []
@@ -1476,8 +1480,8 @@ def extract_bullet_items(content: str) -> List[str]:
     return [item for item in items if item]
 
 
-def complete_bullet_count(content: str, minimum_length: int = 12) -> int:
-    count = 0
+def complete_bullet_items(content: str, minimum_length: int = 8) -> List[str]:
+    items: List[str] = []
     for item in extract_bullet_items(content):
         normalized = normalize_section_body(item)
         if (
@@ -1485,8 +1489,12 @@ def complete_bullet_count(content: str, minimum_length: int = 12) -> int:
             and "do doprecyzowania" not in normalized.lower()
             and ends_with_sentence_punctuation(item)
         ):
-            count += 1
-    return count
+            items.append(re.sub(r"\s+", " ", item).strip())
+    return items
+
+
+def complete_bullet_count(content: str, minimum_length: int = 8) -> int:
+    return len(complete_bullet_items(content, minimum_length=minimum_length))
 
 
 def trim_to_complete_sentences(content: str) -> str:
@@ -1520,9 +1528,44 @@ def sanitize_generated_section(marker: str, content: str) -> str:
         return normalize_single_line_section(raw)
     if marker in {"Stawki:", "Co przygotowac:", "Relacje:", "Jak uzyc tej postaci na sesji:"}:
         items = [trim_to_complete_sentences(item) for item in extract_bullet_items(raw)]
+        items = complete_bullet_items("\n".join(f"* {item}" for item in items if item.strip()))
+        items = [re.sub(r"\s+", " ", item).strip() for item in items if item.strip()]
+        return "\n".join(f"* {item}" for item in items)
+    if marker.startswith("## "):
+        items = [trim_to_complete_sentences(item) for item in extract_bullet_items(raw)]
+        items = complete_bullet_items("\n".join(f"* {item}" for item in items if item.strip()))
         items = [re.sub(r"\s+", " ", item).strip() for item in items if item.strip()]
         return "\n".join(f"* {item}" for item in items)
     return trim_to_complete_sentences(raw)
+
+
+def is_bullet_section_marker(artifact_type: ArtifactType, marker: str) -> bool:
+    if marker in {"Stawki:", "Co przygotowac:", "Relacje:", "Jak uzyc tej postaci na sesji:"}:
+        return True
+    return artifact_type == "pre_session_brief" and marker.startswith("## ")
+
+
+def section_target_bullet_count(artifact_type: ArtifactType, marker: str) -> int:
+    if artifact_type == "session_hooks" and marker in {"Stawki:", "Co przygotowac:"}:
+        return 4
+    if artifact_type == "npc_brief" and marker in {"Relacje:", "Jak uzyc tej postaci na sesji:"}:
+        return 3
+    if artifact_type == "pre_session_brief" and marker.startswith("## "):
+        return 3
+    return 2
+
+
+def compact_retry_rule(artifact_type: ArtifactType, marker: str) -> str:
+    if artifact_type == "session_hooks" and marker in {"Hook 1:", "Hook 2:", "Hook 3:"}:
+        return "Zwroc dokladnie 2 krotkie pelne zdania. Kazde zdanie ma byc konkretne i zakonczone kropka."
+    if artifact_type == "npc_brief" and marker in {
+        "Rola w kampanii:",
+        "Pierwsze wrazenie:",
+        "Motywacja:",
+        "Sekret:",
+    }:
+        return "Zwroc dokladnie 2 krotkie pelne zdania. Kazde zdanie zakoncz kropka."
+    return section_retry_rule(artifact_type, marker)
 
 
 def section_min_length(artifact_type: ArtifactType, marker: str) -> int:
@@ -1561,7 +1604,11 @@ def section_needs_fill(
         if marker == "Tytul:":
             return "\n" in raw or len(raw.split()) > 12
         if marker in {"Hook 1:", "Hook 2:", "Hook 3:"}:
-            return len(normalized) < section_min_length(artifact_type, marker) or not ends_with_sentence_punctuation(raw)
+            return (
+                len(normalized) < section_min_length(artifact_type, marker)
+                or not ends_with_sentence_punctuation(raw)
+                or sentence_count(raw) < 2
+            )
         if marker in {"Stawki:", "Co przygotowac:"}:
             return complete_bullet_count(raw) < 2
     if artifact_type == "npc_brief":
@@ -1721,6 +1768,39 @@ def build_placeholder_sections(artifact_type: ArtifactType, markers: List[str]) 
 
 
 def creative_section_specs(artifact_type: ArtifactType) -> List[Dict[str, Any]]:
+    if artifact_type == "pre_session_brief":
+        return [
+            {
+                "marker": "## Campaign State",
+                "instruction": "Daj 3 krotkie bullety o aktualnym stanie kampanii i ostatnim zwrocie sytuacji.",
+                "require_canonical_name": True,
+            },
+            {
+                "marker": "## Active Threads",
+                "instruction": "Daj 3 krotkie bullety o najwazniejszych aktywnych watkach i ich aktualnym stanie.",
+                "require_canonical_name": True,
+            },
+            {
+                "marker": "## Key NPCs and Factions",
+                "instruction": "Daj 3 krotkie bullety o kluczowych NPC i frakcjach istotnych przed kolejna sesja.",
+                "require_canonical_name": True,
+            },
+            {
+                "marker": "## Risks and Pressure Points",
+                "instruction": "Daj 3 krotkie bullety o ryzykach, presji i potencjalnej eskalacji.",
+                "require_canonical_name": True,
+            },
+            {
+                "marker": "## Scene Opportunities",
+                "instruction": "Daj 3 krotkie bullety z konkretnymi scenami do rozegrania na sesji.",
+                "require_canonical_name": True,
+            },
+            {
+                "marker": "## Prep Checklist",
+                "instruction": "Daj 3 konkretne bullety rzeczy do przygotowania przez MG przed sesja.",
+                "require_canonical_name": True,
+            },
+        ]
     if artifact_type == "session_hooks":
         return [
             {"marker": "Tytul:", "instruction": "Jedna krotka linia, 4-8 slow.", "require_canonical_name": False},
@@ -1803,6 +1883,233 @@ def strip_section_marker(text: str, marker: str) -> str:
     if stripped.lower().startswith(marker.lower()):
         stripped = stripped[len(marker):].lstrip()
     return stripped.strip()
+
+
+def generate_section_candidate(
+    *,
+    artifact_type: ArtifactType,
+    marker: str,
+    instruction: str,
+    message: str,
+    world_context: str,
+    structured_context: str,
+    recent_sessions_context: str,
+    canonical_names: List[str],
+    prior_sections_text: str,
+    require_canonical_name: bool,
+) -> str:
+    canonical_context = build_canonical_names_context(canonical_names)
+    markers = artifact_required_markers(artifact_type)
+    is_last_marker = marker == markers[-1]
+    prompt = f"""
+Jestes wspolautorem kampanii RPG "Krew Na Gwiazdach". Pisz po polsku.
+
+Masz wygenerowac tylko tresc jednej sekcji artefaktu `{artifact_type}`.
+Nie zwracaj JSON. Nie zwracaj code fence. Nie zwracaj nazwy sekcji.
+
+SEKCJA:
+{marker}
+
+INSTRUKCJA DLA SEKCJI:
+{instruction}
+
+ZASADY:
+- Zachowaj ton kampanii: smutne heroic fantasy, polityka, emocje, trudne wybory.
+- Pisz zwiezle i konkretnie.
+- Nie przeczyc twardym faktom z kontekstu.
+- Nie tlumacz nazw kanonicznych.
+
+{canonical_context}
+
+AKTUALNY MODEL SWIATA:
+{structured_context}
+
+OSTATNIE SESJE:
+{recent_sessions_context}
+
+RELEWANTNY KONTEKST KAMPANII:
+{world_context}
+
+PROSBA UZYTKOWNIKA:
+{message}
+
+JUZ WYGNEROWANE SEKCJE:
+{prior_sections_text or '[brak]'}
+
+ZWROC TYLKO TRESC SEKCJI:
+""".strip()
+
+    def run_prompt(extra_rule: Optional[str] = None, *, temperature: float = 0.45) -> str:
+        effective_prompt = prompt
+        if extra_rule:
+            effective_prompt = f"{prompt}\n\nDODATKOWA REGULA:\n{extra_rule}"
+        return sanitize_generated_section(
+            marker,
+            gemini_generate(
+                effective_prompt,
+                response_mime_type="text/plain",
+                temperature=temperature,
+                max_output_tokens=900,
+            ).strip(),
+        )
+
+    try:
+        candidate = run_prompt()
+    except Exception:
+        candidate = ""
+
+    needs_retry = section_needs_fill(
+        artifact_type=artifact_type,
+        marker=marker,
+        content=candidate,
+        is_last_marker=is_last_marker,
+    )
+    missing_name = require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)
+    if needs_retry or missing_name:
+        retry_rule = section_retry_rule(artifact_type, marker)
+        if require_canonical_name and canonical_names:
+            retry_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
+        try:
+            retry_candidate = run_prompt(retry_rule, temperature=0.35)
+            if retry_candidate:
+                candidate = retry_candidate
+        except Exception:
+            pass
+    if section_needs_fill(
+        artifact_type=artifact_type,
+        marker=marker,
+        content=candidate,
+        is_last_marker=is_last_marker,
+    ) or (require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)):
+        candidate = repair_creative_section(
+            artifact_type=artifact_type,
+            marker=marker,
+            instruction=instruction,
+            message=message,
+            world_context=world_context,
+            structured_context=structured_context,
+            recent_sessions_context=recent_sessions_context,
+            canonical_names=canonical_names,
+            prior_sections_text=prior_sections_text,
+            broken_content=candidate,
+            require_canonical_name=require_canonical_name,
+        )
+    if section_needs_fill(
+        artifact_type=artifact_type,
+        marker=marker,
+        content=candidate,
+        is_last_marker=is_last_marker,
+    ):
+        compact_rule = compact_retry_rule(artifact_type, marker)
+        if require_canonical_name and canonical_names:
+            compact_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
+        try:
+            compact_candidate = run_prompt(compact_rule, temperature=0.25)
+            if compact_candidate:
+                candidate = compact_candidate
+        except Exception:
+            pass
+    return sanitize_generated_section(marker, candidate).strip()
+
+
+def generate_bullet_item(
+    *,
+    artifact_type: ArtifactType,
+    marker: str,
+    instruction: str,
+    message: str,
+    world_context: str,
+    structured_context: str,
+    recent_sessions_context: str,
+    canonical_names: List[str],
+    prior_sections_text: str,
+    existing_items: List[str],
+    require_canonical_name: bool,
+    target_index: int,
+) -> str:
+    canonical_context = build_canonical_names_context(canonical_names)
+    existing_items_text = "\n".join(f"* {item}" for item in existing_items) or "[brak]"
+    prompt = f"""
+Jestes wspolautorem kampanii RPG "Krew Na Gwiazdach". Pisz po polsku.
+
+Masz wygenerowac dokladnie jeden nowy bullet do sekcji `{marker}` artefaktu `{artifact_type}`.
+Nie zwracaj JSON. Nie zwracaj code fence. Nie zwracaj nazwy sekcji. Nie zwracaj numeracji.
+
+SEKCJA:
+{marker}
+
+INSTRUKCJA DLA SEKCJI:
+{instruction}
+
+CEL:
+- To ma byc bullet numer {target_index}.
+- Ma byc inny od juz istniejacych bulletow.
+- Zwroc tylko tresc jednego bulleta bez prefixu '* '.
+
+ZASADY:
+- Daj jedno pelne, domkniete zdanie.
+- Pisz konkretnie i praktycznie.
+- Nie tlumacz nazw kanonicznych.
+- Nie powtarzaj juz istniejacych bulletow.
+
+{canonical_context}
+
+AKTUALNY MODEL SWIATA:
+{structured_context}
+
+OSTATNIE SESJE:
+{recent_sessions_context}
+
+RELEWANTNY KONTEKST KAMPANII:
+{world_context}
+
+PROSBA UZYTKOWNIKA:
+{message}
+
+JUZ WYGNEROWANE SEKCJE:
+{prior_sections_text or '[brak]'}
+
+ISTNIEJACE BULLETY W TEJ SEKCJI:
+{existing_items_text}
+
+ZWROC TYLKO NOWY BULLET:
+""".strip()
+
+    def clean_item(text: str) -> str:
+        item = strip_section_marker(text, marker)
+        item = re.sub(r"^\s*[\*\-]\s+", "", item).strip()
+        item = trim_to_complete_sentences(item)
+        item = re.sub(r"\s+", " ", item).strip()
+        return item
+
+    for attempt in range(3):
+        extra_rule = ""
+        if attempt == 1:
+            extra_rule = "Zwroc krotsze zdanie, zakonczone kropka."
+        elif attempt == 2:
+            extra_rule = "Zwroc bardzo konkretne jedno zdanie, max 18 slow, zakonczone kropka."
+        if require_canonical_name and canonical_names and not any(name in " ".join(existing_items) for name in canonical_names):
+            extra_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
+        effective_prompt = prompt if not extra_rule else f"{prompt}\n\nDODATKOWA REGULA:\n{extra_rule.strip()}"
+        try:
+            candidate = clean_item(
+                gemini_generate(
+                    effective_prompt,
+                    response_mime_type="text/plain",
+                    temperature=0.3,
+                    max_output_tokens=220,
+                ).strip()
+            )
+        except Exception:
+            candidate = ""
+        if (
+            candidate
+            and len(normalize_section_body(candidate)) >= 12
+            and ends_with_sentence_punctuation(candidate)
+            and candidate not in existing_items
+        ):
+            return candidate
+    return ""
 
 
 def repair_creative_section(
@@ -1893,90 +2200,8 @@ def generate_creative_section(
     prior_sections_text: str,
     require_canonical_name: bool,
 ) -> str:
-    canonical_context = build_canonical_names_context(canonical_names)
-    markers = artifact_required_markers(artifact_type)
-    is_last_marker = marker == markers[-1]
-    prompt = f"""
-Jestes wspolautorem kampanii RPG "Krew Na Gwiazdach". Pisz po polsku.
-
-Masz wygenerowac tylko tresc jednej sekcji artefaktu `{artifact_type}`.
-Nie zwracaj JSON. Nie zwracaj code fence. Nie zwracaj nazwy sekcji.
-
-SEKCJA:
-{marker}
-
-INSTRUKCJA DLA SEKCJI:
-{instruction}
-
-ZASADY:
-- Zachowaj ton kampanii: smutne heroic fantasy, polityka, emocje, trudne wybory.
-- Pisz zwiezle i konkretnie.
-- Nie przeczyc twardym faktom z kontekstu.
-- Nie tlumacz nazw kanonicznych.
-
-{canonical_context}
-
-AKTUALNY MODEL SWIATA:
-{structured_context}
-
-OSTATNIE SESJE:
-{recent_sessions_context}
-
-RELEWANTNY KONTEKST KAMPANII:
-{world_context}
-
-PROSBA UZYTKOWNIKA:
-{message}
-
-JUZ WYGNEROWANE SEKCJE:
-{prior_sections_text or '[brak]'}
-
-ZWROC TYLKO TRESC SEKCJI:
-""".strip()
-
-    def run_prompt(extra_rule: Optional[str] = None) -> str:
-        effective_prompt = prompt
-        if extra_rule:
-            effective_prompt = f"{prompt}\n\nDODATKOWA REGULA:\n{extra_rule}"
-        return sanitize_generated_section(
-            marker,
-            gemini_generate(
-                effective_prompt,
-                response_mime_type="text/plain",
-                temperature=0.45,
-                max_output_tokens=900,
-            ).strip(),
-        )
-
-    try:
-        candidate = run_prompt()
-    except Exception:
-        candidate = ""
-
-    needs_retry = section_needs_fill(
-        artifact_type=artifact_type,
-        marker=marker,
-        content=candidate,
-        is_last_marker=is_last_marker,
-    )
-    missing_name = require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)
-    if needs_retry or missing_name:
-        retry_rule = section_retry_rule(artifact_type, marker)
-        if require_canonical_name and canonical_names:
-            retry_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
-        try:
-            retry_candidate = run_prompt(retry_rule)
-            if retry_candidate:
-                candidate = retry_candidate
-        except Exception:
-            pass
-    if section_needs_fill(
-        artifact_type=artifact_type,
-        marker=marker,
-        content=candidate,
-        is_last_marker=is_last_marker,
-    ) or (require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)):
-        candidate = repair_creative_section(
+    if is_bullet_section_marker(artifact_type, marker):
+        candidate = generate_section_candidate(
             artifact_type=artifact_type,
             marker=marker,
             instruction=instruction,
@@ -1986,10 +2211,65 @@ ZWROC TYLKO TRESC SEKCJI:
             recent_sessions_context=recent_sessions_context,
             canonical_names=canonical_names,
             prior_sections_text=prior_sections_text,
-            broken_content=candidate,
             require_canonical_name=require_canonical_name,
         )
-    return sanitize_generated_section(marker, candidate).strip()
+        items = complete_bullet_items(candidate)
+        target_count = section_target_bullet_count(artifact_type, marker)
+
+        while len(items) < target_count:
+            next_item = generate_bullet_item(
+                artifact_type=artifact_type,
+                marker=marker,
+                instruction=instruction,
+                message=message,
+                world_context=world_context,
+                structured_context=structured_context,
+                recent_sessions_context=recent_sessions_context,
+                canonical_names=canonical_names,
+                prior_sections_text=prior_sections_text,
+                existing_items=items,
+                require_canonical_name=require_canonical_name,
+                target_index=len(items) + 1,
+            )
+            if not next_item:
+                break
+            items.append(next_item)
+
+        if require_canonical_name and canonical_names and not any(name in " ".join(items) for name in canonical_names):
+            replacement = generate_bullet_item(
+                artifact_type=artifact_type,
+                marker=marker,
+                instruction=instruction,
+                message=message,
+                world_context=world_context,
+                structured_context=structured_context,
+                recent_sessions_context=recent_sessions_context,
+                canonical_names=canonical_names,
+                prior_sections_text=prior_sections_text,
+                existing_items=items[1:] if len(items) > 1 else [],
+                require_canonical_name=True,
+                target_index=1,
+            )
+            if replacement:
+                if items:
+                    items[0] = replacement
+                else:
+                    items.append(replacement)
+
+        return "\n".join(f"* {item}" for item in items)
+
+    return generate_section_candidate(
+        artifact_type=artifact_type,
+        marker=marker,
+        instruction=instruction,
+        message=message,
+        world_context=world_context,
+        structured_context=structured_context,
+        recent_sessions_context=recent_sessions_context,
+        canonical_names=canonical_names,
+        prior_sections_text=prior_sections_text,
+        require_canonical_name=require_canonical_name,
+    )
 
 
 def generate_structured_creative_artifact(
@@ -2002,6 +2282,8 @@ def generate_structured_creative_artifact(
     canonical_names: List[str],
 ) -> str:
     section_values: Dict[str, str] = {}
+    if artifact_type == "pre_session_brief":
+        section_values["# Pre-Session Brief"] = ""
     specs = creative_section_specs(artifact_type)
     for spec in specs:
         body = generate_creative_section(
@@ -2274,43 +2556,15 @@ def generate_pre_session_brief(message: str) -> tuple[str, List[str]]:
             world_context = build_context_for_planner(drive_store_v2)
         except Exception:
             world_context = "Brak dodatkowego kontekstu kampanii."
-    canonical_names_context = build_canonical_names_context(collect_canonical_names(message, hits))
+    canonical_names = collect_canonical_names(message, hits)
 
-    prompt = build_pre_session_brief_prompt(
+    artifact_text = generate_structured_creative_artifact(
+        artifact_type="pre_session_brief",
         message=message,
         world_context=world_context,
         structured_context=structured_context,
         recent_sessions_context=recent_sessions_context,
-        canonical_names_context=canonical_names_context,
-    )
-    artifact_text = gemini_generate(
-        prompt,
-        response_mime_type="text/plain",
-        temperature=0.5,
-        max_output_tokens=2500,
-    ).strip()
-    repair_context = "\n\n".join(
-        [
-            "AKTUALNY MODEL SWIATA:",
-            structured_context,
-            "",
-            "OSTATNIE SESJE:",
-            recent_sessions_context,
-            "",
-            "RELEWANTNY KONTEKST KAMPANII:",
-            world_context,
-            "",
-            "NAZWY KANONICZNE:",
-            canonical_names_context,
-            "",
-            "PROSBA UZYTKOWNIKA:",
-            message,
-        ]
-    ).strip()
-    artifact_text = ensure_artifact_shape(
-        artifact_type="pre_session_brief",
-        text=artifact_text,
-        repair_context=repair_context,
+        canonical_names=canonical_names,
     )
     return artifact_text, render_source_labels(hits)
 
