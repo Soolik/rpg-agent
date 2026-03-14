@@ -1,11 +1,16 @@
+import asyncio
 import unittest
 
 from app.api_models import (
+    ConversationCreateRequest,
+    ConversationMessageCreateRequest,
     ProposalStatus,
     V1ArtifactGenerateRequest,
+    V1ChatRequest,
     WorldModelChangeDecisionRequest,
     WorldModelChangeProposalRequest,
 )
+from app.conversation_store import ConversationMessageRecord, ConversationRecord
 from app.chat_models import ChatRequest, ChatResponse
 from app.models_v2 import (
     ApplyChangesResponse,
@@ -193,8 +198,61 @@ class FakeApplier:
         )
 
 
+class FakeConversationStore:
+    def __init__(self):
+        self.conversations = {}
+        self.messages = {}
+        self.next_id = 1
+
+    def create_conversation(self, *, title="", metadata=None):
+        conversation_id = f"conv-{self.next_id}"
+        self.next_id += 1
+        record = ConversationRecord(
+            conversation_id=conversation_id,
+            campaign_id="kng",
+            title=title or "Nowa rozmowa",
+            message_count=0,
+            created_at="2026-03-14T00:00:00+00:00",
+            updated_at="2026-03-14T00:00:00+00:00",
+            last_message_at=None,
+            metadata=metadata or {},
+        )
+        self.conversations[conversation_id] = record
+        self.messages[conversation_id] = []
+        return record
+
+    def get_conversation(self, conversation_id):
+        return self.conversations.get(conversation_id)
+
+    def list_conversations(self, limit=20):
+        return list(self.conversations.values())[:limit]
+
+    def append_message(self, conversation_id, *, role, content, kind=None, artifact_type=None, metadata=None):
+        items = self.messages.setdefault(conversation_id, [])
+        message = ConversationMessageRecord(
+            message_id=len(items) + 1,
+            conversation_id=conversation_id,
+            campaign_id="kng",
+            role=role,
+            content=content,
+            kind=kind,
+            artifact_type=artifact_type,
+            created_at="2026-03-14T00:00:00+00:00",
+            metadata=metadata or {},
+        )
+        items.append(message)
+        convo = self.conversations[conversation_id]
+        convo.message_count = len(items)
+        convo.last_message_at = message.created_at
+        convo.updated_at = message.created_at
+        return message
+
+    def list_messages(self, conversation_id, limit=100):
+        return self.messages.get(conversation_id, [])[:limit]
+
+
 class RoutesV1Test(unittest.TestCase):
-    def build_router(self, chat_fn=None, workflow_store=None):
+    def build_router(self, chat_fn=None, workflow_store=None, conversation_store=None):
         return build_v1_router(
             chat_request_cls=ChatRequest,
             chat_fn=chat_fn or (lambda req: ChatResponse(kind="answer", reply="OK", references=[])),
@@ -203,6 +261,7 @@ class RoutesV1Test(unittest.TestCase):
             planner=FakePlanner(),
             workflow_store=workflow_store or FakeWorkflowStore(),
             world_model_store=FakeWorldModelStore(),
+            conversation_store=conversation_store or FakeConversationStore(),
             applier=FakeApplier(),
         )
 
@@ -212,6 +271,12 @@ class RoutesV1Test(unittest.TestCase):
                 return route.endpoint
         raise AssertionError(f"Route {method} {path} not found")
 
+    async def collect_stream(self, response):
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+        return "".join(chunks)
+
     def test_v1_health_returns_trace_fields(self):
         router = self.build_router()
 
@@ -220,6 +285,90 @@ class RoutesV1Test(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertTrue(body["request_id"])
         self.assertEqual(body["request_id"], body["trace_id"])
+
+    def test_v1_chat_auto_creates_conversation_and_persists_messages(self):
+        seen = {}
+
+        def fake_chat(req):
+            seen["message"] = req.message
+            seen["conversation_id"] = req.conversation_id
+            return ChatResponse(kind="answer", reply="Captain Mira pracuje z Red Blade.", references=[])
+
+        conversation_store = FakeConversationStore()
+        router = self.build_router(chat_fn=fake_chat, conversation_store=conversation_store)
+
+        body = self.route_endpoint(router, "/v1/chat", "POST")(
+            request=V1ChatRequest(message="Kim jest Captain Mira?")
+        ).model_dump(mode="json")
+
+        self.assertEqual(body["reply_markdown"], "Captain Mira pracuje z Red Blade.")
+        self.assertTrue(body["conversation_id"])
+        self.assertTrue(seen["conversation_id"])
+        self.assertEqual(seen["message"], "Kim jest Captain Mira?")
+        self.assertEqual(len(conversation_store.list_messages(body["conversation_id"])), 2)
+        self.assertTrue(any(action["type"] == "continue_conversation" for action in body["next_actions"]))
+
+    def test_v1_chat_uses_prior_messages_as_memory_context(self):
+        seen = {}
+
+        def fake_chat(req):
+            seen["message"] = req.message
+            return ChatResponse(kind="answer", reply="Kontynuacja.", references=[])
+
+        conversation_store = FakeConversationStore()
+        conversation = conversation_store.create_conversation(title="Red Blade", metadata={})
+        conversation_store.append_message(conversation.conversation_id, role="user", content="Powiedz mi o Red Blade.", kind="input")
+        conversation_store.append_message(conversation.conversation_id, role="assistant", content="To frakcja.", kind="answer")
+        router = self.build_router(chat_fn=fake_chat, conversation_store=conversation_store)
+
+        self.route_endpoint(router, "/v1/chat", "POST")(
+            request=V1ChatRequest(
+                conversation_id=conversation.conversation_id,
+                message="A jak to sie ma do Captain Mira?",
+            )
+        )
+
+        self.assertIn("KONTEKST ROZMOWY:", seen["message"])
+        self.assertIn("Powiedz mi o Red Blade.", seen["message"])
+        self.assertIn("A jak to sie ma do Captain Mira?", seen["message"])
+
+    def test_v1_chat_stream_returns_sse_events(self):
+        router = self.build_router(
+            chat_fn=lambda req: ChatResponse(kind="answer", reply="Pierwszy akapit.\n\nDrugi akapit.", references=[])
+        )
+
+        response = self.route_endpoint(router, "/v1/chat", "POST")(
+            request=V1ChatRequest(message="Stresc to", stream=True)
+        )
+        body = asyncio.run(self.collect_stream(response))
+
+        self.assertIn("event: start", body)
+        self.assertIn("event: delta", body)
+        self.assertIn("event: complete", body)
+        self.assertIn("Pierwszy akapit.", body)
+
+    def test_v1_conversation_routes_return_saved_history(self):
+        conversation_store = FakeConversationStore()
+        router = self.build_router(conversation_store=conversation_store)
+
+        create_body = self.route_endpoint(router, "/v1/conversations", "POST")(
+            request=ConversationCreateRequest(title="Plan sesji")
+        ).model_dump(mode="json")
+        conversation_id = create_body["conversation"]["conversation_id"]
+
+        self.route_endpoint(router, "/v1/conversations/{conversation_id}/messages", "POST")(
+            conversation_id=conversation_id,
+            request=ConversationMessageCreateRequest(message="Przygotuj 3 hooki."),
+        )
+
+        message_body = self.route_endpoint(router, "/v1/conversations/{conversation_id}/messages", "GET")(
+            conversation_id=conversation_id
+        ).model_dump(mode="json")
+
+        self.assertEqual(message_body["conversation_id"], conversation_id)
+        self.assertEqual(len(message_body["items"]), 2)
+        self.assertEqual(message_body["items"][0]["role"], "user")
+        self.assertEqual(message_body["items"][1]["role"], "assistant")
 
     def test_v1_artifact_generate_returns_continuity_report(self):
         def fake_chat(req):
@@ -250,6 +399,7 @@ class RoutesV1Test(unittest.TestCase):
             body = body.model_dump(mode="json")
 
         self.assertEqual(body["artifact_type"], "pre_session_brief")
+        self.assertEqual(body["artifact"]["artifact_type"], "pre_session_brief")
         self.assertFalse(body["continuity"]["ok"])
         self.assertIn("Skup", body["continuity"]["proposed_new_names"])
 

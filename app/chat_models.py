@@ -38,6 +38,8 @@ class ChatRequest(BaseModel):
     intent: ChatIntent = "auto"
     artifact_type: Optional[ArtifactType] = None
     source_title: Optional[str] = None
+    conversation_id: Optional[str] = None
+    conversation_title: Optional[str] = None
     include_sources: bool = False
     include_telemetry: bool = False
     save_output: bool = False

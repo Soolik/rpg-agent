@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 from .chat_models import ArtifactType, ChatIntent
+from .conversation_store import ConversationMessageRecord, ConversationRecord
 from .models_v2 import AppliedActionResult, DocumentAction, DocumentRef, WorldEntityRecord, WorldSessionRecord, WorldThreadRecord
 
 
@@ -30,6 +31,25 @@ class SavedOutputRef(BaseModel):
     doc_id: str
     title: str
     path: str
+
+
+class ChatArtifact(BaseModel):
+    artifact_type: ArtifactType
+    text: str
+    format: Literal["markdown", "plain_text"] = "markdown"
+
+
+class NextAction(BaseModel):
+    type: Literal[
+        "continue_conversation",
+        "revise",
+        "accept_world_change",
+        "reject_world_change",
+        "review_continuity",
+        "open_output_doc",
+    ]
+    label: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ContinuityIssue(BaseModel):
@@ -61,6 +81,9 @@ class V1ChatRequest(BaseModel):
     intent: ChatIntent = "auto"
     artifact_type: Optional[ArtifactType] = None
     source_title: Optional[str] = None
+    conversation_id: Optional[str] = None
+    conversation_title: Optional[str] = None
+    stream: bool = False
     include_sources: bool = False
     include_telemetry: bool = False
     save_output: bool = False
@@ -70,6 +93,9 @@ class V1ChatRequest(BaseModel):
 class V1ArtifactGenerateRequest(BaseModel):
     message: str = Field(..., min_length=1)
     artifact_type: ArtifactType
+    conversation_id: Optional[str] = None
+    conversation_title: Optional[str] = None
+    stream: bool = False
     include_telemetry: bool = False
     save_output: bool = False
     output_title: Optional[str] = None
@@ -78,6 +104,9 @@ class V1ArtifactGenerateRequest(BaseModel):
 
 class V1SessionPrepRequest(BaseModel):
     message: str = Field(..., min_length=1)
+    conversation_id: Optional[str] = None
+    conversation_title: Optional[str] = None
+    stream: bool = False
     include_telemetry: bool = False
     save_output: bool = False
     output_title: Optional[str] = None
@@ -86,15 +115,50 @@ class V1SessionPrepRequest(BaseModel):
 class V1ChatResponse(RequestTrace):
     kind: Literal["answer", "proposal", "session_sync", "creative"]
     reply: str
+    reply_markdown: str
+    title: Optional[str] = None
+    conversation_id: Optional[str] = None
+    conversation_title: Optional[str] = None
     artifact_type: Optional[ArtifactType] = None
     artifact_text: Optional[str] = None
+    artifact: Optional[ChatArtifact] = None
     proposal_id: Optional[int] = None
     session_id: Optional[int] = None
     citations: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
+    next_actions: List[NextAction] = Field(default_factory=list)
     output: Optional[SavedOutputRef] = None
     telemetry: Optional[Dict[str, Any]] = None
     continuity: Optional[ContinuityReport] = None
+
+
+class ConversationCreateRequest(BaseModel):
+    title: Optional[str] = None
+
+
+class ConversationMessageCreateRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+    intent: ChatIntent = "auto"
+    artifact_type: Optional[ArtifactType] = None
+    source_title: Optional[str] = None
+    stream: bool = False
+    include_sources: bool = False
+    include_telemetry: bool = False
+    save_output: bool = False
+    output_title: Optional[str] = None
+
+
+class ConversationResponse(RequestTrace):
+    conversation: ConversationRecord
+
+
+class ConversationListResponse(RequestTrace):
+    items: List[ConversationRecord] = Field(default_factory=list)
+
+
+class ConversationMessageListResponse(RequestTrace):
+    conversation_id: str
+    items: List[ConversationMessageRecord] = Field(default_factory=list)
 
 
 class WorldModelEntityListResponse(RequestTrace):

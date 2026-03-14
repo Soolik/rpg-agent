@@ -36,6 +36,7 @@ from app.chat_models import (
     SessionPatch,
     ThreadPatch,
 )
+from app.conversation_store import ConversationStore
 from app.creative_artifacts import (
     append_missing_artifact_sections,
     artifact_required_markers,
@@ -2535,6 +2536,12 @@ def build_world_model_store() -> Optional[WorldModelStore]:
     return WorldModelStore(campaign_id=CAMPAIGN_ID, connection_factory=db_conn)
 
 
+def build_conversation_store() -> Optional[ConversationStore]:
+    if not DB_URL:
+        return None
+    return ConversationStore(campaign_id=CAMPAIGN_ID, connection_factory=db_conn)
+
+
 def doc_type_for_indexing(doc: WorldDocInfo) -> str:
     if doc.title == "Thread Tracker":
         return "threads"
@@ -2664,6 +2671,7 @@ def reindex_after_apply_default(targets: List[DocumentRef]) -> Dict[str, Any]:
 drive_store_v2 = build_drive_store()
 workflow_store_v2 = build_workflow_store()
 world_model_store_v2 = build_world_model_store()
+conversation_store_v1 = build_conversation_store()
 planner_v2 = PlannerService(generate_text_fn=planner_generate_json)
 consistency_planner_v2 = PlannerService(generate_text_fn=planner_generate_text)
 proposal_applier_v2 = ProposalApplier(drive_store=drive_store_v2, reindex_fn=reindex_after_apply_default)
@@ -2687,6 +2695,7 @@ app.include_router(
         planner=planner_v2,
         workflow_store=workflow_store_v2,
         world_model_store=world_model_store_v2,
+        conversation_store=conversation_store_v1,
         applier=proposal_applier_v2,
     )
 )
