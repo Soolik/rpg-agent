@@ -2,6 +2,7 @@ import asyncio
 import unittest
 
 from app.api_models import (
+    AssistantMode,
     ConversationCreateRequest,
     ConversationMessageCreateRequest,
     ProposalStatus,
@@ -50,6 +51,9 @@ class FakePlanner:
             ],
             needs_confirmation=True,
         )
+
+    def consistency_check(self, instruction, world_context):
+        return "Konfliktow krytycznych brak, ale pojawia sie nowa nazwa wlasna do decyzji."
 
 
 class FakeWorldModelStore:
@@ -346,6 +350,57 @@ class RoutesV1Test(unittest.TestCase):
         self.assertIn("event: delta", body)
         self.assertIn("event: complete", body)
         self.assertIn("Pierwszy akapit.", body)
+
+    def test_v1_guard_mode_returns_guard_report_without_calling_chat(self):
+        def fail_chat(_req):
+            raise AssertionError("chat_fn should not be called for guard mode")
+
+        router = self.build_router(chat_fn=fail_chat)
+
+        body = self.route_endpoint(router, "/v1/chat", "POST")(
+            request=V1ChatRequest(
+                message="Sprawdz zgodnosc tego opisu z kanonem.",
+                mode=AssistantMode.guard,
+                candidate_text=(
+                    "* **Captain Mira** - zawarla pakt przeciw Red Blade.\n"
+                    "* **Skup** - wchodzi do gry jako nowa frakcja."
+                ),
+            )
+        ).model_dump(mode="json")
+
+        self.assertEqual(body["mode"], AssistantMode.guard.value)
+        self.assertEqual(body["kind"], "answer")
+        self.assertFalse(body["continuity"]["ok"])
+        self.assertIn("Skup", body["continuity"]["proposed_new_names"])
+        self.assertIn("Guard Report", body["reply_markdown"])
+        self.assertIn("Konfliktow krytycznych brak", body["reply_markdown"])
+
+    def test_v1_editor_mode_forces_proposal_intent(self):
+        seen = {}
+
+        def fake_chat(req):
+            seen["intent"] = req.intent
+            return ChatResponse(
+                kind="proposal",
+                reply="Plan zmian gotowy.",
+                proposal_id=44,
+                references=[],
+            )
+
+        router = self.build_router(chat_fn=fake_chat)
+
+        body = self.route_endpoint(router, "/v1/chat", "POST")(
+            request=V1ChatRequest(
+                message="Dodaj nowego NPC powiazanego z Red Blade.",
+                mode=AssistantMode.editor,
+            )
+        ).model_dump(mode="json")
+
+        self.assertEqual(seen["intent"], "proposal")
+        self.assertEqual(body["mode"], AssistantMode.editor.value)
+        self.assertEqual(body["proposal_id"], 44)
+        self.assertTrue(any(action["type"] == "accept_world_change" for action in body["next_actions"]))
+        self.assertTrue(any(action["type"] == "reject_world_change" for action in body["next_actions"]))
 
     def test_v1_conversation_routes_return_saved_history(self):
         conversation_store = FakeConversationStore()

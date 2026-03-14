@@ -22,6 +22,12 @@ class ProposalType(str, Enum):
     world_model_change = "world_model_change"
 
 
+class AssistantMode(str, Enum):
+    create = "create"
+    guard = "guard"
+    editor = "editor"
+
+
 class RequestTrace(BaseModel):
     request_id: str
     trace_id: str
@@ -78,9 +84,11 @@ class V1HealthResponse(RequestTrace):
 
 class V1ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
+    mode: AssistantMode = AssistantMode.create
     intent: ChatIntent = "auto"
     artifact_type: Optional[ArtifactType] = None
     source_title: Optional[str] = None
+    candidate_text: Optional[str] = None
     conversation_id: Optional[str] = None
     conversation_title: Optional[str] = None
     stream: bool = False
@@ -114,6 +122,7 @@ class V1SessionPrepRequest(BaseModel):
 
 class V1ChatResponse(RequestTrace):
     kind: Literal["answer", "proposal", "session_sync", "creative"]
+    mode: AssistantMode = AssistantMode.create
     reply: str
     reply_markdown: str
     title: Optional[str] = None
@@ -138,9 +147,11 @@ class ConversationCreateRequest(BaseModel):
 
 class ConversationMessageCreateRequest(BaseModel):
     message: str = Field(..., min_length=1)
+    mode: AssistantMode = AssistantMode.create
     intent: ChatIntent = "auto"
     artifact_type: Optional[ArtifactType] = None
     source_title: Optional[str] = None
+    candidate_text: Optional[str] = None
     stream: bool = False
     include_sources: bool = False
     include_telemetry: bool = False

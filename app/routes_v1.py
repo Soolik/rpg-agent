@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from .api_models import (
+    AssistantMode,
     ChatArtifact,
     ContinuityReport,
     ConversationCreateRequest,
@@ -245,6 +246,7 @@ def _chat_response_v1(
     message: str,
     response: ChatResponse,
     world_model_store: WorldModelStore | NullWorldModelStore,
+    mode: AssistantMode = AssistantMode.create,
     conversation_id: Optional[str] = None,
     conversation_title: Optional[str] = None,
 ) -> V1ChatResponse:
@@ -258,6 +260,7 @@ def _chat_response_v1(
         request_id=trace.request_id,
         trace_id=trace.trace_id,
         kind=response.kind,
+        mode=mode,
         reply=response.reply,
         reply_markdown=reply_markdown,
         title=_derive_response_title(response),
@@ -277,6 +280,146 @@ def _chat_response_v1(
         ),
         output=_saved_output_from_chat(response),
         telemetry=response.telemetry,
+        continuity=continuity,
+    )
+
+
+def _guard_context_instruction(message: str, candidate_text: str) -> str:
+    return (
+        f"{message.strip()}\n\n"
+        "KANDYDAT DO WALIDACJI:\n"
+        f"{candidate_text.strip()}"
+    ).strip()
+
+
+def _render_guard_reply(
+    *,
+    candidate_text: str,
+    continuity: ContinuityReport,
+    planner_notes: Optional[str],
+) -> str:
+    lines = ["# Guard Report", ""]
+
+    if continuity.ok:
+        lines.extend(
+            [
+                "## Werdykt",
+                "",
+                "- Nie wykryto oczywistych konfliktow z kanonem ani nowych nazw wlasnych wymagajacych decyzji.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "## Werdykt",
+                "",
+                f"- Wykryto {len(continuity.issues)} sygnalow do sprawdzenia.",
+            ]
+        )
+        for issue in continuity.issues[:8]:
+            lines.append(f"- [{issue.severity}] {issue.message}")
+
+    if continuity.source_backed_names:
+        lines.extend(
+            [
+                "",
+                "## Nazwy Potwierdzone",
+                "",
+            ]
+        )
+        lines.extend(f"- {name}" for name in continuity.source_backed_names[:10])
+
+    if continuity.proposed_new_names:
+        lines.extend(
+            [
+                "",
+                "## Nowe Nazwy",
+                "",
+            ]
+        )
+        lines.extend(f"- {name}" for name in continuity.proposed_new_names[:10])
+
+    if continuity.possible_conflicts:
+        lines.extend(
+            [
+                "",
+                "## Mozliwe Konflikty",
+                "",
+            ]
+        )
+        lines.extend(f"- {item}" for item in continuity.possible_conflicts[:10])
+
+    if planner_notes:
+        lines.extend(
+            [
+                "",
+                "## Notatki Guard",
+                "",
+                planner_notes.strip(),
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Sprawdzany Tekst",
+            "",
+            candidate_text.strip(),
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
+def _build_guard_response(
+    *,
+    trace: RequestTrace,
+    message: str,
+    candidate_text: str,
+    world_model_store: WorldModelStore | NullWorldModelStore,
+    planner_notes: Optional[str],
+    conversation_id: Optional[str] = None,
+    conversation_title: Optional[str] = None,
+) -> V1ChatResponse:
+    entities = world_model_store.list_entities(limit=200)
+    threads = world_model_store.list_threads(limit=200)
+    continuity = build_continuity_report(
+        message=message,
+        generated_text=candidate_text,
+        known_entity_names=[entity.name for entity in entities],
+        known_thread_names=[thread.title for thread in threads],
+        extra_allowed_names=[],
+        allow_proposed_new_names=False,
+    )
+    reply_markdown = _render_guard_reply(
+        candidate_text=candidate_text,
+        continuity=continuity,
+        planner_notes=planner_notes,
+    )
+    pseudo_response = ChatResponse(
+        kind="answer",
+        reply=reply_markdown,
+        references=[],
+        warnings=[],
+    )
+    return V1ChatResponse(
+        request_id=trace.request_id,
+        trace_id=trace.trace_id,
+        kind="answer",
+        mode=AssistantMode.guard,
+        reply=reply_markdown,
+        reply_markdown=reply_markdown,
+        title="Guard Report",
+        conversation_id=conversation_id,
+        conversation_title=conversation_title,
+        citations=[],
+        warnings=[],
+        next_actions=_next_actions_for_response(
+            response=pseudo_response,
+            continuity=continuity,
+            conversation_id=conversation_id,
+        ),
+        output=None,
+        telemetry=None,
         continuity=continuity,
     )
 
@@ -463,12 +606,16 @@ def _run_chat_request(
     trace: RequestTrace,
     chat_request_cls: Type[ChatRequest],
     chat_fn: Callable[[ChatRequest], ChatResponse],
+    drive_store,
+    consistency_planner,
     world_model_store: WorldModelStore | NullWorldModelStore,
     conversation_store: ConversationStore | NullConversationStore,
     message: str,
+    assistant_mode: AssistantMode,
     intent: str,
     artifact_type: Optional[str],
     source_title: Optional[str],
+    candidate_text: Optional[str],
     include_sources: bool,
     include_telemetry: bool,
     save_output: bool,
@@ -492,31 +639,57 @@ def _run_chat_request(
             content=message,
             kind="input",
             artifact_type=artifact_type,
-            metadata={"source_title": source_title},
+            metadata={
+                "source_title": source_title,
+                "assistant_mode": assistant_mode.value,
+                "candidate_text": candidate_text,
+            },
         )
 
-    response = chat_fn(
-        chat_request_cls(
-            message=_compose_message_with_history(message, history),
-            intent=intent,
-            artifact_type=artifact_type,
-            source_title=source_title,
+    composed_message = _compose_message_with_history(message, history)
+
+    if assistant_mode == AssistantMode.guard:
+        checked_text = (candidate_text or message).strip()
+        planner_notes = None
+        if consistency_planner and hasattr(consistency_planner, "consistency_check"):
+            planner_notes = consistency_planner.consistency_check(
+                instruction=_guard_context_instruction(composed_message, checked_text),
+                world_context=build_context_for_planner(drive_store),
+            )
+        rendered = _build_guard_response(
+            trace=trace,
+            message=message,
+            candidate_text=checked_text,
+            world_model_store=world_model_store,
+            planner_notes=planner_notes,
             conversation_id=conversation.conversation_id if conversation else None,
-            conversation_title=conversation.title if conversation else conversation_title,
-            include_sources=include_sources,
-            include_telemetry=include_telemetry,
-            save_output=save_output,
-            output_title=output_title,
+            conversation_title=conversation.title if conversation else None,
         )
-    )
-    rendered = _chat_response_v1(
-        trace=trace,
-        message=message,
-        response=response,
-        world_model_store=world_model_store,
-        conversation_id=conversation.conversation_id if conversation else None,
-        conversation_title=conversation.title if conversation else None,
-    )
+    else:
+        effective_intent = "proposal" if assistant_mode == AssistantMode.editor else intent
+        response = chat_fn(
+            chat_request_cls(
+                message=composed_message,
+                intent=effective_intent,
+                artifact_type=artifact_type,
+                source_title=source_title,
+                conversation_id=conversation.conversation_id if conversation else None,
+                conversation_title=conversation.title if conversation else conversation_title,
+                include_sources=include_sources,
+                include_telemetry=include_telemetry,
+                save_output=save_output,
+                output_title=output_title,
+            )
+        )
+        rendered = _chat_response_v1(
+            trace=trace,
+            message=message,
+            response=response,
+            world_model_store=world_model_store,
+            mode=assistant_mode,
+            conversation_id=conversation.conversation_id if conversation else None,
+            conversation_title=conversation.title if conversation else None,
+        )
 
     if conversation:
         conversation_store.append_message(
@@ -529,6 +702,7 @@ def _run_chat_request(
                 "proposal_id": rendered.proposal_id,
                 "session_id": rendered.session_id,
                 "continuity_ok": rendered.continuity.ok if rendered.continuity else None,
+                "assistant_mode": rendered.mode.value,
             },
         )
 
@@ -542,6 +716,7 @@ def build_v1_router(
     health_fn: Callable[[], dict],
     drive_store,
     planner,
+    consistency_planner=None,
     workflow_store: Optional[WorkflowStore | NullWorkflowStore] = None,
     world_model_store: Optional[WorldModelStore | NullWorldModelStore] = None,
     conversation_store: Optional[ConversationStore | NullConversationStore] = None,
@@ -551,6 +726,7 @@ def build_v1_router(
     store = workflow_store or NullWorkflowStore()
     model_store = world_model_store or NullWorldModelStore()
     convo_store = conversation_store or NullConversationStore()
+    guard_planner = consistency_planner or planner
     proposal_applier = applier or ProposalApplier(drive_store=drive_store)
 
     @router.get("/health", response_model=V1HealthResponse)
@@ -659,12 +835,16 @@ def build_v1_router(
             trace=trace,
             chat_request_cls=chat_request_cls,
             chat_fn=chat_fn,
+            drive_store=drive_store,
+            consistency_planner=guard_planner,
             world_model_store=model_store,
             conversation_store=convo_store,
             message=request.message,
+            assistant_mode=request.mode,
             intent=request.intent,
             artifact_type=request.artifact_type,
             source_title=request.source_title,
+            candidate_text=request.candidate_text,
             include_sources=request.include_sources,
             include_telemetry=request.include_telemetry,
             save_output=request.save_output,
@@ -683,12 +863,16 @@ def build_v1_router(
             trace=trace,
             chat_request_cls=chat_request_cls,
             chat_fn=chat_fn,
+            drive_store=drive_store,
+            consistency_planner=guard_planner,
             world_model_store=model_store,
             conversation_store=convo_store,
             message=request.message,
+            assistant_mode=request.mode,
             intent=request.intent,
             artifact_type=request.artifact_type,
             source_title=request.source_title,
+            candidate_text=request.candidate_text,
             include_sources=request.include_sources,
             include_telemetry=request.include_telemetry,
             save_output=request.save_output,
@@ -707,12 +891,16 @@ def build_v1_router(
             trace=trace,
             chat_request_cls=chat_request_cls,
             chat_fn=chat_fn,
+            drive_store=drive_store,
+            consistency_planner=guard_planner,
             world_model_store=model_store,
             conversation_store=convo_store,
             message=request.message,
+            assistant_mode=AssistantMode.create,
             intent="auto",
             artifact_type=request.artifact_type,
             source_title=None,
+            candidate_text=None,
             include_sources=request.include_sources,
             include_telemetry=request.include_telemetry,
             save_output=request.save_output,
@@ -731,12 +919,16 @@ def build_v1_router(
             trace=trace,
             chat_request_cls=chat_request_cls,
             chat_fn=chat_fn,
+            drive_store=drive_store,
+            consistency_planner=guard_planner,
             world_model_store=model_store,
             conversation_store=convo_store,
             message=request.message,
+            assistant_mode=AssistantMode.create,
             intent="auto",
             artifact_type="pre_session_brief",
             source_title=None,
+            candidate_text=None,
             include_sources=False,
             include_telemetry=request.include_telemetry,
             save_output=request.save_output,

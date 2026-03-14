@@ -2693,6 +2693,7 @@ app.include_router(
         health_fn=lambda: health(),
         drive_store=drive_store_v2,
         planner=planner_v2,
+        consistency_planner=consistency_planner_v2,
         workflow_store=workflow_store_v2,
         world_model_store=world_model_store_v2,
         conversation_store=conversation_store_v1,
