@@ -179,6 +179,104 @@ def _normalized(text: str) -> str:
     )
 
 
+def _extract_latest_user_message(message: str) -> str:
+    marker = "NOWA WIADOMOSC UZYTKOWNIKA:"
+    if marker not in (message or ""):
+        return (message or "").strip()
+    tail = (message or "").split(marker, 1)[1]
+    tail = tail.split("Odpowiedz na ostatnia wiadomosc", 1)[0]
+    return tail.strip()
+
+
+def _requested_character_pack(message_norm: str) -> bool:
+    return any(
+        phrase in message_norm
+        for phrase in ("3 postacie", "trzy postacie", "2 postacie", "dwie postacie", "pakiet postaci", "obsade postaci")
+    )
+
+
+def _infer_wrapped_followup_artifact_type(message: str) -> Optional[ArtifactType]:
+    message_norm = _normalized(message)
+    if "kontekst rozmowy" not in message_norm or "nowa wiadomosc uzytkownika" not in message_norm:
+        return None
+
+    latest_norm = _normalized(_extract_latest_user_message(message))
+    if not latest_norm or "?" in latest_norm:
+        return None
+
+    family = None
+    if any(marker in message_norm for marker in ("imie", "jak uzyc tej postaci na sesji", "relacje", "postac 1", "jak ich odroznic na sesji")):
+        family = "npc"
+    elif any(marker in message_norm for marker in ("nazwa", "typ miejsca", "sekret miejsca", "jak uzyc na sesji")):
+        family = "location"
+    if not family:
+        return None
+
+    continuation_prefixes = (
+        "a teraz",
+        "teraz",
+        "dobra a teraz",
+        "no to teraz",
+        "to teraz",
+        "jeszcze",
+        "inna",
+        "inny",
+        "kolejna",
+        "kolejny",
+        "druga",
+        "drugi",
+        "poprosze",
+    )
+    short_followup = len(latest_norm.split()) <= 8 and len(latest_norm) <= 80
+    continuation = short_followup or any(latest_norm.startswith(prefix) for prefix in continuation_prefixes)
+    if not continuation:
+        return None
+
+    if family == "npc":
+        if _requested_character_pack(latest_norm):
+            return "npc_pack"
+        npc_hints = (
+            "postac",
+            "npc",
+            "pirat",
+            "piracka",
+            "wojownik",
+            "wojowniczka",
+            "mag",
+            "czarodziej",
+            "czarodziejka",
+            "rybak",
+            "kapitan",
+            "kapitanka",
+            "nawigator",
+            "bosman",
+            "szkutnik",
+        )
+        if any(hint in latest_norm for hint in npc_hints):
+            return "npc_brief"
+        if any(phrase in latest_norm for phrase in ("inna postac", "inny npc", "kolejna postac", "jeszcze jedna")):
+            return "npc_brief"
+
+    if family == "location":
+        location_hints = (
+            "miejsce",
+            "lokacja",
+            "wyspa",
+            "klif",
+            "klify",
+            "jaskinia",
+            "zatoka",
+            "przystan",
+            "dzielnica",
+            "ruiny",
+        )
+        if any(hint in latest_norm for hint in location_hints):
+            return "location_brief"
+        if any(phrase in latest_norm for phrase in ("inne miejsce", "inna lokacja", "kolejne miejsce", "jeszcze jedno")):
+            return "location_brief"
+    return None
+
+
 def _infer_artifact_type(message_norm: str, requested_artifact_type: Optional[str]) -> Optional[ArtifactType]:
     if requested_artifact_type:
         return requested_artifact_type  # type: ignore[return-value]
@@ -226,8 +324,9 @@ class TaskRouter:
         requested_output_title: Optional[str],
         candidate_text: Optional[str],
     ) -> TaskSpec:
-        message_norm = _normalized(message)
-        artifact_type = _infer_artifact_type(message_norm, requested_artifact_type)
+        latest_message = _extract_latest_user_message(message)
+        message_norm = _normalized(latest_message)
+        artifact_type = _infer_wrapped_followup_artifact_type(message) or _infer_artifact_type(message_norm, requested_artifact_type)
         editor_hint = any(hint in message_norm for hint in EDITOR_HINTS) or (
             "kanon" in message_norm and any(verb in message_norm for verb in EDITOR_VERBS)
         ) or (

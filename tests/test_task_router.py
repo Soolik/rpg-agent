@@ -106,6 +106,31 @@ class TaskRouterTest(unittest.TestCase):
         self.assertEqual(spec.chat_intent, "creative")
         self.assertEqual(spec.artifact_type, "location_brief")
 
+    def test_classify_wrapped_followup_after_npc_pack_as_npc_brief(self):
+        router = TaskRouter()
+        wrapped = (
+            "KONTEKST ROZMOWY:\n"
+            "Uzytkownik: Wymysl mi 3 postacie do Portu Peril.\n"
+            "Asystent: Motyw przewodni:\nPortowi wyrzutkowie.\n\nPostac 1:\nImie: Mara Flint\n\n"
+            "NOWA WIADOMOSC UZYTKOWNIKA:\n"
+            "Dobra, a teraz rybak.\n\n"
+            "Odpowiedz na ostatnia wiadomosc, zachowujac ciaglosc rozmowy i kanonu."
+        )
+
+        spec = router.classify(
+            message=wrapped,
+            requested_mode=AssistantMode.auto,
+            requested_intent="auto",
+            requested_artifact_type=None,
+            requested_save_output=False,
+            requested_output_title=None,
+            candidate_text=None,
+        )
+
+        self.assertEqual(spec.task_type, TaskType.create_artifact)
+        self.assertEqual(spec.chat_intent, "creative")
+        self.assertEqual(spec.artifact_type, "npc_brief")
+
 
 if __name__ == "__main__":
     unittest.main()
