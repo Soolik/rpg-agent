@@ -356,6 +356,53 @@ class ChatServiceTest(unittest.TestCase):
         self.assertEqual(response.conversation_title, "Krew Na Gwiazdach: opis kampanii")
         self.assertEqual(store.get_conversation(conversation.conversation_id).title, "Krew Na Gwiazdach: opis kampanii")
 
+    def test_run_infers_creative_followup_from_prior_artifact_in_conversation(self):
+        seen = {}
+
+        def fake_chat(req):
+            seen["intent"] = req.intent
+            seen["artifact_type"] = req.artifact_type
+            seen["message"] = req.message
+            return ChatResponse(
+                kind="creative",
+                reply="Imie: Brann Torsk",
+                artifact_type=req.artifact_type,
+                artifact_text="Imie: Brann Torsk",
+                references=[],
+            )
+
+        store = FakeConversationStore()
+        conversation = store.create_conversation(title="Port Peril", metadata={})
+        store.append_message(conversation.conversation_id, role="user", content="Wymysl mi 3 postacie do Portu Peril.", kind="input")
+        store.append_message(
+            conversation.conversation_id,
+            role="assistant",
+            content="Motyw przewodni:\nPortowi rozbitkowie.\n\nPostac 1:\nImie: Mara Flint",
+            kind="creative",
+            artifact_type="npc_pack",
+        )
+
+        service = self.build_service(fake_chat, store)
+        response = service.run(
+            trace=RequestTrace(request_id="req-9", trace_id="req-9"),
+            message="Dobra, a teraz rybak.",
+            assistant_mode=AssistantMode.auto,
+            intent="auto",
+            artifact_type=None,
+            source_title=None,
+            candidate_text=None,
+            include_sources=False,
+            include_telemetry=False,
+            save_output=False,
+            output_title=None,
+            conversation_id=conversation.conversation_id,
+            conversation_title=None,
+        )
+
+        self.assertEqual(seen["intent"], "creative")
+        self.assertEqual(seen["artifact_type"], "npc_brief")
+        self.assertEqual(response.kind, "creative")
+
 
 if __name__ == "__main__":
     unittest.main()

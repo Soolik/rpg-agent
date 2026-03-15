@@ -1276,8 +1276,155 @@ ODPOWIEDŹ:
 """.strip()
 
 
+CREATIVE_FOLLOWUP_PREFIXES = (
+    "a teraz",
+    "teraz",
+    "dobra a teraz",
+    "no to teraz",
+    "to teraz",
+    "jeszcze",
+    "inna",
+    "inny",
+    "kolejna",
+    "kolejny",
+    "druga",
+    "drugi",
+    "poprosze",
+)
+
+NPC_ROLE_FOLLOWUP_HINTS = (
+    "postac",
+    "npc",
+    "pirat",
+    "piracka",
+    "wojownik",
+    "wojowniczka",
+    "mag",
+    "czarodziej",
+    "czarodziejka",
+    "rybak",
+    "kapitan",
+    "kapitanka",
+    "nawigator",
+    "bosman",
+    "szkutnik",
+    "uzdrowiciel",
+    "wrozbitka",
+)
+
+LOCATION_FOLLOWUP_HINTS = (
+    "miejsce",
+    "lokacja",
+    "lokacje",
+    "wyspa",
+    "klif",
+    "klify",
+    "jaskinia",
+    "zatoka",
+    "przystan",
+    "dzielnica",
+    "ruiny",
+)
+
+CHARACTER_COUNT_WORDS = {
+    "2": 2,
+    "dwa": 2,
+    "dwie": 2,
+    "3": 3,
+    "trzy": 3,
+    "4": 4,
+    "cztery": 4,
+    "5": 5,
+    "piec": 5,
+    "6": 6,
+    "szesc": 6,
+}
+
+
+def normalize_followup_signal_text(value: str) -> str:
+    normalized = normalize_creative_request_text(value)
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+    return " ".join(normalized.split())
+
+
+def extract_requested_character_count(message: str) -> Optional[int]:
+    latest = normalize_followup_signal_text(extract_latest_user_message(message) or message)
+    if not latest:
+        return None
+    match = re.search(
+        r"\b(\d+|dwa|dwie|trzy|cztery|piec|szesc)\s+(?:rozne\s+|inne\s+|nowe\s+)?(?:postacie|postac|npc|bohaterow|bohaterki|bohatera)\b",
+        latest,
+    )
+    if not match:
+        return None
+    token = match.group(1)
+    count = int(token) if token.isdigit() else CHARACTER_COUNT_WORDS.get(token)
+    if count is None or count < 2:
+        return None
+    return min(count, 6)
+
+
+def is_multi_character_request(message: str) -> bool:
+    latest = normalize_followup_signal_text(extract_latest_user_message(message) or message)
+    if not latest:
+        return False
+    if extract_requested_character_count(message):
+        return True
+    return any(
+        phrase in latest
+        for phrase in ("pakiet postaci", "ekipe postaci", "obsade postaci", "trio npc", "trio postaci")
+    )
+
+
+def is_location_brief_request(message: str) -> bool:
+    latest = normalize_followup_signal_text(extract_latest_user_message(message) or message)
+    if not latest:
+        return False
+    has_creation_verb = any(verb in latest for verb in ("wymysl", "wmymysl", "pomysl", "zaproponuj", "stworz"))
+    has_location_noun = any(noun in latest for noun in LOCATION_FOLLOWUP_HINTS)
+    return has_creation_verb and has_location_noun
+
+
+def infer_prior_creative_family(message: str) -> Optional[str]:
+    normalized = normalize_text_artifacts(message or "")
+    if "KONTEKST ROZMOWY:" not in normalized and "PODSUMOWANIE ROZMOWY:" not in normalized:
+        return None
+    lowered = normalize_followup_signal_text(normalized)
+    if any(marker in lowered for marker in ("imie", "jak uzyc tej postaci na sesji", "relacje", "postac 1", "jak ich odroznic na sesji")):
+        return "npc"
+    if any(marker in lowered for marker in ("nazwa", "typ miejsca", "sekret miejsca", "jak uzyc na sesji")):
+        return "location"
+    return None
+
+
+def infer_creative_followup_artifact_type(message: str) -> Optional[ArtifactType]:
+    family = infer_prior_creative_family(message)
+    if not family:
+        return None
+    latest_raw = extract_latest_user_message(message) or message
+    latest = normalize_followup_signal_text(latest_raw)
+    if not latest or "?" in latest_raw:
+        return None
+    tokens = latest.split()
+    short_followup = len(tokens) <= 8 and len(latest) <= 80
+    continuation = short_followup or any(latest.startswith(prefix) for prefix in CREATIVE_FOLLOWUP_PREFIXES)
+    if family == "npc" and continuation:
+        if is_multi_character_request(message):
+            return "npc_pack"
+        if any(hint in latest for hint in NPC_ROLE_FOLLOWUP_HINTS):
+            return "npc_brief"
+        if any(phrase in latest for phrase in ("inna postac", "inny npc", "kolejna postac", "jeszcze jedna")):
+            return "npc_brief"
+    if family == "location" and continuation:
+        if any(hint in latest for hint in LOCATION_FOLLOWUP_HINTS):
+            return "location_brief"
+        if any(phrase in latest for phrase in ("inne miejsce", "inna lokacja", "kolejne miejsce", "jeszcze jedno")):
+            return "location_brief"
+    return None
+
+
 def detect_chat_intent(message: str) -> Literal["answer", "proposal", "session_sync", "creative"]:
-    text = (message or "").strip()
+    text = (extract_latest_user_message(message) or message or "").strip()
     lowered = text.lower()
 
     creative_markers = [
@@ -1301,6 +1448,10 @@ def detect_chat_intent(message: str) -> Literal["answer", "proposal", "session_s
         "npc brief",
     ]
     if any(marker in lowered for marker in creative_markers):
+        return "creative"
+    if infer_creative_followup_artifact_type(message):
+        return "creative"
+    if infer_artifact_type(message, None) in {"session_hooks", "scene_seed", "npc_brief", "npc_pack", "location_brief", "twist_pack"}:
         return "creative"
 
     proposal_markers = [
@@ -1436,11 +1587,18 @@ PROPER_NOUN_IGNORE_KEYS = {
     "hook",
     "hooks",
     "imie",
+    "jak ich odroznic na sesji",
+    "jak uzyc na sesji",
     "jak uzyc tej postaci na sesji",
     "key npcs and factions",
     "mg",
+    "motyw przewodni",
+    "nazwa",
     "npc",
     "pierwsze wrazenie",
+    "postac 1",
+    "postac 2",
+    "postac 3",
     "prep checklist",
     "pre-session brief",
     "pre session brief",
@@ -1449,8 +1607,10 @@ PROPER_NOUN_IGNORE_KEYS = {
     "rola w kampanii",
     "scene opportunities",
     "sekret",
+    "sekret miejsca",
     "stworz",
     "stawki",
+    "typ miejsca",
     "tytul",
     "wymy",
     "wymysl",
@@ -1503,11 +1663,19 @@ def message_requests_original_character(message: str) -> bool:
     normalized = normalize_creative_request_text(latest)
     if not normalized:
         return False
-    if "npc brief" in normalized and any(token in normalized for token in ("nowy", "nowego", "inna", "inna postac", "wymysl", "stworz")):
+    if "npc brief" in normalized and any(token in normalized for token in ("nowy", "nowego", "inna", "inna postac", "wymysl", "wmymysl", "stworz")):
         return True
-    return any(verb in normalized for verb in ("wymysl", "pomysl", "zaproponuj", "stworz")) and any(
-        noun in normalized for noun in ("postac", "bohatera", "bohaterke", "pirata", "piratke", "kapitana", "kapitanke", "npc")
+    return any(verb in normalized for verb in ("wymysl", "wmymysl", "pomysl", "zaproponuj", "stworz")) and any(
+        noun in normalized for noun in ("postac", "postacie", "bohatera", "bohaterke", "pirata", "piratke", "kapitana", "kapitanke", "npc", "rybaka", "maga", "wojownika")
     )
+
+
+def message_requests_original_location(message: str) -> bool:
+    latest = extract_latest_user_message(message) or message
+    normalized = normalize_creative_request_text(latest)
+    if not normalized:
+        return False
+    return is_location_brief_request(latest)
 
 
 def extract_recent_generated_character_names(message: str, limit: int = 8) -> List[str]:
@@ -1551,6 +1719,28 @@ def should_use_setting_only_creative_context(message: str, canonical_names: List
     if not meaningful_names:
         return True
     return all(name in NPC_BROAD_SETTING_ANCHORS for name in meaningful_names)
+
+
+def should_use_setting_only_creative_context_for_artifact(
+    artifact_type: Optional[ArtifactType],
+    message: str,
+    canonical_names: List[str],
+) -> bool:
+    if artifact_type in {"npc_brief", "npc_pack"}:
+        return should_use_setting_only_creative_context(message, canonical_names)
+    if artifact_type == "location_brief":
+        if not message_requests_original_location(message):
+            return False
+        meaningful_names = []
+        for name in canonical_names:
+            normalized = normalize_creative_request_text(name)
+            if not normalized or normalized.startswith("wymy"):
+                continue
+            meaningful_names.append(normalized)
+        if not meaningful_names:
+            return True
+        return all(name in NPC_BROAD_SETTING_ANCHORS for name in meaningful_names)
+    return False
 
 
 def collect_disallowed_character_names(
@@ -1653,6 +1843,8 @@ def build_original_character_guidance(
         [
             "To ma byc nowa, oryginalna postac, a nie ukryta tozsamosc ani przerobka istniejacej postaci z kanonu.",
             f"Jesli prosba jest szeroka, oprzyj postac o swiezy kierunek: {angle}.",
+            "Jesli uzytkownik podal archetyp, zawod albo klase, oprzyj postac wlasnie na tym fachu zamiast uciekac w generyczny dramat.",
+            "To ma byc pirackie fantasy ze Shackles: morze, port, przesady, dlugi, kontrabanda, magia i przemoc maja byc wyczuwalne w szczegolach.",
             "Uzywaj istniejacego lore jako tla, nacisku lub punktu zaczepienia, ale nie buduj calej postaci wokol jednego glownego watku z kontekstu, jesli uzytkownik tego nie zazadal.",
             "Unikaj domyslnego schematu: powracajacy swiadek, dawna zdrada, zemsta za Black Eel, ukryty krewny glownej postaci.",
             f"Nie opieraj tej postaci na istniejacych osobach ani ich rodzinach: {blocked_cast}.",
@@ -1663,12 +1855,16 @@ def build_original_character_guidance(
                 else "Jesli chcesz nawiazac do biezacej kampanii, zrob to lekko i funkcjonalnie, bez przejmowania cudzego watku."
             ),
             "Kazda sekcja ma pokazywac inny wymiar tej postaci: fach, styl bycia, presje dnia codziennego, przewage, slabosc i realna uzytecznosc na sesji.",
+            "Pisz naturalna polszczyzna; nie wstawiaj dziwnych deklinacji etykiet typu 'Wojownika' jako rzeczownika opisu.",
         ]
     )
 
 
 def section_disallows_new_proper_nouns(artifact_type: ArtifactType, marker: str) -> bool:
-    return not (artifact_type == "npc_brief" and marker == "Imie:")
+    return not (
+        (artifact_type == "npc_brief" and marker == "Imie:")
+        or (artifact_type == "location_brief" and marker == "Nazwa:")
+    )
 
 
 def looks_like_proper_noun_label(value: str) -> bool:
@@ -1790,7 +1986,7 @@ def collect_section_allowed_proper_nouns(
 
 
 def is_creative_artifact_type(artifact_type: Optional[ArtifactType]) -> bool:
-    return artifact_type in {"session_hooks", "scene_seed", "npc_brief", "twist_pack"}
+    return artifact_type in {"session_hooks", "scene_seed", "npc_brief", "npc_pack", "location_brief", "twist_pack"}
 
 
 def resolved_creative_artifact_type(artifact_type: Optional[ArtifactType]) -> ArtifactType:
@@ -1803,9 +1999,15 @@ def infer_artifact_type(message: str, requested: Optional[ArtifactType]) -> Opti
     if requested:
         return requested
 
+    followup_artifact_type = infer_creative_followup_artifact_type(message)
+    if followup_artifact_type:
+        return followup_artifact_type
+
+    latest_message = extract_latest_user_message(message) or message
+
     normalized = " ".join(
         "".join(
-            ch for ch in unicodedata.normalize("NFKD", (message or "").strip().lower()) if not unicodedata.combining(ch)
+            ch for ch in unicodedata.normalize("NFKD", (latest_message or "").strip().lower()) if not unicodedata.combining(ch)
         ).split()
     )
     if not normalized:
@@ -1823,11 +2025,15 @@ def infer_artifact_type(message: str, requested: Optional[ArtifactType]) -> Opti
         return "session_hooks"
     if "scene seed" in normalized or ("scene" in normalized and "seed" in normalized):
         return "scene_seed"
+    if is_location_brief_request(message):
+        return "location_brief"
+    if is_multi_character_request(message):
+        return "npc_pack"
     if "npc brief" in normalized or "nowego npc" in normalized or "nowy npc" in normalized:
         return "npc_brief"
-    if any(verb in normalized for verb in ("wymysl", "pomysl", "zaproponuj", "stworz")) and any(
+    if any(verb in normalized for verb in ("wymysl", "wmymysl", "pomysl", "zaproponuj", "stworz")) and any(
         noun in normalized
-        for noun in ("postac", "bohatera", "bohaterke", "pirata", "piratke", "kapitana", "kapitanke")
+        for noun in ("postac", "postacie", "bohatera", "bohaterke", "pirata", "piratke", "kapitana", "kapitanke", "rybaka", "maga", "wojownika")
     ):
         return "npc_brief"
     if "twist" in normalized:
@@ -3329,7 +3535,8 @@ def load_creative_generation_context(
         hits = augment_campaign_hits(search_message, hits, vector_top_k)
 
     canonical_names = collect_canonical_names(search_message, hits)
-    setting_only_request = artifact_type == "npc_brief" and should_use_setting_only_creative_context(
+    setting_only_request = should_use_setting_only_creative_context_for_artifact(
+        artifact_type,
         search_message,
         canonical_names,
     )
@@ -3371,6 +3578,266 @@ def load_creative_generation_context(
     }
 
 
+def build_npc_pack_format(count: int) -> str:
+    lines = ["Motyw przewodni:", ""]
+    for idx in range(1, count + 1):
+        if idx > 1:
+            lines.append("")
+        lines.extend(
+            [
+                f"Postac {idx}:",
+                "Imie:",
+                "Archetyp:",
+                "Pierwszy obraz:",
+                "Motywacja:",
+                "Komplikacja:",
+                "Hak na sesje:",
+                "",
+            ]
+        )
+    lines.extend(["Jak ich odroznic na sesji:", "* "])
+    return "\n".join(lines).strip()
+
+
+def npc_pack_required_markers(count: int) -> List[str]:
+    return ["Motyw przewodni:", *[f"Postac {idx}:" for idx in range(1, count + 1)], "Jak ich odroznic na sesji:"]
+
+
+def extract_npc_pack_sections(text: str, count: int) -> Dict[str, str]:
+    markers = npc_pack_required_markers(count)
+    sections: Dict[str, str] = {}
+    current_marker: Optional[str] = None
+    buffer: List[str] = []
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        matched_marker: Optional[str] = None
+        inline_value = ""
+        for marker in markers:
+            if stripped == marker:
+                matched_marker = marker
+                break
+            if stripped.startswith(marker):
+                matched_marker = marker
+                inline_value = stripped[len(marker):].strip()
+                break
+        if matched_marker:
+            if current_marker is not None:
+                sections[current_marker] = "\n".join(buffer).strip()
+            current_marker = matched_marker
+            buffer = [inline_value] if inline_value else []
+            continue
+        if current_marker is not None:
+            buffer.append(line)
+
+    if current_marker is not None:
+        sections[current_marker] = "\n".join(buffer).strip()
+    return sections
+
+
+def npc_pack_markers_requiring_fill(text: str, count: int) -> List[str]:
+    sections = extract_npc_pack_sections(text, count)
+    required: List[str] = []
+    for marker in npc_pack_required_markers(count):
+        content = sections.get(marker, "").strip()
+        if marker == "Motyw przewodni:":
+            if len(normalize_section_body(content)) < 35:
+                required.append(marker)
+            continue
+        if marker == "Jak ich odroznic na sesji:":
+            if complete_bullet_count(content) < 3:
+                required.append(marker)
+            continue
+        if len(normalize_section_body(content)) < 90:
+            required.append(marker)
+            continue
+        lowered = normalize_creative_request_text(content)
+        if "imie:" not in lowered or "archetyp:" not in lowered or "hak na sesje:" not in lowered:
+            required.append(marker)
+    return required
+
+
+def ensure_npc_pack_shape(*, text: str, count: int, repair_context: str) -> str:
+    cleaned = (text or "").strip()
+    if cleaned and not npc_pack_markers_requiring_fill(cleaned, count):
+        return cleaned
+
+    repair_prompt = f"""
+Napraw artefakt tekstowy. Zwracaj tylko finalny artefakt tekstowy.
+Nie zwracaj JSON. Nie zwracaj code fence.
+Wszystkie tresci maja byc po polsku.
+Artefakt musi zawierac wszystkie wymagane znaczniki:
+{chr(10).join(f"- {marker}" for marker in npc_pack_required_markers(count))}
+
+DOCZELOWY FORMAT:
+{build_npc_pack_format(count)}
+
+KONTEKST:
+{repair_context}
+
+ZLY ARTEFAKT:
+{cleaned or '[empty]'}
+
+POPRAWIONY ARTEFAKT:
+""".strip()
+
+    try:
+        repaired = gemini_generate(
+            repair_prompt,
+            response_mime_type="text/plain",
+            temperature=0.25,
+            max_output_tokens=3500,
+            thinking_budget=CREATIVE_THINKING_BUDGET,
+            telemetry_label=f"ensure_shape:npc_pack:{count}",
+        ).strip()
+    except Exception:
+        repaired = ""
+
+    candidate = repaired or cleaned
+    missing = npc_pack_markers_requiring_fill(candidate, count)
+    if missing:
+        lines = [candidate.rstrip()] if candidate.strip() else []
+        sections = extract_npc_pack_sections(candidate, count)
+        for marker in missing:
+            if marker in sections:
+                continue
+            if lines:
+                lines.append("")
+            if marker == "Jak ich odroznic na sesji:":
+                lines.extend([marker, "* Do doprecyzowania."])
+            else:
+                lines.extend([marker, "Do doprecyzowania."])
+        candidate = "\n".join(lines).strip()
+    return candidate.strip()
+
+
+def generate_npc_pack_artifact(
+    *,
+    message: str,
+    world_context: str,
+    structured_context: str,
+    recent_sessions_context: str,
+    canonical_names: List[str],
+    setting_only_request: bool,
+) -> str:
+    count = extract_requested_character_count(message) or 3
+    disallowed_character_names = collect_disallowed_character_names(message, canonical_names, structured_context)
+    blocked_story_anchors = NPC_BLOCKED_STORY_ANCHORS if setting_only_request else []
+    blocked_names = "\n".join(f"- {name}" for name in disallowed_character_names[:12]) if disallowed_character_names else "- [brak]"
+    blocked_plots = ", ".join(blocked_story_anchors[:8]) if blocked_story_anchors else "[brak]"
+    canonical_names_context = build_canonical_names_context(canonical_names)
+    prompt = f"""
+Jestes wspolautorem kampanii RPG "Krew Na Gwiazdach". Pisz po polsku.
+
+CEL:
+- Stworz dokladnie {count} rozne, oryginalne postacie do kampanii.
+- Jesli uzytkownik wymienil role lub archetypy, pokryj je po jednej postaci.
+- To ma byc pirackie fantasy ze Shackles i Port Peril, a nie trzy wariacje tej samej ponurej figury z tego samego watku.
+
+ZASADY:
+1) Zwracaj tylko finalny artefakt tekstowy.
+2) Nie zwracaj JSON ani code fence.
+3) Kazda postac ma byc wyraznie odrebna pod wzgledem fachu, sposobu bycia, presji i uzytecznosci na sesji.
+4) Nie uzywaj tych istniejacych imion ani nazwisk:
+{blocked_names}
+5) Nie buduj wszystkich postaci wokol jednego glownego plotu kampanii.
+6) Jesli prosba jest szeroka, oprzyj postacie o codziennosc portu, morza, zabobony, handel, magie, biede i przemoc Shackles.
+7) Nie wracaj do tych aktywnych nazw i watkow, jesli uzytkownik o nie nie prosil: {blocked_plots}.
+8) Pisz naturalna polszczyzna. Unikaj generycznych moralitetow i powtorzen konstrukcji zdan.
+9) W kazdej sekcji `Postac N:` uzyj podpol: `Imie:`, `Archetyp:`, `Pierwszy obraz:`, `Motywacja:`, `Komplikacja:`, `Hak na sesje:`.
+
+WYTYCZNE STYLU:
+- Postacie maja byc grywalne i natychmiast rozpoznawalne glosami, fachami i problemami.
+- Nie powtarzaj tego samego nazwiska, sekretu ani motywacji.
+- Daj rozrzut miedzy przemoc, magie, prace portowa, spryt, wierzenia i biede.
+
+{canonical_names_context}
+
+AKTUALNY MODEL SWIATA:
+{structured_context}
+
+OSTATNIE SESJE:
+{recent_sessions_context}
+
+RELEWANTNY KONTEKST KAMPANII:
+{world_context}
+
+PROSBA UZYTKOWNIKA:
+{message}
+
+ZWROC DOKLADNIE TEN FORMAT:
+{build_npc_pack_format(count)}
+""".strip()
+
+    artifact_text = gemini_generate(
+        prompt,
+        response_mime_type="text/plain",
+        temperature=0.85,
+        max_output_tokens=3500,
+        thinking_budget=CREATIVE_THINKING_BUDGET,
+        telemetry_label=f"creative:npc_pack:{count}",
+    ).strip()
+
+    repair_context = "\n\n".join(
+        [
+            "AKTUALNY MODEL SWIATA:",
+            structured_context,
+            "",
+            "OSTATNIE SESJE:",
+            recent_sessions_context,
+            "",
+            "RELEWANTNY KONTEKST KAMPANII:",
+            world_context,
+            "",
+            "PROSBA UZYTKOWNIKA:",
+            message,
+        ]
+    ).strip()
+    blocked_anchor_hits = (
+        find_unrequested_story_anchors(artifact_text, message, blocked_story_anchors)
+        if setting_only_request
+        else []
+    )
+    if blocked_anchor_hits:
+        repair_prompt = f"""
+Napraw artefakt tekstowy. Zwracaj tylko finalny artefakt tekstowy.
+Nie zwracaj JSON. Nie zwracaj code fence.
+To jest prosba settingowa, wiec usun nawiazania do glownych aktywnych watkow i tych nazw:
+{", ".join(blocked_anchor_hits)}
+
+WYMAGANY FORMAT:
+{build_npc_pack_format(count)}
+
+KONTEKST:
+{repair_context}
+
+WADLIWY ARTEFAKT:
+{artifact_text}
+
+POPRAWIONY ARTEFAKT:
+""".strip()
+        try:
+            repaired_text = gemini_generate(
+                repair_prompt,
+                response_mime_type="text/plain",
+                temperature=0.3,
+                max_output_tokens=3500,
+                thinking_budget=CREATIVE_THINKING_BUDGET,
+                telemetry_label=f"repair:npc_pack:{count}",
+            ).strip()
+            if repaired_text:
+                artifact_text = repaired_text
+        except Exception:
+            pass
+    artifact_text = ensure_npc_pack_shape(
+        text=artifact_text,
+        count=count,
+        repair_context=repair_context,
+    )
+    return artifact_text
+
+
 def generate_creative_artifact(
     *,
     message: str,
@@ -3388,9 +3855,21 @@ def generate_creative_artifact(
     hits = creative_context["hits"]
     world_context = creative_context["world_context"]
     canonical_names = creative_context["canonical_names"]
+    setting_only_request = creative_context["setting_only_request"]
     canonical_names_context = build_canonical_names_context(canonical_names)
 
-    if artifact_type in {"session_hooks", "npc_brief"}:
+    if artifact_type == "npc_pack":
+        artifact_text = generate_npc_pack_artifact(
+            message=message,
+            world_context=world_context,
+            structured_context=structured_context,
+            recent_sessions_context=recent_sessions_context,
+            canonical_names=canonical_names,
+            setting_only_request=setting_only_request,
+        )
+        return artifact_text, render_source_labels(hits)
+
+    if artifact_type in {"session_hooks", "npc_brief", "location_brief"}:
         artifact_text = generate_structured_creative_artifact(
             artifact_type=artifact_type,
             message=message,
@@ -5070,9 +5549,9 @@ def ask_text(req: AskRequest):
 
 def stream_chat(req: ChatRequest) -> StreamPlan:
     request_message = extract_latest_user_message(req.message) or req.message
-    resolved_artifact_type = infer_artifact_type(request_message, req.artifact_type)
+    resolved_artifact_type = infer_artifact_type(req.message, req.artifact_type)
     explicit_intent = req.intent != "auto"
-    resolved_intent = req.intent if explicit_intent else detect_chat_intent(request_message)
+    resolved_intent = req.intent if explicit_intent else detect_chat_intent(req.message)
     if not explicit_intent and is_creative_artifact_type(resolved_artifact_type):
         resolved_intent = "creative"
 
@@ -5109,9 +5588,9 @@ def chat(req: ChatRequest):
             )
 
         request_message = extract_latest_user_message(req.message) or req.message
-        resolved_artifact_type = infer_artifact_type(request_message, req.artifact_type)
+        resolved_artifact_type = infer_artifact_type(req.message, req.artifact_type)
         explicit_intent = req.intent != "auto"
-        resolved_intent = req.intent if explicit_intent else detect_chat_intent(request_message)
+        resolved_intent = req.intent if explicit_intent else detect_chat_intent(req.message)
         if not explicit_intent and is_creative_artifact_type(resolved_artifact_type):
             resolved_intent = "creative"
         warnings: List[str] = []

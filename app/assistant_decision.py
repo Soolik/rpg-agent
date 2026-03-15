@@ -10,9 +10,11 @@ from .api_models import AssistantMode
 ARTIFACT_LABELS = {
     "session_hooks": "hooki na sesje",
     "npc_brief": "brief NPC-a",
+    "npc_pack": "pakiet postaci",
     "pre_session_brief": "brief przed sesja",
     "gm_brief": "brief MG",
     "scene_seed": "zalazek sceny",
+    "location_brief": "brief lokacji",
     "twist_pack": "pakiet twistow",
     "player_summary": "podsumowanie dla graczy",
     "session_report": "raport z sesji",
@@ -59,23 +61,44 @@ GUARD_HINTS = (
 ARTIFACT_HINTS = (
     ("session_hooks", ("hook", "hooki")),
     ("npc_brief", ("npc", "bn", "bohater niezalezny")),
+    ("npc_pack", ("3 postacie", "trzy postacie", "pakiet postaci", "ekipe postaci", "obsade postaci")),
     ("pre_session_brief", ("brief przed sesja", "brief na sesje", "checklista mg", "prep na sesje")),
     ("gm_brief", ("brief mg",)),
     ("scene_seed", ("scene", "sceny", "scene seed", "zalazek sceny")),
+    ("location_brief", ("miejsce", "lokacje", "lokacja", "location brief", "brief lokacji")),
     ("twist_pack", ("twist", "zwrot akcji", "komplikacje")),
     ("player_summary", ("podsumowanie dla graczy", "summary dla graczy")),
     ("session_report", ("raport z sesji", "podsumowanie sesji", "session report")),
 )
 
-CHARACTER_CREATION_VERBS = ("wymysl", "pomysl", "zaproponuj", "stworz")
+CHARACTER_CREATION_VERBS = ("wymysl", "wmymysl", "pomysl", "zaproponuj", "stworz")
 CHARACTER_CREATION_NOUNS = (
     "postac",
+    "postacie",
     "bohatera",
     "bohaterke",
+    "bohaterow",
+    "bohaterki",
     "pirata",
     "piratke",
+    "rybaka",
+    "maga",
+    "wojownika",
     "kapitana",
     "kapitanke",
+)
+
+LOCATION_CREATION_NOUNS = (
+    "miejsce",
+    "lokacja",
+    "lokacje",
+    "wyspa",
+    "klif",
+    "klify",
+    "jaskinia",
+    "zatoka",
+    "przystan",
+    "dzielnica",
 )
 
 
@@ -129,9 +152,17 @@ def infer_assistant_decision(
     artifact_type = requested_artifact_type
     if not artifact_type and mode == AssistantMode.create:
         if any(verb in message_norm for verb in CHARACTER_CREATION_VERBS) and any(
+            phrase in message_norm for phrase in ("3 postacie", "trzy postacie", "2 postacie", "dwie postacie", "pakiet postaci", "obsade")
+        ):
+            artifact_type = "npc_pack"
+        elif any(verb in message_norm for verb in CHARACTER_CREATION_VERBS) and any(
             noun in message_norm for noun in CHARACTER_CREATION_NOUNS
         ):
             artifact_type = "npc_brief"
+        elif any(verb in message_norm for verb in CHARACTER_CREATION_VERBS) and any(
+            noun in message_norm for noun in LOCATION_CREATION_NOUNS
+        ):
+            artifact_type = "location_brief"
         for candidate_artifact, hints in ARTIFACT_HINTS:
             if any(hint in message_norm for hint in hints):
                 artifact_type = candidate_artifact

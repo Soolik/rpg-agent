@@ -134,6 +134,107 @@ def _normalize_title_hint(value: str) -> str:
     )
 
 
+def _normalize_signal_text(value: str) -> str:
+    compact = " ".join((value or "").strip().lower().split())
+    compact = "".join(
+        ch for ch in unicodedata.normalize("NFKD", compact) if not unicodedata.combining(ch)
+    )
+    compact = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in compact)
+    return " ".join(compact.split())
+
+
+def _requested_character_pack(message_norm: str) -> bool:
+    return any(
+        phrase in message_norm
+        for phrase in ("3 postacie", "trzy postacie", "2 postacie", "dwie postacie", "pakiet postaci", "obsade postaci")
+    )
+
+
+def _infer_followup_artifact_type(
+    messages: list[ConversationMessageRecord],
+    latest_message: str,
+) -> Optional[str]:
+    latest_norm = _normalize_signal_text(latest_message)
+    if not latest_norm or "?" in latest_message:
+        return None
+
+    last_assistant = next((item for item in reversed(messages) if item.role == "assistant"), None)
+    if not last_assistant:
+        return None
+
+    family = None
+    if last_assistant.artifact_type in {"npc_brief", "npc_pack"}:
+        family = "npc"
+    elif last_assistant.artifact_type == "location_brief":
+        family = "location"
+    if not family:
+        return None
+
+    continuation_prefixes = (
+        "a teraz",
+        "teraz",
+        "dobra a teraz",
+        "no to teraz",
+        "to teraz",
+        "jeszcze",
+        "inna",
+        "inny",
+        "kolejna",
+        "kolejny",
+        "druga",
+        "drugi",
+        "poprosze",
+    )
+    short_followup = len(latest_norm.split()) <= 8 and len(latest_norm) <= 80
+    continuation = short_followup or any(latest_norm.startswith(prefix) for prefix in continuation_prefixes)
+    if not continuation:
+        return None
+
+    if family == "npc":
+        if _requested_character_pack(latest_norm):
+            return "npc_pack"
+        npc_hints = (
+            "postac",
+            "npc",
+            "pirat",
+            "piracka",
+            "wojownik",
+            "wojowniczka",
+            "mag",
+            "czarodziej",
+            "czarodziejka",
+            "rybak",
+            "kapitan",
+            "kapitanka",
+            "nawigator",
+            "bosman",
+            "szkutnik",
+        )
+        if any(hint in latest_norm for hint in npc_hints):
+            return "npc_brief"
+        if any(phrase in latest_norm for phrase in ("inna postac", "inny npc", "kolejna postac", "jeszcze jedna")):
+            return "npc_brief"
+
+    if family == "location":
+        location_hints = (
+            "miejsce",
+            "lokacja",
+            "wyspa",
+            "klif",
+            "klify",
+            "jaskinia",
+            "zatoka",
+            "przystan",
+            "dzielnica",
+            "ruiny",
+        )
+        if any(hint in latest_norm for hint in location_hints):
+            return "location_brief"
+        if any(phrase in latest_norm for phrase in ("inne miejsce", "inna lokacja", "kolejne miejsce", "jeszcze jedno")):
+            return "location_brief"
+    return None
+
+
 def _derive_response_title(response: ChatResponse, message: str = "") -> str:
     normalized_message = _normalize_title_hint(message)
     if "krew na gwiazdach" in normalized_message:
@@ -500,6 +601,24 @@ class ChatService:
         )
         return conversation, composed_message
 
+    def _followup_defaults(
+        self,
+        *,
+        conversation_id: Optional[str],
+        requested_intent: str,
+        requested_artifact_type: Optional[str],
+        message: str,
+    ) -> tuple[str, Optional[str]]:
+        if requested_intent != "auto" or requested_artifact_type or not conversation_id:
+            return requested_intent, requested_artifact_type
+        if not self.conversation_storage_enabled():
+            return requested_intent, requested_artifact_type
+        messages = self.conversation_store.list_messages(conversation_id, limit=50)
+        inferred_artifact_type = _infer_followup_artifact_type(messages, message)
+        if inferred_artifact_type:
+            return "creative", inferred_artifact_type
+        return requested_intent, requested_artifact_type
+
     def _append_user_message(
         self,
         conversation: Optional[ConversationRecord],
@@ -818,11 +937,17 @@ class ChatService:
         conversation_title: Optional[str],
         confirmed: bool = False,
     ) -> V1ChatResponse:
+        effective_requested_intent, effective_requested_artifact_type = self._followup_defaults(
+            conversation_id=conversation_id,
+            requested_intent=intent,
+            requested_artifact_type=artifact_type,
+            message=message,
+        )
         task_spec = self.task_router.classify(
             message=message,
             requested_mode=assistant_mode,
-            requested_intent=intent,  # type: ignore[arg-type]
-            requested_artifact_type=artifact_type,
+            requested_intent=effective_requested_intent,  # type: ignore[arg-type]
+            requested_artifact_type=effective_requested_artifact_type,
             requested_save_output=save_output,
             requested_output_title=output_title,
             candidate_text=candidate_text,
@@ -937,11 +1062,17 @@ class ChatService:
         conversation_title: Optional[str],
         confirmed: bool = False,
     ) -> StreamingResponse:
+        effective_requested_intent, effective_requested_artifact_type = self._followup_defaults(
+            conversation_id=conversation_id,
+            requested_intent=intent,
+            requested_artifact_type=artifact_type,
+            message=message,
+        )
         task_spec = self.task_router.classify(
             message=message,
             requested_mode=assistant_mode,
-            requested_intent=intent,  # type: ignore[arg-type]
-            requested_artifact_type=artifact_type,
+            requested_intent=effective_requested_intent,  # type: ignore[arg-type]
+            requested_artifact_type=effective_requested_artifact_type,
             requested_save_output=save_output,
             requested_output_title=output_title,
             candidate_text=candidate_text,
@@ -956,8 +1087,8 @@ class ChatService:
                 trace=trace,
                 message=message,
                 assistant_mode=assistant_mode,
-                intent=intent,
-                artifact_type=artifact_type,
+                intent=effective_requested_intent,
+                artifact_type=effective_requested_artifact_type,
                 source_title=source_title,
                 candidate_text=candidate_text,
                 include_sources=include_sources,
@@ -1007,7 +1138,7 @@ class ChatService:
                 trace=trace,
                 message=message,
                 assistant_mode=effective_mode,
-                intent=intent,
+                intent=effective_requested_intent,
                 artifact_type=effective_artifact_type,
                 source_title=source_title,
                 candidate_text=candidate_text,

@@ -55,6 +55,33 @@ class ChatFlowTest(unittest.TestCase):
         )
         self.assertEqual(artifact_type, "npc_brief")
 
+    def test_infer_artifact_type_recognizes_multi_character_request_as_npc_pack(self):
+        artifact_type = main.infer_artifact_type(
+            "Wymysl mi 3 postacie do Portu Peril: wojownika pirata, maga i rybaka.",
+            None,
+        )
+        self.assertEqual(artifact_type, "npc_pack")
+
+    def test_infer_artifact_type_recognizes_location_creation_request(self):
+        artifact_type = main.infer_artifact_type(
+            "Wymysl miejsce - klify nieopodal Portu Peril.",
+            None,
+        )
+        self.assertEqual(artifact_type, "location_brief")
+
+    def test_detect_chat_intent_recognizes_creative_followup_from_wrapped_conversation(self):
+        wrapped = (
+            "KONTEKST ROZMOWY:\n"
+            "Uzytkownik: Wymysl mi postac do Portu Peril.\n"
+            "Asystent: Imie: Talia Vane\n"
+            "Rola w kampanii: Portowa kontrabandzistka.\n\n"
+            "NOWA WIADOMOSC UZYTKOWNIKA:\n"
+            "Dobra, a teraz rybak.\n\n"
+            "Odpowiedz na ostatnia wiadomosc, zachowujac ciaglosc rozmowy i kanonu."
+        )
+
+        self.assertEqual(main.detect_chat_intent(wrapped), "creative")
+
     def test_ask_source_question_returns_docs_based_answer_without_model_call(self):
         original_drive_store = getattr(main, "drive_store_v2", None)
         original_gemini_generate = main.gemini_generate
@@ -876,6 +903,61 @@ class ChatFlowTest(unittest.TestCase):
         self.assertEqual(response.artifact_type, "npc_brief")
         self.assertEqual(captured["artifact_type"], "npc_brief")
 
+    def test_chat_creative_multi_character_request_defaults_to_npc_pack(self):
+        original_generate_creative_artifact = main.generate_creative_artifact
+        captured = {}
+
+        def fake_generate_creative_artifact(**kwargs):
+            captured.update(kwargs)
+            return "Motyw przewodni:\nPortowi wyrzutkowie.", []
+
+        try:
+            main.generate_creative_artifact = fake_generate_creative_artifact
+
+            response = main.chat(
+                main.ChatRequest(
+                    message="Wymysl mi 3 postacie do Portu Peril: wojownika pirata, maga i rybaka.",
+                )
+            )
+        finally:
+            main.generate_creative_artifact = original_generate_creative_artifact
+
+        self.assertEqual(response.kind, "creative")
+        self.assertEqual(response.artifact_type, "npc_pack")
+        self.assertEqual(captured["artifact_type"], "npc_pack")
+
+    def test_chat_creative_followup_from_wrapped_conversation_defaults_to_npc_brief(self):
+        original_generate_creative_artifact = main.generate_creative_artifact
+        captured = {}
+
+        def fake_generate_creative_artifact(**kwargs):
+            captured.update(kwargs)
+            return "Imie: Brann Torsk", []
+
+        wrapped = (
+            "KONTEKST ROZMOWY:\n"
+            "Uzytkownik: Wymysl mi 3 postacie do Portu Peril.\n"
+            "Asystent: Motyw przewodni:\nPortowi wyrzutkowie.\n\nPostac 1:\nImie: Mara Flint\n\n"
+            "NOWA WIADOMOSC UZYTKOWNIKA:\n"
+            "Dobra, a teraz rybak.\n\n"
+            "Odpowiedz na ostatnia wiadomosc, zachowujac ciaglosc rozmowy i kanonu."
+        )
+
+        try:
+            main.generate_creative_artifact = fake_generate_creative_artifact
+
+            response = main.chat(
+                main.ChatRequest(
+                    message=wrapped,
+                )
+            )
+        finally:
+            main.generate_creative_artifact = original_generate_creative_artifact
+
+        self.assertEqual(response.kind, "creative")
+        self.assertEqual(response.artifact_type, "npc_brief")
+        self.assertEqual(captured["artifact_type"], "npc_brief")
+
     def test_chat_explicit_proposal_intent_is_not_overridden_by_creative_artifact_type(self):
         original_planner = main.planner_v2
         original_workflow_store = main.workflow_store_v2
@@ -1097,6 +1179,128 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("Relacje:\n* Captain Mira:", artifact_text)
         self.assertIn("Jak uzyc tej postaci na sesji:\n* Moze zlecic BG", artifact_text)
         self.assertNotIn("Do doprecyzowania.", artifact_text)
+
+    def test_generate_creative_artifact_location_brief_uses_structured_sections(self):
+        original_generate = main.gemini_generate
+        original_build_world_model_context = main.build_world_model_context
+        original_build_recent_sessions_context = main.build_recent_sessions_context
+        original_build_context_for_planner = main.build_context_for_planner
+        original_vector_search = main.vector_search
+        original_render_source_labels = main.render_source_labels
+        outputs = [
+            "Klify Latarnikow",
+            "Poszarpane klify z dawnym posterunkiem sygnalowym nad podejsciem do Port Peril.",
+            "Czarne sciany skal lsna od soli, a nad glowa trzepocza splowiale proporce dawnych sygnalistow.",
+            "Przemytnicy, zwiadowcy i biedniejsi rybacy korzystaja tu z ukrytej sciezki pod klifem, zeby omijac poborcow z Port Peril. Przy spokojnym morzu miejsce zyje od szybkich rozladunkow, a przy sztormie pustoszeje.",
+            "Przemytnicy, zwiadowcy i biedniejsi rybacy korzystaja tu z ukrytej sciezki pod klifem, zeby omijac poborcow z Port Peril. Przy spokojnym morzu miejsce zyje od szybkich rozladunkow, a przy sztormie pustoszeje.",
+            "W rozpadlinie pod wieza tkwi zalana komora z ghol-ganskimi znakami, ktore budza sie podczas sztormu. Kiedy wiatr niesie dzwiek z ruin, miejscowi omijaja klif szerokim lukiem.",
+            "W rozpadlinie pod wieza tkwi zalana komora z ghol-ganskimi znakami, ktore budza sie podczas sztormu. Kiedy wiatr niesie dzwiek z ruin, miejscowi omijaja klif szerokim lukiem.",
+            "* To dobre miejsce na zasadzke, tajny rozladunek albo obserwacje wejscia do Port Peril.\n* Bohaterowie moga tu znalezc przemytniczy trop, zanim dotrze on do portowych plotek.\n* Sztorm moze zamienic klify w scene grozy z omenami i naglym osunieciem skal.",
+            "* To dobre miejsce na zasadzke, tajny rozladunek albo obserwacje wejscia do Port Peril.\n* Bohaterowie moga tu znalezc przemytniczy trop, zanim dotrze on do portowych plotek.\n* Sztorm moze zamienic klify w scene grozy z omenami i naglym osunieciem skal.",
+        ]
+        call_index = {"value": 0}
+
+        def fake_generate(prompt, **kwargs):
+            idx = call_index["value"]
+            call_index["value"] += 1
+            return outputs[idx] if idx < len(outputs) else outputs[-1]
+
+        try:
+            main.gemini_generate = fake_generate
+            main.build_world_model_context = lambda limit=30: "KNOWN ENTITIES:\n- location: Port Peril"
+            main.build_recent_sessions_context = lambda limit=5: "RECENT SESSIONS:\n- session_id=1 | source=Session 05 | summary=Niepokoj przy wejsciu do portu."
+            main.build_context_for_planner = lambda drive_store: "Campaign context about Port Peril."
+            main.vector_search = lambda message, top_k: []
+            main.render_source_labels = lambda hits: []
+
+            artifact_text, references = main.generate_creative_artifact(
+                message="Wymysl miejsce - klify nieopodal Portu Peril.",
+                artifact_type="location_brief",
+            )
+        finally:
+            main.gemini_generate = original_generate
+            main.build_world_model_context = original_build_world_model_context
+            main.build_recent_sessions_context = original_build_recent_sessions_context
+            main.build_context_for_planner = original_build_context_for_planner
+            main.vector_search = original_vector_search
+            main.render_source_labels = original_render_source_labels
+
+        self.assertEqual(references, [])
+        self.assertIn("Nazwa: Klify Latarnikow", artifact_text)
+        self.assertIn("Typ miejsca:\nPoszarpane klify", artifact_text)
+        self.assertIn("Sekret miejsca:\nW rozpadlinie pod wieza", artifact_text)
+        self.assertIn("Jak uzyc na sesji:\n* To dobre miejsce", artifact_text)
+
+    def test_generate_creative_artifact_npc_pack_uses_requested_count(self):
+        original_generate = main.gemini_generate
+        original_build_world_model_context = main.build_world_model_context
+        original_build_recent_sessions_context = main.build_recent_sessions_context
+        original_build_context_for_planner = main.build_context_for_planner
+        original_vector_search = main.vector_search
+        original_render_source_labels = main.render_source_labels
+
+        pack_text = """
+Motyw przewodni:
+Troje ludzi, ktorzy znaja Port Peril od spodu: przez doki, zabobony i glod.
+
+Postac 1:
+Imie: Jorren Vask
+Archetyp: Pirat-wojownik i wynajety bosman abordazowy.
+Pierwszy obraz: Nosi skore rekina zszyta drutem i usmiecha sie dopiero, gdy pachnie bitwa.
+Motywacja: Chce odzyskac wlasny poklad i zaloge, zanim ktos sprzeda jego dlugi zbyt wysoko.
+Komplikacja: W porcie krazy plotka, ze raz uciekł z abordazu z czyms cenniejszym niz zloto.
+Hak na sesje: Moze poprowadzic BG przez brutalny abordaz albo zdradzic ich za lepszy udzial.
+
+Postac 2:
+Imie: Sera Bale
+Archetyp: Portowa magini sztormu i czytaczka omenow.
+Pierwszy obraz: Wlosy ma posklejane sola, a na nadgarstkach miedziane dzwonki przeciw zlym falom.
+Motywacja: Chce udowodnic, ze magia pogody moze kupic wolnosc, jesli trafi do wlasciwej zalogi.
+Komplikacja: Jej zaklecia przyciagaja czasem rzeczy, ktore powinny zostac na dnie.
+Hak na sesje: Moze sprzedac BG bezpieczne okno pogodowe albo wciagnac ich w omen, ktory trzeba uciszyc.
+
+Postac 3:
+Imie: Brann Torsk
+Archetyp: Rybak, lowca krabow i cichy przewodnik po rafach.
+Pierwszy obraz: Pachnie sieciami, smola i starym tranem, a jego lodz jest bardziej polatana niz nowa.
+Motywacja: Chce wykupic rodzine z dlugu wobec portowego faktora, zanim zabiora mu lodz.
+Komplikacja: Podczas nocnych polowow widzial rzeczy przy klifach, o ktorych boi sie mowic glosno.
+Hak na sesje: Moze byc lokalnym przewodnikiem, swiadkiem przemytu albo pierwsza ofiara czegos z morza.
+
+Jak ich odroznic na sesji:
+* Jorren mowi krotko i ostrzy noz przy kazdej rozmowie.
+* Sera wszystko ocenia przez omen, wiatr i dzwiek fal.
+* Brann unika tlumu i patrzy najpierw na niebo, potem na ludzi.
+""".strip()
+
+        def fake_generate(prompt, **kwargs):
+            return pack_text
+
+        try:
+            main.gemini_generate = fake_generate
+            main.build_world_model_context = lambda limit=30: "KNOWN ENTITIES:\n- location: Port Peril"
+            main.build_recent_sessions_context = lambda limit=5: "RECENT SESSIONS:\n- session_id=1 | source=Session 05 | summary=Port znow wrze."
+            main.build_context_for_planner = lambda drive_store: "Campaign context about Port Peril."
+            main.vector_search = lambda message, top_k: []
+            main.render_source_labels = lambda hits: []
+
+            artifact_text, references = main.generate_creative_artifact(
+                message="Wymysl mi 3 postacie do Portu Peril: wojownika pirata, maga i rybaka.",
+                artifact_type="npc_pack",
+            )
+        finally:
+            main.gemini_generate = original_generate
+            main.build_world_model_context = original_build_world_model_context
+            main.build_recent_sessions_context = original_build_recent_sessions_context
+            main.build_context_for_planner = original_build_context_for_planner
+            main.vector_search = original_vector_search
+            main.render_source_labels = original_render_source_labels
+
+        self.assertEqual(references, [])
+        self.assertIn("Postac 1:", artifact_text)
+        self.assertIn("Postac 2:", artifact_text)
+        self.assertIn("Postac 3:", artifact_text)
+        self.assertIn("Imie: Brann Torsk", artifact_text)
 
     def test_generate_creative_artifact_npc_brief_retries_existing_identity_for_original_request(self):
         original_generate = main.gemini_generate

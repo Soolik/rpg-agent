@@ -12,6 +12,8 @@ ArtifactTypeName = Literal[
     "session_hooks",
     "scene_seed",
     "npc_brief",
+    "npc_pack",
+    "location_brief",
     "twist_pack",
 ]
 
@@ -79,6 +81,32 @@ Relacje:
 
 Jak uzyc tej postaci na sesji:
 """.strip()
+    if artifact_type == "npc_pack":
+        return """
+Motyw przewodni:
+
+Postac 1:
+
+Postac 2:
+
+Postac 3:
+
+Jak ich odroznic na sesji:
+""".strip()
+    if artifact_type == "location_brief":
+        return """
+Nazwa:
+
+Typ miejsca:
+
+Pierwszy obraz:
+
+Co tu sie dzieje:
+
+Sekret miejsca:
+
+Jak uzyc na sesji:
+""".strip()
     return """
 Twist 1:
 
@@ -125,6 +153,23 @@ def artifact_required_markers(artifact_type: ArtifactTypeName) -> List[str]:
             "Relacje:",
             "Jak uzyc tej postaci na sesji:",
         ]
+    if artifact_type == "npc_pack":
+        return [
+            "Motyw przewodni:",
+            "Postac 1:",
+            "Postac 2:",
+            "Postac 3:",
+            "Jak ich odroznic na sesji:",
+        ]
+    if artifact_type == "location_brief":
+        return [
+            "Nazwa:",
+            "Typ miejsca:",
+            "Pierwszy obraz:",
+            "Co tu sie dzieje:",
+            "Sekret miejsca:",
+            "Jak uzyc na sesji:",
+        ]
     if artifact_type == "twist_pack":
         return ["Twist 1:", "Twist 2:", "Twist 3:", "Foreshadowing:", "Ryzyko dla kampanii:"]
     return []
@@ -150,7 +195,24 @@ def artifact_style_guidance(artifact_type: ArtifactTypeName) -> str:
         return (
             "- Kazda sekcja ma byc konkretna i zwiezla.\n"
             "- Nie pisz dlugich blokow tekstu; zwykle 2-4 zdania na sekcje.\n"
-            "- Sekcje 'Relacje' i 'Jak uzyc tej postaci na sesji' moga byc listami."
+            "- Sekcje 'Relacje' i 'Jak uzyc tej postaci na sesji' moga byc listami.\n"
+            "- Postac ma brzmiec jak oryginalna piracka fantasy ze Shackles, a nie generyczny bohater z nowoczesnego dramatu.\n"
+            "- Opieraj klimat na fachu, przesadach morza, porcie, dlugach, kontrabandzie i brutalnej codziennosci."
+        )
+    if artifact_type == "npc_pack":
+        return (
+            "- Daj dokladnie trzy rozne postacie.\n"
+            "- Kazda postac ma miec wyraznie inny fach, vibe i uzytecznosc.\n"
+            "- Unikaj trzech wariacji na ten sam archetyp cierpietniczy.\n"
+            "- To ma byc pirackie fantasy ze Shackles: morze, port, przesady, przemoc, handel, magia i bieda maja byc widoczne w szczegolach.\n"
+            "- Sekcja 'Jak ich odroznic na sesji' ma byc lista praktycznych bulletow."
+        )
+    if artifact_type == "location_brief":
+        return (
+            "- Miejsce ma byc konkretne, sensoryczne i od razu grywalne.\n"
+            "- Nie odpowiadaj, ze brakuje danych. Jesli prosba brzmi kreatywnie, wymysl szczegoly spojne z lore.\n"
+            "- Klimat ma byc pirackie fantasy: sól, wiatr, ruiny, przesady, nielegalny handel, omeny, magia morza.\n"
+            "- Sekcja 'Jak uzyc na sesji' ma byc lista 3-5 praktycznych bulletow."
         )
     if artifact_type == "twist_pack":
         return "- Kazdy twist ma byc odrebny, konkretny i opisany w 2-4 zdaniach."
@@ -282,9 +344,9 @@ def strip_section_marker(text: str, marker: str) -> str:
 
 def sanitize_generated_section(marker: str, content: str) -> str:
     raw = strip_section_marker(content, marker)
-    if marker in {"Tytul:", "Tytul sceny:", "Imie:"}:
+    if marker in {"Tytul:", "Tytul sceny:", "Imie:", "Nazwa:"}:
         return normalize_single_line_section(raw)
-    if marker in {"Stawki:", "Co przygotowac:", "Relacje:", "Jak uzyc tej postaci na sesji:"}:
+    if marker in {"Stawki:", "Co przygotowac:", "Relacje:", "Jak uzyc tej postaci na sesji:", "Jak uzyc na sesji:", "Jak ich odroznic na sesji:"}:
         items = [trim_to_complete_sentences(item) for item in extract_bullet_items(raw)]
         items = complete_bullet_items("\n".join(f"* {item}" for item in items if item.strip()))
         items = [re.sub(r"\s+", " ", item).strip() for item in items if item.strip()]
@@ -298,7 +360,7 @@ def sanitize_generated_section(marker: str, content: str) -> str:
 
 
 def is_bullet_section_marker(artifact_type: ArtifactTypeName, marker: str) -> bool:
-    if marker in {"Stawki:", "Co przygotowac:", "Relacje:", "Jak uzyc tej postaci na sesji:"}:
+    if marker in {"Stawki:", "Co przygotowac:", "Relacje:", "Jak uzyc tej postaci na sesji:", "Jak uzyc na sesji:", "Jak ich odroznic na sesji:"}:
         return True
     return artifact_type == "pre_session_brief" and marker.startswith("## ")
 
@@ -307,6 +369,8 @@ def section_target_bullet_count(artifact_type: ArtifactTypeName, marker: str) ->
     if artifact_type == "session_hooks" and marker in {"Stawki:", "Co przygotowac:"}:
         return 4
     if artifact_type == "npc_brief" and marker in {"Relacje:", "Jak uzyc tej postaci na sesji:"}:
+        return 3
+    if artifact_type in {"npc_pack", "location_brief"} and marker in {"Jak ich odroznic na sesji:", "Jak uzyc na sesji:"}:
         return 3
     if artifact_type == "pre_session_brief" and marker.startswith("## "):
         return 3
@@ -327,6 +391,19 @@ def section_retry_rule(artifact_type: ArtifactTypeName, marker: str) -> str:
         if marker in {"Relacje:", "Jak uzyc tej postaci na sesji:"}:
             return "Zwroc co najmniej 2 osobne bullety zaczynajace sie od '* '. Kazdy bullet zakoncz pelnym zdaniem."
         return "Zwroc 2-4 pelne zdania i zakoncz sekcje pelnym zdaniem."
+    if artifact_type == "location_brief":
+        if marker == "Nazwa:":
+            return "Zwroc tylko nazwe miejsca w jednym wierszu."
+        if marker == "Jak uzyc na sesji:":
+            return "Zwroc co najmniej 2 osobne bullety zaczynajace sie od '* '. Kazdy bullet zakoncz pelnym zdaniem."
+        return "Zwroc 2-4 pelne zdania i zakoncz sekcje pelnym zdaniem."
+    if artifact_type == "npc_pack":
+        if marker == "Motyw przewodni:":
+            return "Zwroc 2-3 pelne zdania wyjasniajace wspolny klimat tych trzech postaci."
+        if marker in {"Postac 1:", "Postac 2:", "Postac 3:"}:
+            return "Zwroc 4-6 pelnych zdan o jednej wyraznie odrebnej postaci. Zacznij od imienia i fachu."
+        if marker == "Jak ich odroznic na sesji:":
+            return "Zwroc co najmniej 3 osobne bullety zaczynajace sie od '* '. Kazdy bullet zakoncz pelnym zdaniem."
     if artifact_type == "pre_session_brief" and marker.startswith("## "):
         return "Zwroc co najmniej 2 osobne bullety zaczynajace sie od '* '. Kazdy bullet zakoncz pelnym zdaniem."
     return "Uzupelnij sekcje pelna i konkretna trescia."
@@ -340,6 +417,13 @@ def compact_retry_rule(artifact_type: ArtifactTypeName, marker: str) -> str:
         "Pierwsze wrazenie:",
         "Motywacja:",
         "Sekret:",
+    }:
+        return "Zwroc dokladnie 2 krotkie pelne zdania. Kazde zdanie zakoncz kropka."
+    if artifact_type == "location_brief" and marker in {
+        "Typ miejsca:",
+        "Pierwszy obraz:",
+        "Co tu sie dzieje:",
+        "Sekret miejsca:",
     }:
         return "Zwroc dokladnie 2 krotkie pelne zdania. Kazde zdanie zakoncz kropka."
     return section_retry_rule(artifact_type, marker)
@@ -358,6 +442,14 @@ def section_min_length(artifact_type: ArtifactTypeName, marker: str) -> int:
         return 25
     if artifact_type == "npc_brief":
         return 3 if marker == "Imie:" else 45
+    if artifact_type == "location_brief":
+        return 3 if marker == "Nazwa:" else 35
+    if artifact_type == "npc_pack":
+        if marker == "Motyw przewodni:":
+            return 35
+        if marker in {"Postac 1:", "Postac 2:", "Postac 3:"}:
+            return 80
+        return 35
     if artifact_type == "twist_pack":
         return 40
     return 20
@@ -393,6 +485,18 @@ def section_needs_fill(
             return "\n" in raw or len(normalized) < 2
         if marker in {"Relacje:", "Jak uzyc tej postaci na sesji:"}:
             return complete_bullet_count(raw) < 2
+        return len(normalized) < section_min_length(artifact_type, marker) or not ends_with_sentence_punctuation(raw)
+    if artifact_type == "location_brief":
+        if marker == "Nazwa:":
+            return "\n" in raw or len(normalized) < 2
+        if marker == "Jak uzyc na sesji:":
+            return complete_bullet_count(raw) < 2
+        return len(normalized) < section_min_length(artifact_type, marker) or not ends_with_sentence_punctuation(raw)
+    if artifact_type == "npc_pack":
+        if marker in {"Postac 1:", "Postac 2:", "Postac 3:"}:
+            return len(normalized) < section_min_length(artifact_type, marker) or sentence_count(raw) < 3 or not ends_with_sentence_punctuation(raw)
+        if marker == "Jak ich odroznic na sesji:":
+            return complete_bullet_count(raw) < 3
         return len(normalized) < section_min_length(artifact_type, marker) or not ends_with_sentence_punctuation(raw)
     if artifact_type == "pre_session_brief" and marker.startswith("## "):
         return complete_bullet_count(raw) < 2
@@ -445,7 +549,7 @@ def render_artifact_section_block(marker: str, content: str) -> List[str]:
             lines.append("- Do doprecyzowania.")
         return lines
 
-    if marker in {"Tytul:", "Tytul sceny:", "Imie:"} and body and "\n" not in body and not body.lstrip().startswith(("*", "-")):
+    if marker in {"Tytul:", "Tytul sceny:", "Imie:", "Nazwa:"} and body and "\n" not in body and not body.lstrip().startswith(("*", "-")):
         lines.append(f"{marker} {body}".rstrip())
         return lines
 
@@ -577,6 +681,35 @@ def creative_section_specs(artifact_type: ArtifactTypeName) -> List[Dict[str, An
                 "marker": "Jak uzyc tej postaci na sesji:",
                 "instruction": "Daj 3-5 bulletow zaczynajacych sie od '* ' z praktycznymi sposobami uzycia.",
                 "require_canonical_name": True,
+            },
+        ]
+    if artifact_type == "location_brief":
+        return [
+            {"marker": "Nazwa:", "instruction": "Podaj nowa nazwe miejsca pasujaca do Shackles i Port Peril.", "require_canonical_name": False},
+            {
+                "marker": "Typ miejsca:",
+                "instruction": "Napisz 2-3 zdania, czym jest to miejsce i do czego sluzy.",
+                "require_canonical_name": False,
+            },
+            {
+                "marker": "Pierwszy obraz:",
+                "instruction": "Napisz 2-3 zdania z mocnym, sensorycznym pierwszym obrazem miejsca.",
+                "require_canonical_name": False,
+            },
+            {
+                "marker": "Co tu sie dzieje:",
+                "instruction": "Napisz 2-4 zdania o codziennym ruchu, ludziach, procederach albo zagrozeniach tego miejsca.",
+                "require_canonical_name": True,
+            },
+            {
+                "marker": "Sekret miejsca:",
+                "instruction": "Napisz 2-4 zdania o sekrecie, ukrytym koszcie albo niebezpieczenstwie tego miejsca.",
+                "require_canonical_name": False,
+            },
+            {
+                "marker": "Jak uzyc na sesji:",
+                "instruction": "Daj 3-5 bulletow zaczynajacych sie od '* ' z praktycznymi zastosowaniami na sesji.",
+                "require_canonical_name": False,
             },
         ]
     return []

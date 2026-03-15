@@ -21,9 +21,11 @@ class TaskType(str, Enum):
 ARTIFACT_LABELS = {
     "session_hooks": "hooki na sesje",
     "npc_brief": "brief NPC-a",
+    "npc_pack": "pakiet postaci",
     "pre_session_brief": "brief przed sesja",
     "gm_brief": "brief MG",
     "scene_seed": "zalazek sceny",
+    "location_brief": "brief lokacji",
     "twist_pack": "pakiet twistow",
     "player_summary": "podsumowanie dla graczy",
     "session_report": "raport z sesji",
@@ -72,23 +74,44 @@ GUARD_HINTS = (
 ARTIFACT_HINTS = (
     ("session_hooks", ("hook", "hooki")),
     ("npc_brief", ("npc", "bn", "bohater niezalezny")),
+    ("npc_pack", ("3 postacie", "trzy postacie", "pakiet postaci", "ekipe postaci", "obsade postaci")),
     ("pre_session_brief", ("brief przed sesja", "brief na sesje", "checklista mg", "prep na sesje")),
     ("gm_brief", ("brief mg",)),
     ("scene_seed", ("scene", "sceny", "scene seed", "zalazek sceny")),
+    ("location_brief", ("miejsce", "lokacje", "lokacja", "location brief", "brief lokacji")),
     ("twist_pack", ("twist", "zwrot akcji", "komplikacje")),
     ("player_summary", ("podsumowanie dla graczy", "summary dla graczy")),
     ("session_report", ("raport z sesji", "podsumowanie sesji", "session report")),
 )
 
-CHARACTER_CREATION_VERBS = ("wymysl", "pomysl", "zaproponuj", "stworz")
+CHARACTER_CREATION_VERBS = ("wymysl", "wmymysl", "pomysl", "zaproponuj", "stworz")
 CHARACTER_CREATION_NOUNS = (
     "postac",
+    "postacie",
     "bohatera",
     "bohaterke",
+    "bohaterow",
+    "bohaterki",
     "pirata",
     "piratke",
+    "rybaka",
+    "maga",
+    "wojownika",
     "kapitana",
     "kapitanke",
+)
+
+LOCATION_CREATION_NOUNS = (
+    "miejsce",
+    "lokacja",
+    "lokacje",
+    "wyspa",
+    "klif",
+    "klify",
+    "jaskinia",
+    "zatoka",
+    "przystan",
+    "dzielnica",
 )
 
 CREATIVE_MARKERS = (
@@ -106,6 +129,10 @@ CREATIVE_MARKERS = (
     "nowy npc",
     "stworz npc",
     "npc brief",
+    "brief lokacji",
+    "location brief",
+    "3 postacie",
+    "trzy postacie",
 )
 
 PROPOSAL_MARKERS = (
@@ -156,9 +183,17 @@ def _infer_artifact_type(message_norm: str, requested_artifact_type: Optional[st
     if requested_artifact_type:
         return requested_artifact_type  # type: ignore[return-value]
     if any(verb in message_norm for verb in CHARACTER_CREATION_VERBS) and any(
+        phrase in message_norm for phrase in ("3 postacie", "trzy postacie", "2 postacie", "dwie postacie", "pakiet postaci", "obsade")
+    ):
+        return "npc_pack"
+    if any(verb in message_norm for verb in CHARACTER_CREATION_VERBS) and any(
         noun in message_norm for noun in CHARACTER_CREATION_NOUNS
     ):
         return "npc_brief"
+    if any(verb in message_norm for verb in CHARACTER_CREATION_VERBS) and any(
+        noun in message_norm for noun in LOCATION_CREATION_NOUNS
+    ):
+        return "location_brief"
     for candidate_artifact, hints in ARTIFACT_HINTS:
         if any(hint in message_norm for hint in hints):
             return candidate_artifact  # type: ignore[return-value]
@@ -168,7 +203,7 @@ def _infer_artifact_type(message_norm: str, requested_artifact_type: Optional[st
 def _infer_chat_intent(message_norm: str, artifact_type: Optional[ArtifactType], requested_intent: ChatIntent) -> ChatIntent:
     if requested_intent != "auto":
         return requested_intent
-    if artifact_type in {"session_hooks", "scene_seed", "npc_brief", "twist_pack"}:
+    if artifact_type in {"session_hooks", "scene_seed", "npc_brief", "npc_pack", "location_brief", "twist_pack"}:
         return "creative"
     if any(marker in message_norm for marker in CREATIVE_MARKERS):
         return "creative"

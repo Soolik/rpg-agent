@@ -17,6 +17,8 @@ ArtifactType = Literal[
     "session_hooks",
     "scene_seed",
     "npc_brief",
+    "npc_pack",
+    "location_brief",
     "twist_pack",
 ]
 
