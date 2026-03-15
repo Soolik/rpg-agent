@@ -29,7 +29,7 @@ def _page() -> str:
 button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-radius:999px;cursor:pointer;font-weight:700;background:linear-gradient(135deg,var(--gold),var(--fire));color:#24150d} button.secondary{background:#fff4e20f;color:var(--text);border:1px solid var(--line)} button:disabled{opacity:.45;cursor:not-allowed}
 .list{display:grid;gap:10px;max-height:36vh;overflow:auto} .list button{text-align:left;width:100%;background:#fff4e20a;color:var(--text);border:1px solid transparent;border-radius:16px;padding:12px} .list button.active{border-color:#d4b06a8f;background:#d4b06a1f}
 .main{display:grid;grid-template-rows:auto 1fr auto;gap:18px} .chat{min-height:0;overflow:hidden} .messages{height:100%;overflow:auto;display:grid;gap:14px;padding:18px;align-content:start}
-.msg{max-width:min(900px,94%);border-radius:18px;padding:16px;background:#fff4e20d;border:1px solid var(--line)} .msg.user{justify-self:end;background:#ef8c521a} .msg.pending{border-style:dashed;opacity:.82} .head{display:flex;justify-content:space-between;gap:12px;margin-bottom:10px;font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted)} .body{margin:0;white-space:pre-wrap;line-height:1.6;word-break:break-word} .meta{margin-top:12px;padding:12px;border-radius:14px;background:#fff4e20a} .meta h4{margin:0 0 8px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em} .meta ul{margin:0;padding-left:18px}
+.msg{max-width:min(900px,94%);border-radius:18px;padding:16px;background:#fff4e20d;border:1px solid var(--line)} .msg.user{justify-self:end;background:#ef8c521a} .msg.pending{border-style:dashed;opacity:.82} .head{display:flex;justify-content:space-between;gap:12px;margin-bottom:10px;font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted)} .body{line-height:1.65;word-break:break-word} .body > *:first-child{margin-top:0} .body > *:last-child{margin-bottom:0} .body p{margin:0 0 12px} .body h1,.body h2,.body h3,.body h4{margin:16px 0 10px;font-family:"Fraunces",serif;line-height:1.2} .body h1{font-size:28px} .body h2{font-size:22px} .body h3{font-size:18px} .body ul{margin:0 0 12px;padding-left:20px} .body li{margin:0 0 6px} .body table{width:100%;border-collapse:collapse;margin:12px 0;border-radius:14px;overflow:hidden;background:#fff4e208} .body th,.body td{border:1px solid var(--line);padding:8px 10px;vertical-align:top;text-align:left} .body th{background:#fff4e214} .body code{padding:2px 6px;border-radius:6px;background:#fff4e214;font-family:Consolas,monospace;font-size:.95em} .body pre{margin:0 0 12px;padding:12px 14px;border-radius:14px;background:#081014;border:1px solid var(--line);overflow:auto} .body a{color:var(--gold)} .meta{margin-top:12px;padding:12px;border-radius:14px;background:#fff4e20a} .meta h4{margin:0 0 8px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em} .meta ul{margin:0;padding-left:18px}
 .composer{padding:16px;display:grid;gap:12px} .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px} .full{grid-column:1/-1} textarea,input{width:100%;border-radius:14px;border:1px solid var(--line);background:#fff4e20a;color:var(--text);padding:12px 14px} textarea{min-height:120px;resize:vertical}
 .empty{color:var(--muted);border:1px dashed var(--line);border-radius:18px;padding:24px} a{color:var(--gold)} details{border:1px solid var(--line);border-radius:16px;padding:12px;background:#fff4e208} summary{cursor:pointer;color:var(--muted)}
 @media (max-width:1100px){.shell{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--line)}}
@@ -87,6 +87,101 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
     stream: byId("stream"),
   };
   const esc = (v) => String(v || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  function renderInline(text) {
+    let html = esc(text);
+    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+    html = html.replace(/\\*\\*([^*\\n]+)\\*\\*/g, "<strong>$1</strong>");
+    html = html.replace(/\\*([^*\\n]+)\\*/g, "<em>$1</em>");
+    html = html.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^)\\s]+)\\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    return html;
+  }
+  function isTableSeparator(line) {
+    return /^\\|\\s*:?-{3,}:?\\s*(\\|\\s*:?-{3,}:?\\s*)+\\|?$/.test(line.trim());
+  }
+  function splitTableRow(line) {
+    return line.trim().replace(/^\\|/, "").replace(/\\|$/, "").split("|").map(cell => cell.trim());
+  }
+  function renderTable(lines) {
+    if (!lines.length) return "";
+    const rows = lines.map(splitTableRow).filter(row => row.length);
+    if (!rows.length) return "";
+    let header = [];
+    let body = rows;
+    if (rows.length >= 2 && isTableSeparator(lines[1])) {
+      header = rows[0];
+      body = rows.slice(2);
+    }
+    if (!header.length) {
+      header = rows[0];
+      body = rows.slice(1);
+    }
+    const headHtml = `<thead><tr>${header.map(cell => `<th>${renderInline(cell)}</th>`).join("")}</tr></thead>`;
+    const bodyHtml = body.length
+      ? `<tbody>${body.map(row => `<tr>${row.map(cell => `<td>${renderInline(cell)}</td>`).join("")}</tr>`).join("")}</tbody>`
+      : "";
+    return `<table>${headHtml}${bodyHtml}</table>`;
+  }
+  function flushParagraph(buffer, out) {
+    if (!buffer.length) return;
+    out.push(`<p>${buffer.map(renderInline).join("<br>")}</p>`);
+    buffer.length = 0;
+  }
+  function flushList(buffer, out) {
+    if (!buffer.length) return;
+    out.push(`<ul>${buffer.map(item => `<li>${renderInline(item)}</li>`).join("")}</ul>`);
+    buffer.length = 0;
+  }
+  function flushTable(buffer, out) {
+    if (!buffer.length) return;
+    out.push(renderTable(buffer));
+    buffer.length = 0;
+  }
+  function renderMarkdown(text) {
+    const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+    const out = [];
+    const paragraph = [];
+    const list = [];
+    const table = [];
+    for (const rawLine of lines) {
+      const line = rawLine || "";
+      const trimmed = line.trim();
+      if (!trimmed) {
+        flushParagraph(paragraph, out);
+        flushList(list, out);
+        flushTable(table, out);
+        continue;
+      }
+      if (/^\\|.*\\|$/.test(trimmed)) {
+        flushParagraph(paragraph, out);
+        flushList(list, out);
+        table.push(trimmed);
+        continue;
+      }
+      const heading = trimmed.match(/^(#{1,4})\\s+(.+)$/);
+      if (heading) {
+        flushParagraph(paragraph, out);
+        flushList(list, out);
+        flushTable(table, out);
+        const level = Math.min(4, heading[1].length);
+        out.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
+        continue;
+      }
+      const bullet = trimmed.match(/^- (.+)$/);
+      if (bullet) {
+        flushParagraph(paragraph, out);
+        flushTable(table, out);
+        list.push(bullet[1]);
+        continue;
+      }
+      flushList(list, out);
+      flushTable(table, out);
+      paragraph.push(trimmed);
+    }
+    flushParagraph(paragraph, out);
+    flushList(list, out);
+    flushTable(table, out);
+    return out.join("") || `<p>${renderInline(text || "")}</p>`;
+  }
   const chip = (n, t, x) => { n.className = `chip ${t}`; n.textContent = x; };
   async function request(path, opt = {}) {
     const headers = new Headers(opt.headers || {});
@@ -162,7 +257,7 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
       if (m.output?.doc_id) meta.push(`<div class="meta"><h4>Output</h4><a target="_blank" rel="noopener noreferrer" href="https://docs.google.com/document/d/${encodeURIComponent(m.output.doc_id)}/edit">${esc(m.output.title || "Otworz dokument")}</a></div>`);
       if (m.stream) meta.push(`<div class="meta"><h4>Streaming</h4><div>${esc(m.stream.selected_mode || "")} / ${esc(m.stream.reason || "")}</div></div>`);
       const actions = (m.actions || []).map(a => `<button class="secondary" type="button" data-action="${esc(a.type)}" data-payload="${encodeURIComponent(JSON.stringify(a.payload || {}))}" data-index="${i}">${esc(a.label)}</button>`).join("");
-      return `<article class="msg ${esc(m.role)} ${m.pending ? "pending" : ""}"><div class="head"><span>${esc(m.role === "user" ? "MG" : "Agent")}</span><span>${esc(m.kind || "")}</span></div>${m.title ? `<h3>${esc(m.title)}</h3>` : ""}<pre class="body">${esc(m.content || "")}</pre>${meta.join("")}<div class="row" style="margin-top:12px">${actions}</div></article>`;
+      return `<article class="msg ${esc(m.role)} ${m.pending ? "pending" : ""}"><div class="head"><span>${esc(m.role === "user" ? "MG" : "Agent")}</span><span>${esc(m.kind || "")}</span></div>${m.title ? `<h3>${esc(m.title)}</h3>` : ""}<div class="body">${renderMarkdown(m.content || "")}</div>${meta.join("")}<div class="row" style="margin-top:12px">${actions}</div></article>`;
     }).join("");
     e.messages.querySelectorAll("[data-action]").forEach(b => b.addEventListener("click", onAction));
     e.messages.scrollTop = e.messages.scrollHeight;

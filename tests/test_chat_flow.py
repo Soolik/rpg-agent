@@ -5,6 +5,20 @@ from app.models_v2 import ChangeProposal, DocumentRef, WorldEntityRecord, WorldT
 
 
 class ChatFlowTest(unittest.TestCase):
+    def test_extract_latest_user_message_uses_last_turn_from_conversation_wrapper(self):
+        wrapped = (
+            "PODSUMOWANIE ROZMOWY:\n"
+            "- U: Rozmowa o Shackles.\n\n"
+            "KONTEKST ROZMOWY:\n"
+            "Uzytkownik: Co wiemy o Port Peril?\n"
+            "Asystent: To glowne miasto startowe.\n\n"
+            "NOWA WIADOMOSC UZYTKOWNIKA:\n"
+            "Coś o sprawie Morna w Shackles?\n\n"
+            "Odpowiedz na ostatnia wiadomosc, zachowujac ciaglosc rozmowy i kanonu."
+        )
+
+        self.assertEqual(main.extract_latest_user_message(wrapped), "Coś o sprawie Morna w Shackles?")
+
     def test_detect_chat_intent_prefers_proposal_markers(self):
         intent = main.detect_chat_intent(
             "W dokumencie Campaign Bible podmien sekcje Test Automation na nowy tekst."
@@ -103,6 +117,62 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("Port Peril jest glownym portem", response.answer)
         self.assertIn("title=Campaign Bible", seen["calls"][0])
         self.assertEqual(response.sources[0]["title"], "Campaign Bible")
+
+    def test_ask_uses_latest_user_message_for_wrapped_conversation_input(self):
+        original_vector_search = main.vector_search
+        original_gemini_generate = main.gemini_generate
+        seen = {}
+
+        wrapped = (
+            "PODSUMOWANIE ROZMOWY:\n"
+            "- U: Rozmowa o kampanii.\n\n"
+            "KONTEKST ROZMOWY:\n"
+            "Uzytkownik: Co to kampania Krew Na Gwiazdach?\n"
+            "Asystent: Kampania zaczyna sie w Port Peril.\n\n"
+            "NOWA WIADOMOSC UZYTKOWNIKA:\n"
+            "Coś o sprawie Morna w Shackles?\n\n"
+            "Odpowiedz na ostatnia wiadomosc, zachowujac ciaglosc rozmowy i kanonu."
+        )
+
+        def fake_vector_search(question, top_k):
+            seen["vector_question"] = question
+            return [
+                {
+                    "chunk_id": 1,
+                    "doc_id": "doc-morn",
+                    "doc_type": "gdoc",
+                    "chunk_text": "Sprawa Morna dotyczy Black Eel i falszywych dokumentow przewozowych.",
+                    "distance": 0.18,
+                    "title": "Dossier Morna - sprawa Black Eel",
+                    "folder": "02 Sessions",
+                    "path_hint": "02 Sessions / Dossier Morna - sprawa Black Eel",
+                }
+            ]
+
+        def fake_gemini_generate(prompt, **kwargs):
+            seen.setdefault("prompts", []).append(prompt)
+            return main.json.dumps(
+                {
+                    "format": "bullets",
+                    "bullets": [
+                        "Sprawa Morna dotyczy Black Eel i falszywych dokumentow przewozowych.",
+                        "To watek osadzony w Shackles i Rozdziale 1 kampanii.",
+                    ],
+                    "used_context": [1],
+                },
+                ensure_ascii=False,
+            )
+
+        try:
+            main.vector_search = fake_vector_search
+            main.gemini_generate = fake_gemini_generate
+            response = main.ask(main.AskRequest(question=wrapped, include_sources=False))
+        finally:
+            main.vector_search = original_vector_search
+            main.gemini_generate = original_gemini_generate
+
+        self.assertEqual(seen["vector_question"], "Coś o sprawie Morna w Shackles?")
+        self.assertIn("Sprawa Morna", response.answer)
 
     def test_ask_uses_analysis_prompt_for_campaign_coherence_questions(self):
         original_vector_search = main.vector_search

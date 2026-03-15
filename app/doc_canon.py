@@ -8,8 +8,8 @@ from typing import Callable, Iterable, Sequence
 from .canon_guard import (
     IGNORED_SINGLE_WORDS,
     PROPER_NOUN_IGNORE_KEYS,
-    extract_proper_noun_candidates,
     extract_titlecase_phrases,
+    looks_like_proper_noun_label,
     normalize_key,
 )
 from .models_v2 import WorldDocInfo, WorldEntityType
@@ -39,6 +39,30 @@ DOC_CANON_IGNORE_KEYS = PROPER_NOUN_IGNORE_KEYS | {
     "thread tracker",
     "world",
     "zrodla",
+}
+
+DOC_CANON_EDGE_IGNORE_KEYS = {
+    "co",
+    "czy",
+    "dla",
+    "do",
+    "gdzie",
+    "jak",
+    "kiedy",
+    "kto",
+    "na",
+    "o",
+    "od",
+    "operacyjnie",
+    "oraz",
+    "po",
+    "politycznie",
+    "przed",
+    "przez",
+    "to",
+    "w",
+    "za",
+    "ze",
 }
 
 
@@ -82,6 +106,47 @@ def _looks_like_doc_canon_name(value: str) -> bool:
     return True
 
 
+def _looks_like_meaningful_multiword_doc_name(value: str) -> bool:
+    cleaned = _clean_candidate(value)
+    if not cleaned or " " not in cleaned:
+        return False
+    words = [part for part in cleaned.split() if part]
+    if len(words) < 2:
+        return False
+    first_key = normalize_key(words[0])
+    last_key = normalize_key(words[-1])
+    if first_key in DOC_CANON_EDGE_IGNORE_KEYS or last_key in DOC_CANON_EDGE_IGNORE_KEYS:
+        return False
+    return all(word[:1].isupper() for word in words)
+
+
+def _extract_structured_name_candidates(text: str) -> list[str]:
+    normalized = normalize_text_artifacts(text or "")
+    candidates: list[str] = []
+    seen = set()
+
+    def add_candidate(value: str) -> None:
+        cleaned = _clean_candidate(value)
+        key = normalize_key(cleaned)
+        if not cleaned or not key or key in seen:
+            return
+        if not looks_like_proper_noun_label(cleaned):
+            return
+        seen.add(key)
+        candidates.append(cleaned)
+
+    for match in re.findall(r"(?m)^\s*#{1,6}\s+([^\n]{2,80})$", normalized):
+        add_candidate(match)
+    for match in re.findall(r"\*\*([^*\n]{2,80})\*\*", normalized):
+        add_candidate(match)
+    for match in re.findall(
+        r"(?m)^\s*[\*\-]?\s*([A-ZĄĆĘŁŃÓŚŹŻ][A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż0-9'_\- ]{1,80})\s*:",
+        normalized,
+    ):
+        add_candidate(match)
+    return candidates
+
+
 def _supporting_line(text: str, name: str, doc: WorldDocInfo) -> str:
     normalized_name = normalize_key(name)
     for raw_line in normalize_text_artifacts(text or "").splitlines():
@@ -111,7 +176,12 @@ def extract_doc_backed_entities(doc: WorldDocInfo, text: str, *, limit: int = 80
     for phrase in extract_titlecase_phrases(doc.title):
         add_candidate(phrase)
 
-    for phrase in extract_proper_noun_candidates(text):
+    for phrase in _extract_structured_name_candidates(text):
+        add_candidate(phrase)
+
+    for phrase in extract_titlecase_phrases(text):
+        if not _looks_like_meaningful_multiword_doc_name(phrase):
+            continue
         add_candidate(phrase)
 
     entity_kind = _world_entity_kind(doc)

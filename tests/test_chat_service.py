@@ -88,6 +88,13 @@ class FakeConversationStore:
         }
         return conversation
 
+    def update_conversation_title(self, conversation_id, *, title):
+        conversation = self.conversations.get(conversation_id)
+        if not conversation:
+            return None
+        conversation.title = title
+        return conversation
+
 
 class ChatServiceTest(unittest.TestCase):
     def build_service(self, chat_fn, conversation_store):
@@ -322,6 +329,32 @@ class ChatServiceTest(unittest.TestCase):
         )
 
         self.assertEqual(response.title, "Krew Na Gwiazdach: opis kampanii")
+
+    def test_run_refreshes_generic_conversation_title_from_first_answer(self):
+        def fake_chat(_req):
+            return ChatResponse(kind="answer", reply="Opis kampanii oparty o notatki.", references=[])
+
+        store = FakeConversationStore()
+        conversation = store.create_conversation(title="Nowa rozmowa", metadata={})
+        service = self.build_service(fake_chat, store)
+        response = service.run(
+            trace=RequestTrace(request_id="req-8", trace_id="req-8"),
+            message="Co to kampania Krew Na Gwiazdach?",
+            assistant_mode=AssistantMode.create,
+            intent="answer",
+            artifact_type=None,
+            source_title=None,
+            candidate_text=None,
+            include_sources=False,
+            include_telemetry=False,
+            save_output=False,
+            output_title=None,
+            conversation_id=conversation.conversation_id,
+            conversation_title=None,
+        )
+
+        self.assertEqual(response.conversation_title, "Krew Na Gwiazdach: opis kampanii")
+        self.assertEqual(store.get_conversation(conversation.conversation_id).title, "Krew Na Gwiazdach: opis kampanii")
 
 
 if __name__ == "__main__":

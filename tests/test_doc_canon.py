@@ -60,6 +60,31 @@ class DocCanonTest(unittest.TestCase):
         self.assertIn("Port Peril", names)
         self.assertIn("Tavin Morn", names)
 
+    def test_extract_doc_backed_entities_filters_generic_heading_noise(self):
+        doc = WorldDocInfo(
+            folder="02 Sessions",
+            title="Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+            doc_id="doc-r1",
+            path_hint="02 Sessions / Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+            entity_type=WorldEntityType.session,
+        )
+        text = (
+            "Operacyjnie sytuacja robi sie gorsza.\n"
+            "Politycznie sprawa eskaluje.\n"
+            "Co Ressa wie, pozostaje niejasne.\n"
+            "Captain Mira rozmawia z Red Blade w Port Peril.\n"
+        )
+
+        entities = extract_doc_backed_entities(doc, text)
+        names = {entity.name for entity in entities}
+
+        self.assertIn("Captain Mira", names)
+        self.assertIn("Red Blade", names)
+        self.assertIn("Port Peril", names)
+        self.assertNotIn("Operacyjnie", names)
+        self.assertNotIn("Politycznie", names)
+        self.assertNotIn("Co Ressa", names)
+
     def test_sync_doc_backed_entities_replaces_rows_for_touched_docs(self):
         doc = WorldDocInfo(
             folder="04 Locations",

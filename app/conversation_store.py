@@ -304,6 +304,36 @@ class ConversationStore:
 
         return self.get_conversation(conversation_id)
 
+    def update_conversation_title(
+        self,
+        conversation_id: str,
+        *,
+        title: str,
+    ) -> Optional[ConversationRecord]:
+        self.ensure_schema()
+        cleaned_title = (title or "").strip()
+        if not cleaned_title:
+            return self.get_conversation(conversation_id)
+
+        with self.connection_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    update conversations
+                    set title = %s,
+                        updated_at = now()
+                    where campaign_id = %s and id = %s
+                    """,
+                    (
+                        cleaned_title[:96],
+                        self.campaign_id,
+                        conversation_id,
+                    ),
+                )
+            conn.commit()
+
+        return self.get_conversation(conversation_id)
+
 
 class NullConversationStore:
     def ensure_schema(self) -> None:
@@ -343,5 +373,13 @@ class NullConversationStore:
         conversation_id: str,
         *,
         metadata_patch: Dict[str, Any],
+    ) -> Optional[ConversationRecord]:
+        return None
+
+    def update_conversation_title(
+        self,
+        conversation_id: str,
+        *,
+        title: str,
     ) -> Optional[ConversationRecord]:
         return None

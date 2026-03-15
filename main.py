@@ -2585,12 +2585,16 @@ def load_creative_generation_context(
     recent_sessions_limit: int,
     vector_top_k: int,
 ) -> Dict[str, Any]:
+    search_message = extract_latest_user_message(message) or message
     structured_context = build_world_model_context(limit=structured_limit)
     recent_sessions_context = build_recent_sessions_context(limit=recent_sessions_limit)
     try:
-        hits = vector_search(message, vector_top_k)
+        hits = vector_search(search_message, vector_top_k)
     except Exception:
         hits = []
+
+    if is_campaign_question(search_message) or has_likely_campaign_hits(hits):
+        hits = augment_campaign_hits(search_message, hits, vector_top_k)
 
     if hits:
         world_context = build_campaign_context(hits)
@@ -2605,7 +2609,7 @@ def load_creative_generation_context(
         "recent_sessions_context": recent_sessions_context,
         "hits": hits,
         "world_context": world_context,
-        "canonical_names": collect_canonical_names(message, hits),
+        "canonical_names": collect_canonical_names(search_message, hits),
     }
 
 
@@ -2698,6 +2702,22 @@ def generate_pre_session_brief(message: str) -> tuple[str, List[str]]:
         canonical_names=canonical_names,
     )
     return artifact_text, render_source_labels(hits)
+
+
+CONVERSATION_NEW_MESSAGE_MARKER = "NOWA WIADOMOSC UZYTKOWNIKA:"
+CONVERSATION_REPLY_INSTRUCTION = "Odpowiedz na ostatnia wiadomosc"
+
+
+def extract_latest_user_message(text: str) -> str:
+    normalized = normalize_text_artifacts(text or "").strip()
+    if not normalized:
+        return ""
+    if CONVERSATION_NEW_MESSAGE_MARKER not in normalized:
+        return normalized
+    latest = normalized.split(CONVERSATION_NEW_MESSAGE_MARKER, 1)[1].strip()
+    if CONVERSATION_REPLY_INSTRUCTION in latest:
+        latest = latest.split(CONVERSATION_REPLY_INSTRUCTION, 1)[0].rstrip()
+    return latest.strip()
 
 
 def ctx_slice(h: Dict[str, Any]) -> str:
@@ -2861,6 +2881,7 @@ def boosted_doc_titles_for_question(question: str) -> List[str]:
                 "Campaign Bible",
                 "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
                 "Przewodnik po Shackles",
+                "Dossier Morna - sprawa Black Eel",
                 "Places",
                 "NPCs",
                 "Events",
@@ -2980,7 +3001,7 @@ def campaign_doc_priority(question: str, hit: Dict[str, Any]) -> int:
     if normalized_title == "npcs":
         score += 130 if overview or first_part or morn_case else 50
     if normalized_title == "dossier morna - sprawa black eel":
-        score += 220 if morn_case or first_part else 70
+        score += 220 if morn_case or first_part else 150 if overview else 70
     if normalized_title == "secrets":
         score += 160 if morn_case else 40
     if normalized_title == "campaign bible":
@@ -3010,8 +3031,8 @@ def shape_campaign_hits(question: str, hits: List[Dict[str, Any]], top_k: int) -
             normalize_match_text(hit.get("path_hint") or ""),
         ),
     )
-    per_doc_limit = 1 if is_campaign_overview_question(question) else 2
-    result_limit = max(top_k + 2, 8 if is_campaign_overview_question(question) else 6)
+    per_doc_limit = 2 if is_campaign_overview_question(question) else 2
+    result_limit = max(top_k + 4, 10 if is_campaign_overview_question(question) else 6)
     selected: List[Dict[str, Any]] = []
     per_doc_counts: Dict[str, int] = {}
     for hit in ordered:
@@ -3034,10 +3055,10 @@ def augment_campaign_hits(question: str, hits: List[Dict[str, Any]], top_k: int)
         return shape_campaign_hits(question, hits, top_k)
     seeded_hits = leading_chunks_for_docs(
         boosted_doc_ids,
-        limit_per_doc=1 if is_campaign_overview_question(question) else 2,
-        total_limit=min(max(top_k + 4, 8), 16),
+        limit_per_doc=2 if is_campaign_overview_question(question) else 2,
+        total_limit=min(max(top_k + 6, 10), 18),
     )
-    boosted_hits = vector_search_in_docs(question, boosted_doc_ids, min(max(top_k, 6), 12))
+    boosted_hits = vector_search_in_docs(question, boosted_doc_ids, min(max(top_k + 2, 8), 14))
     merged = merge_ranked_hits(seeded_hits, boosted_hits, limit=max(top_k + 6, 10))
     merged = merge_ranked_hits(merged, hits, limit=max(top_k + 8, 12))
     return shape_campaign_hits(question, merged, top_k)
@@ -3247,7 +3268,7 @@ Jestes asystentem MG kampanii "Krew Na Gwiazdach". Na podstawie notatek odpowied
 
 ZASADY:
 1) Uzywaj tylko faktow z KONTEKSTU.
-2) Odpowiadaj w 5-8 bulletach, kazdy po 1-3 zdania.
+2) Zwracaj wylacznie liste 5-8 bulletow. Kazdy bullet musi zaczynac sie od "- " i miec 1-3 zdania.
 3) Nie uzywaj pogrubien, tabel, naglowkow, numeracji ani wstepow typu "oto fakty".
 {focus_rule}
 5) Jesli w KONTEKST sa materiały o Shackles, Port Peril albo Rozdziale 1, uwzglednij je przed motywami ogolnymi.
@@ -3655,7 +3676,8 @@ def ctx_slice(h: Dict[str, Any]) -> str:
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     try:
-        q = req.question.strip()
+        raw_question = normalize_text_artifacts(req.question or "").strip()
+        q = extract_latest_user_message(raw_question) or raw_question
         hits: List[Dict[str, Any]] = []
         analysis_mode = False
 
@@ -3768,9 +3790,10 @@ def ask_text(req: AskRequest):
 
 
 def stream_chat(req: ChatRequest) -> StreamPlan:
-    resolved_artifact_type = infer_artifact_type(req.message, req.artifact_type)
+    request_message = extract_latest_user_message(req.message) or req.message
+    resolved_artifact_type = infer_artifact_type(request_message, req.artifact_type)
     explicit_intent = req.intent != "auto"
-    resolved_intent = req.intent if explicit_intent else detect_chat_intent(req.message)
+    resolved_intent = req.intent if explicit_intent else detect_chat_intent(request_message)
     if not explicit_intent and is_creative_artifact_type(resolved_artifact_type):
         resolved_intent = "creative"
 
@@ -3780,7 +3803,7 @@ def stream_chat(req: ChatRequest) -> StreamPlan:
         return StreamPlan(selected_mode="buffered", reason="features_require_buffered_stream")
     if "KONTEKST ROZMOWY:" in req.message or "PODSUMOWANIE ROZMOWY:" in req.message:
         return StreamPlan(selected_mode="buffered", reason="conversation_context_requires_buffered_stream")
-    if is_campaign_question(req.message):
+    if is_campaign_question(request_message):
         return StreamPlan(selected_mode="buffered", reason="campaign_question_requires_buffered_stream")
 
     try:
@@ -3788,7 +3811,7 @@ def stream_chat(req: ChatRequest) -> StreamPlan:
             selected_mode="direct",
             reason="simple_answer_direct_stream_enabled",
             handle=DirectChatStream(
-                chunks=gemini_generate_stream(build_general_prompt(req.message.strip())),
+                chunks=gemini_generate_stream(build_general_prompt(request_message.strip())),
                 kind="answer",
             ),
         )
@@ -3806,9 +3829,10 @@ def chat(req: ChatRequest):
                 telemetry=current_request_telemetry() if req.include_telemetry else None,
             )
 
-        resolved_artifact_type = infer_artifact_type(req.message, req.artifact_type)
+        request_message = extract_latest_user_message(req.message) or req.message
+        resolved_artifact_type = infer_artifact_type(request_message, req.artifact_type)
         explicit_intent = req.intent != "auto"
-        resolved_intent = req.intent if explicit_intent else detect_chat_intent(req.message)
+        resolved_intent = req.intent if explicit_intent else detect_chat_intent(request_message)
         if not explicit_intent and is_creative_artifact_type(resolved_artifact_type):
             resolved_intent = "creative"
         warnings: List[str] = []

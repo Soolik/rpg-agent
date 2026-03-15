@@ -154,6 +154,15 @@ def _derive_response_title(response: ChatResponse, message: str = "") -> str:
     return _compact_title(_first_nonempty_line(response.reply), fallback="Odpowiedz")
 
 
+GENERIC_RESPONSE_TITLES = {
+    "Odpowiedz",
+    "Guard Report",
+    "Potwierdz zapis",
+    "Potwierdz zmiane kanonu",
+    "Potwierdz dzialanie",
+}
+
+
 def _next_actions_for_response(
     *,
     response: ChatResponse,
@@ -535,6 +544,34 @@ class ChatService:
             },
         )
 
+    def _maybe_refresh_conversation_title(
+        self,
+        conversation: Optional[ConversationRecord],
+        *,
+        response: V1ChatResponse,
+    ) -> Optional[ConversationRecord]:
+        if not conversation or not self.conversation_storage_enabled():
+            return conversation
+        proposed_title = (response.title or "").strip()
+        if not proposed_title or proposed_title in GENERIC_RESPONSE_TITLES:
+            response.conversation_title = conversation.title
+            return conversation
+        current_title = (conversation.title or "").strip()
+        should_update = current_title in {"", "Nowa rozmowa", "Rozmowa"} or conversation.message_count <= 1
+        if not should_update:
+            response.conversation_title = conversation.title
+            return conversation
+        updated = self.conversation_store.update_conversation_title(
+            conversation.conversation_id,
+            title=proposed_title,
+        )
+        if updated:
+            conversation.title = updated.title
+            response.conversation_title = updated.title
+            return updated
+        response.conversation_title = conversation.title
+        return conversation
+
     def _refresh_conversation_summary(self, conversation: Optional[ConversationRecord]) -> None:
         if not conversation or not self.conversation_storage_enabled():
             return
@@ -824,6 +861,7 @@ class ChatService:
                 title=decision.confirmation_title or "Potwierdz dzialanie",
                 body=decision.confirmation_body or "Potwierdz, zanim agent wykona trwala operacje.",
             )
+            conversation = self._maybe_refresh_conversation_title(conversation, response=rendered)
             self._append_assistant_message(conversation, response=rendered)
             self._refresh_conversation_summary(conversation)
             return rendered
@@ -869,6 +907,7 @@ class ChatService:
                 conversation_title=conversation.title if conversation else None,
             )
 
+        conversation = self._maybe_refresh_conversation_title(conversation, response=rendered)
         self._append_assistant_message(conversation, response=rendered)
         self._refresh_conversation_summary(conversation)
         return rendered
@@ -1033,8 +1072,9 @@ class ChatService:
                     selected_mode="direct",
                     reason=stream_plan.reason,
                 )
-                self._append_assistant_message(conversation, response=final_response)
-                self._refresh_conversation_summary(conversation)
+                updated_conversation = self._maybe_refresh_conversation_title(conversation, response=final_response)
+                self._append_assistant_message(updated_conversation, response=final_response)
+                self._refresh_conversation_summary(updated_conversation)
                 yield _sse_event("complete", final_response.model_dump(mode="json"))
             except Exception as exc:
                 yield _sse_event(

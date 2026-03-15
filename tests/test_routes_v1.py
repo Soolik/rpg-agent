@@ -376,6 +376,13 @@ class FakeConversationStore:
         }
         return conversation
 
+    def update_conversation_title(self, conversation_id, *, title):
+        conversation = self.conversations.get(conversation_id)
+        if not conversation:
+            return None
+        conversation.title = title
+        return conversation
+
 
 class RoutesV1Test(unittest.TestCase):
     def build_router(self, chat_fn=None, chat_stream_fn=None, workflow_store=None, conversation_store=None, drive_store=None, reindex_fn=None, oauth_service=None, campaign_reset_fn=None):
