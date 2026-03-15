@@ -68,6 +68,8 @@ from app.creative_artifacts import (
     trim_to_complete_sentences,
 )
 from app.drive_store import DriveStore, decode_google_export_text
+from app.google_drive_oauth_service import GoogleDriveOAuthConfig, GoogleDriveOAuthService
+from app.google_drive_oauth_store import GoogleDriveOAuthStore
 from app.models_v2 import (
     ChangeProposal,
     DocumentRef,
@@ -79,6 +81,7 @@ from app.models_v2 import (
     WorldEntityType,
 )
 from app.planner import PlannerService
+from app.routed_drive_store import RoutedDriveStore
 from app.routes_v1 import build_v1_router
 from app.routes_v2 import build_context_for_planner, build_v2_router
 from app.text_normalization import normalize_text_artifacts
@@ -105,6 +108,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OUTPUT_ROLLUP_DOC_ID = os.getenv("OUTPUT_ROLLUP_DOC_ID")
 OUTPUT_ROLLUP_DOC_TITLE = os.getenv("OUTPUT_ROLLUP_DOC_TITLE") or os.getenv("OUTPUT_ROLLUP_DOC_TITLE ")
 OUTPUT_ROLLUP_MODE = (os.getenv("OUTPUT_ROLLUP_MODE") or os.getenv("OUTPUT_ROLLUP_MODE ") or "replace").strip().lower()
+GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
+GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET")
+GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY = os.getenv("GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY")
 
 # Models
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")
@@ -2634,6 +2642,52 @@ def build_drive_store() -> DriveStore:
     return DriveStore(folder_map=folder_map, core_doc_map=core_doc_map)
 
 
+def build_google_drive_oauth_store() -> Optional[GoogleDriveOAuthStore]:
+    if not DB_URL:
+        return None
+    return GoogleDriveOAuthStore(campaign_id=CAMPAIGN_ID, connection_factory=db_conn)
+
+
+def build_google_drive_oauth_service() -> Optional[GoogleDriveOAuthService]:
+    store = build_google_drive_oauth_store()
+    if not store:
+        return None
+    if not all(
+        [
+            GOOGLE_OAUTH_CLIENT_ID,
+            GOOGLE_OAUTH_CLIENT_SECRET,
+            GOOGLE_OAUTH_REDIRECT_URI,
+            GOOGLE_OAUTH_STATE_SECRET or GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY,
+            GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY,
+        ]
+    ):
+        return GoogleDriveOAuthService(store=store, config=None)
+    config = GoogleDriveOAuthConfig(
+        client_id=GOOGLE_OAUTH_CLIENT_ID or "",
+        client_secret=GOOGLE_OAUTH_CLIENT_SECRET or "",
+        redirect_uri=GOOGLE_OAUTH_REDIRECT_URI or "",
+        state_secret=GOOGLE_OAUTH_STATE_SECRET or GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY or "",
+        token_encryption_key=GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY or "",
+    )
+    return GoogleDriveOAuthService(store=store, config=config)
+
+
+def build_routed_drive_store(
+    *,
+    base_store: DriveStore,
+    oauth_service: Optional[GoogleDriveOAuthService],
+):
+    if not oauth_service:
+        return base_store
+    return RoutedDriveStore(
+        read_store=base_store,
+        write_store_factory=lambda: oauth_service.build_user_drive_store(
+            folder_map=base_store.folder_map,
+            core_doc_map=base_store.core_doc_map,
+        ),
+    )
+
+
 def build_workflow_store() -> Optional[WorkflowStore]:
     if not DB_URL:
         return None
@@ -2778,7 +2832,9 @@ def reindex_after_apply_default(targets: List[DocumentRef]) -> Dict[str, Any]:
     return result
 
 
-drive_store_v2 = build_drive_store()
+base_drive_store_v2 = build_drive_store()
+google_drive_oauth_service_v1 = build_google_drive_oauth_service()
+drive_store_v2 = build_routed_drive_store(base_store=base_drive_store_v2, oauth_service=google_drive_oauth_service_v1)
 workflow_store_v2 = build_workflow_store()
 world_model_store_v2 = build_world_model_store()
 conversation_store_v1 = build_conversation_store()
@@ -2810,6 +2866,7 @@ app.include_router(
         conversation_store=conversation_store_v1,
         applier=proposal_applier_v2,
         reindex_fn=reindex_after_apply_default,
+        google_drive_oauth_service=google_drive_oauth_service_v1,
     )
 )
 

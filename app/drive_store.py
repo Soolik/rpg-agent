@@ -4,7 +4,7 @@ import re
 import zipfile
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 from xml.etree import ElementTree
 
 import google.auth
@@ -167,13 +167,20 @@ class DriveStore:
 
     folder_map: Dict[str, str]
     core_doc_map: Dict[str, str]
+    credentials_provider: Optional[Callable[[Sequence[str]], object]] = None
+
+    def _credentials(self, scopes: Sequence[str]):
+        if self.credentials_provider is not None:
+            return self.credentials_provider(scopes)
+        creds, _ = google.auth.default(scopes=list(scopes))
+        return creds
 
     def _drive(self):
-        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/drive"])
+        creds = self._credentials(["https://www.googleapis.com/auth/drive"])
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
     def _docs(self):
-        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/documents", "https://www.googleapis.com/auth/drive"])
+        creds = self._credentials(["https://www.googleapis.com/auth/documents", "https://www.googleapis.com/auth/drive"])
         return build("docs", "v1", credentials=creds, cache_discovery=False)
 
     def _export_plain_text(self, file_id: str) -> str:

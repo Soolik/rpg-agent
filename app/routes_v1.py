@@ -4,6 +4,7 @@ import uuid
 from typing import Callable, Optional, Type
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import HTMLResponse
 
 from .api_models import (
     AssistantActionRequest,
@@ -18,6 +19,8 @@ from .api_models import (
     ConversationMessageCreateRequest,
     ConversationMessageListResponse,
     ConversationResponse,
+    GoogleDriveOAuthStartResponse,
+    GoogleDriveOAuthStatusResponse,
     ProposalStatus,
     ProposalType,
     RequestTrace,
@@ -43,6 +46,7 @@ from .canonical_import_service import CanonicalImportService
 from .chat_service import ChatService, StreamPlan
 from .chat_models import ChatRequest, ChatResponse
 from .conversation_store import ConversationStore, NullConversationStore
+from .google_drive_oauth_service import GoogleDriveOAuthError, GoogleDriveOAuthService
 from .world_model_service import WorldModelService
 from .world_model_store import NullWorldModelStore, WorldModelStore
 from .workflow_store import NullWorkflowStore, WorkflowStore
@@ -79,6 +83,7 @@ def build_v1_router(
     conversation_store: Optional[ConversationStore | NullConversationStore] = None,
     applier: Optional[ProposalApplier] = None,
     reindex_fn: Optional[Callable[[list], dict]] = None,
+    google_drive_oauth_service: Optional[GoogleDriveOAuthService] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/v1", tags=["v1"])
     store = workflow_store or NullWorkflowStore()
@@ -104,6 +109,7 @@ def build_v1_router(
     )
     world_model_service = WorldModelService(world_model_store=model_store)
     canonical_import_service = CanonicalImportService(drive_store=drive_store, reindex_fn=reindex_fn)
+    oauth_service = google_drive_oauth_service
 
     @router.get("/health", response_model=V1HealthResponse)
     def v1_health():
@@ -115,6 +121,91 @@ def build_v1_router(
             ok=bool(payload.get("ok")),
             campaign_id=payload.get("campaign_id") or "",
             revision=payload.get("revision") or "unknown",
+        )
+
+    @router.get("/auth/google-drive/status", response_model=GoogleDriveOAuthStatusResponse)
+    def v1_google_drive_auth_status():
+        trace = _new_trace()
+        status = oauth_service.get_status() if oauth_service else None
+        return GoogleDriveOAuthStatusResponse(
+            request_id=trace.request_id,
+            trace_id=trace.trace_id,
+            configured=bool(status.configured) if status else False,
+            connected=bool(status.connected) if status else False,
+            subject_email=status.subject_email if status else None,
+            scopes=status.scopes if status else [],
+            redirect_uri=status.redirect_uri if status else None,
+            write_mode=status.write_mode if status else "service_account",
+        )
+
+    @router.post("/auth/google-drive/start", response_model=GoogleDriveOAuthStartResponse)
+    def v1_google_drive_auth_start():
+        trace = _new_trace()
+        if not oauth_service:
+            raise _api_error(
+                503,
+                request_trace=trace,
+                code="google_drive_oauth_unavailable",
+                message="Google Drive OAuth is not configured for this deployment.",
+            )
+        try:
+            started = oauth_service.start_authorization()
+        except GoogleDriveOAuthError as exc:
+            raise _api_error(
+                503,
+                request_trace=trace,
+                code="google_drive_oauth_unavailable",
+                message=str(exc),
+            )
+        return GoogleDriveOAuthStartResponse(
+            request_id=trace.request_id,
+            trace_id=trace.trace_id,
+            authorization_url=started.authorization_url,
+            redirect_uri=started.redirect_uri,
+            scopes=started.scopes,
+        )
+
+    @router.get("/auth/google-drive/callback", response_class=HTMLResponse)
+    def v1_google_drive_auth_callback(code: str, state: str):
+        trace = _new_trace()
+        if not oauth_service:
+            raise _api_error(
+                503,
+                request_trace=trace,
+                code="google_drive_oauth_unavailable",
+                message="Google Drive OAuth is not configured for this deployment.",
+            )
+        try:
+            result = oauth_service.handle_callback(code=code, state=state)
+        except GoogleDriveOAuthError as exc:
+            raise _api_error(
+                400,
+                request_trace=trace,
+                code="google_drive_oauth_callback_failed",
+                message=str(exc),
+            )
+        return HTMLResponse(content=result.html_body)
+
+    @router.post("/auth/google-drive/disconnect", response_model=GoogleDriveOAuthStatusResponse)
+    def v1_google_drive_auth_disconnect():
+        trace = _new_trace()
+        if not oauth_service:
+            raise _api_error(
+                503,
+                request_trace=trace,
+                code="google_drive_oauth_unavailable",
+                message="Google Drive OAuth is not configured for this deployment.",
+            )
+        status = oauth_service.disconnect()
+        return GoogleDriveOAuthStatusResponse(
+            request_id=trace.request_id,
+            trace_id=trace.trace_id,
+            configured=status.configured,
+            connected=status.connected,
+            subject_email=status.subject_email,
+            scopes=status.scopes,
+            redirect_uri=status.redirect_uri,
+            write_mode=status.write_mode,
         )
 
     @router.get("/conversations", response_model=ConversationListResponse)

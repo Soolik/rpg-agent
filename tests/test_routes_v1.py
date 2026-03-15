@@ -80,6 +80,55 @@ class FailingCreateDriveStore(FakeDriveStore):
         raise RuntimeError("quota exceeded for test")
 
 
+class FakeGoogleDriveOAuthService:
+    def __init__(self, *, configured=True, connected=False, subject_email=None):
+        self.configured = configured
+        self.connected = connected
+        self.subject_email = subject_email
+        self.start_called = False
+        self.disconnect_called = False
+        self.callback_called = None
+
+    def get_status(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            configured=self.configured,
+            connected=self.connected,
+            subject_email=self.subject_email,
+            scopes=["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/documents"] if self.configured else [],
+            redirect_uri="https://example.com/v1/auth/google-drive/callback" if self.configured else None,
+            write_mode="user_oauth" if self.connected else "service_account",
+        )
+
+    def start_authorization(self):
+        self.start_called = True
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            authorization_url="https://accounts.google.com/o/oauth2/v2/auth?client_id=test-client",
+            redirect_uri="https://example.com/v1/auth/google-drive/callback",
+            scopes=["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/documents"],
+        )
+
+    def handle_callback(self, *, code, state):
+        self.callback_called = {"code": code, "state": state}
+        self.connected = True
+        self.subject_email = "soolik1990@gmail.com"
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            status=self.get_status(),
+            html_body="<html><body>connected</body></html>",
+        )
+
+    def disconnect(self):
+        self.disconnect_called = True
+        self.connected = False
+        self.subject_email = None
+        return self.get_status()
+
+
 class FakePlanner:
     def propose(self, request, world_docs, world_context):
         return ChangeProposal(
@@ -324,7 +373,7 @@ class FakeConversationStore:
 
 
 class RoutesV1Test(unittest.TestCase):
-    def build_router(self, chat_fn=None, chat_stream_fn=None, workflow_store=None, conversation_store=None, drive_store=None, reindex_fn=None):
+    def build_router(self, chat_fn=None, chat_stream_fn=None, workflow_store=None, conversation_store=None, drive_store=None, reindex_fn=None, oauth_service=None):
         return build_v1_router(
             chat_request_cls=ChatRequest,
             chat_fn=chat_fn or (lambda req: ChatResponse(kind="answer", reply="OK", references=[])),
@@ -337,6 +386,7 @@ class RoutesV1Test(unittest.TestCase):
             conversation_store=conversation_store or FakeConversationStore(),
             applier=FakeApplier(),
             reindex_fn=reindex_fn,
+            google_drive_oauth_service=oauth_service,
         )
 
     def route_endpoint(self, router, path, method):
@@ -359,6 +409,34 @@ class RoutesV1Test(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertTrue(body["request_id"])
         self.assertEqual(body["request_id"], body["trace_id"])
+
+    def test_v1_google_drive_auth_status_reports_connection(self):
+        router = self.build_router(oauth_service=FakeGoogleDriveOAuthService(connected=True, subject_email="soolik1990@gmail.com"))
+
+        body = self.route_endpoint(router, "/v1/auth/google-drive/status", "GET")().model_dump(mode="json")
+
+        self.assertTrue(body["configured"])
+        self.assertTrue(body["connected"])
+        self.assertEqual(body["subject_email"], "soolik1990@gmail.com")
+        self.assertEqual(body["write_mode"], "user_oauth")
+
+    def test_v1_google_drive_auth_start_returns_authorization_url(self):
+        oauth_service = FakeGoogleDriveOAuthService()
+        router = self.build_router(oauth_service=oauth_service)
+
+        body = self.route_endpoint(router, "/v1/auth/google-drive/start", "POST")().model_dump(mode="json")
+
+        self.assertTrue(oauth_service.start_called)
+        self.assertIn("accounts.google.com", body["authorization_url"])
+
+    def test_v1_google_drive_auth_disconnect_returns_status(self):
+        oauth_service = FakeGoogleDriveOAuthService(connected=True, subject_email="soolik1990@gmail.com")
+        router = self.build_router(oauth_service=oauth_service)
+
+        body = self.route_endpoint(router, "/v1/auth/google-drive/disconnect", "POST")().model_dump(mode="json")
+
+        self.assertTrue(oauth_service.disconnect_called)
+        self.assertFalse(body["connected"])
 
     def test_v1_chat_auto_creates_conversation_and_persists_messages(self):
         seen = {}

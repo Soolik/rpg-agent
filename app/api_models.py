@@ -213,6 +213,21 @@ class WorldModelSearchResponse(RequestTrace):
     items: List[WorldModelSearchItem] = Field(default_factory=list)
 
 
+class GoogleDriveOAuthStatusResponse(RequestTrace):
+    configured: bool = False
+    connected: bool = False
+    subject_email: Optional[str] = None
+    scopes: List[str] = Field(default_factory=list)
+    redirect_uri: Optional[str] = None
+    write_mode: Literal["service_account", "user_oauth"] = "service_account"
+
+
+class GoogleDriveOAuthStartResponse(RequestTrace):
+    authorization_url: str
+    redirect_uri: str
+    scopes: List[str] = Field(default_factory=list)
+
+
 class CanonicalImportRequest(BaseModel):
     source_path: Optional[str] = None
     source_drive_folder_id: Optional[str] = None

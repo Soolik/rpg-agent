@@ -25,6 +25,10 @@ Nowy kontrakt dla klienta chatowego i UI worldbuildingu:
 - `POST /v1/chat` - glowny endpoint asystenta z trybami `create`, `guard`, `editor`
 - `POST /v1/assistant/actions` - wykonanie akcji zwrotnych z `next_actions`
 - `POST /v1/imports/canonical-files` - import z lokalnego folderu albo z folderu Google Drive
+- `GET /v1/auth/google-drive/status`
+- `POST /v1/auth/google-drive/start`
+- `GET /v1/auth/google-drive/callback`
+- `POST /v1/auth/google-drive/disconnect`
 - `GET /v1/conversations`
 - `POST /v1/conversations`
 - `GET /v1/conversations/{conversation_id}/messages`
@@ -135,6 +139,26 @@ Przykladowy request importu z folderu Google Drive:
   "replace_existing": true,
   "reindex_after_import": true
 }
+```
+
+Google Drive OAuth:
+
+- odczyt i indeksowanie dalej moga korzystac z service account
+- zapis (`create_doc`, `replace_doc`, `append_doc`, `replace_section`) automatycznie przechodzi na konto uzytkownika po podlaczeniu OAuth
+- bez podlaczonego OAuth zapis dalej spada do service account
+
+Do konfiguracji OAuth potrzebne sa:
+
+- `GOOGLE_OAUTH_CLIENT_ID`
+- `GOOGLE_OAUTH_CLIENT_SECRET`
+- `GOOGLE_OAUTH_REDIRECT_URI`
+- `GOOGLE_OAUTH_STATE_SECRET`
+- `GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY`
+
+`GOOGLE_OAUTH_REDIRECT_URI` dla produkcji powinno wskazywac na:
+
+```text
+https://rpg-agent-github-7sb25o63kq-ew.a.run.app/v1/auth/google-drive/callback
 ```
 
 Uwaga praktyczna:
