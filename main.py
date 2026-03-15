@@ -3068,6 +3068,23 @@ def render_campaign_out(out: CampaignOut) -> str:
     return "\n".join(f"- {bullet}" for bullet in bullets)
 
 
+def is_campaign_answer_too_thin(question: str, answer: str) -> bool:
+    stripped = normalize_text_artifacts(answer or "").strip()
+    if not stripped or stripped == CAMPAIGN_NOT_FOUND_MESSAGE:
+        return False
+    content = re.split(r"(?im)^\s*(?:zrodla|sources)\s*:\s*$", stripped, maxsplit=1)[0].strip()
+    bullet_count = sum(1 for line in content.splitlines() if line.strip().startswith("- "))
+    char_count = len(content)
+
+    if is_campaign_overview_question(question):
+        return bullet_count < 4 or char_count < 360
+    if is_morn_campaign_question(question) or is_first_part_campaign_question(question):
+        return bullet_count < 4 or char_count < 420
+    if is_campaign_analysis_question(question):
+        return char_count < 320
+    return bullet_count < 3 or char_count < 260
+
+
 def build_campaign_prompt(question: str, context: str) -> str:
     return f"""
 Jestes asystentem MG kampanii "Krew Na Gwiazdach". Odpowiadasz po polsku.
@@ -3207,14 +3224,32 @@ ODPOWIEDZ:
 
 
 def build_campaign_text_prompt(question: str, context: str) -> str:
+    if is_campaign_overview_question(question):
+        focus_rule = (
+            "4) Dla pytania ogolnego pokryj w odpowiedzi: realia Shackles i Port Peril, pierwszy rozdzial, sprawe Morna, "
+            "kluczowe sily polityczne lub frakcyjne oraz stawki kampanii."
+        )
+    elif is_morn_campaign_question(question):
+        focus_rule = (
+            "4) Dla pytan o sprawe Morna opisz: na czym polega przekret, kto jest zaangazowany, jakie dokumenty lub ladunek "
+            "sa kluczowe oraz dlaczego sprawa jest politycznie wazna dla kampanii."
+        )
+    elif is_first_part_campaign_question(question):
+        focus_rule = (
+            "4) Dla pytan o pierwsza czesc kampanii opisz kolejnosc zdarzen, glowna sprawe startowa, najwazniejsze postacie "
+            "i co to zmienia dla dalszej kampanii."
+        )
+    else:
+        focus_rule = "4) Najpierw podaj fakty praktyczne i kampanijne, dopiero potem motywy ogolne."
+
     return f"""
 Jestes asystentem MG kampanii "Krew Na Gwiazdach". Na podstawie notatek odpowiedz po polsku.
 
 ZASADY:
 1) Uzywaj tylko faktow z KONTEKSTU.
-2) Odpowiadaj w 4-8 krotkich bulletach, kazdy po 1-2 zdania.
+2) Odpowiadaj w 5-8 bulletach, kazdy po 1-3 zdania.
 3) Nie uzywaj pogrubien, tabel, naglowkow, numeracji ani wstepow typu "oto fakty".
-4) Jesli pytanie jest ogolne, najpierw podaj fakty praktyczne: gdzie zaczyna sie kampania, jaki jest pierwszy rozdzial i jaka sprawa napedza start.
+{focus_rule}
 5) Jesli w KONTEKST sa materiały o Shackles, Port Peril albo Rozdziale 1, uwzglednij je przed motywami ogolnymi.
 6) Unikaj materialow administracyjnych i technicznych list dokumentow.
 7) Jesli danych jest za malo, napisz wprost czego brakuje zamiast przechodzic w ogolniki.
@@ -3691,7 +3726,7 @@ POPRAWNY OUTPUT (tylko JSON):
                 temperature=0.2,
                 max_output_tokens=2200,
             ).strip()
-        if answer == CAMPAIGN_NOT_FOUND_MESSAGE:
+        if answer == CAMPAIGN_NOT_FOUND_MESSAGE or is_campaign_answer_too_thin(q, answer):
             fallback_prompt = build_campaign_analysis_text_prompt(q, context) if analysis_mode else build_campaign_text_prompt(q, context)
             fallback_answer = gemini_generate(
                 fallback_prompt,

@@ -26,8 +26,9 @@ class WorldModelService:
             return []
 
         items: list[WorldModelSearchItem] = []
+        scan_limit = max(limit * 10, 1000)
 
-        for entity in self.world_model_store.list_entities(limit=max(limit * 3, 50)):
+        for entity in self.world_model_store.list_entities(limit=scan_limit):
             haystack = normalize_key(" ".join(filter(None, [entity.name, entity.description, " ".join(entity.tags)])))
             if qkey not in haystack:
                 continue
@@ -43,7 +44,7 @@ class WorldModelService:
                 )
             )
 
-        for thread in self.world_model_store.list_threads(limit=max(limit * 3, 50)):
+        for thread in self.world_model_store.list_threads(limit=scan_limit):
             haystack = normalize_key(" ".join(filter(None, [thread.thread_id or "", thread.title, thread.last_change, thread.status or ""])))
             if qkey not in haystack:
                 continue
@@ -59,7 +60,7 @@ class WorldModelService:
                 )
             )
 
-        for session in self.world_model_store.list_sessions(limit=max(limit * 3, 50)):
+        for session in self.world_model_store.list_sessions(limit=scan_limit):
             haystack = normalize_key(" ".join(filter(None, [session.session_summary, session.source_title or ""])))
             if qkey not in haystack:
                 continue

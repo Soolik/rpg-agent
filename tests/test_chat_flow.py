@@ -55,7 +55,7 @@ class ChatFlowTest(unittest.TestCase):
     def test_ask_auto_uses_campaign_path_when_vector_hits_are_strong(self):
         original_vector_search = main.vector_search
         original_gemini_generate = main.gemini_generate
-        seen = {}
+        seen = {"calls": []}
 
         def fake_vector_search(question, top_k):
             seen["vector_question"] = question
@@ -73,11 +73,15 @@ class ChatFlowTest(unittest.TestCase):
             ]
 
         def fake_gemini_generate(prompt, **kwargs):
-            seen["prompt"] = prompt
+            seen["calls"].append(prompt)
             return main.json.dumps(
                 {
                     "format": "bullets",
-                    "bullets": ["Port Peril jest glownym portem i politycznym punktem zapalnym kampanii."],
+                    "bullets": [
+                        "Port Peril jest glownym portem i politycznym punktem zapalnym kampanii.",
+                        "To tutaj zbiegaja sie dlugi, przysiegi i naciski polityczne.",
+                        "Notatki kampanii osadzaja tam start glownego konfliktu.",
+                    ],
                     "used_context": [1],
                 },
                 ensure_ascii=False,
@@ -97,13 +101,13 @@ class ChatFlowTest(unittest.TestCase):
             main.gemini_generate = original_gemini_generate
 
         self.assertIn("Port Peril jest glownym portem", response.answer)
-        self.assertIn("KONTEKST (kazdy blok zawiera title, folder, doc_type i tresc chunku):", seen["prompt"])
+        self.assertIn("title=Campaign Bible", seen["calls"][0])
         self.assertEqual(response.sources[0]["title"], "Campaign Bible")
 
     def test_ask_uses_analysis_prompt_for_campaign_coherence_questions(self):
         original_vector_search = main.vector_search
         original_gemini_generate = main.gemini_generate
-        seen = {}
+        seen = {"calls": []}
 
         def fake_vector_search(question, top_k):
             return [
@@ -120,13 +124,15 @@ class ChatFlowTest(unittest.TestCase):
             ]
 
         def fake_gemini_generate(prompt, **kwargs):
-            seen["prompt"] = prompt
+            seen["calls"].append(prompt)
             return main.json.dumps(
                 {
                     "format": "bullets",
                     "bullets": [
                         "Zamach na Tavina Morna daje kampanii mocny punkt zapalny, bo laczy polityke portu, dlugi i przysiegi w jedno zdarzenie.",
                         "Najwiekszym ryzykiem jest to, czy notatki dostatecznie wyjasniaja zaleznosc miedzy Red Blade, dlugami i eskalacja przemocy.",
+                        "W notatkach widac juz os konfliktu miedzy dokumentami, przysiegami i przemocą.",
+                        "Do doprecyzowania zostaje, kto wykonuje kolejne ruchy operacyjne i jak szybko eskaluje przemoc.",
                     ],
                     "used_context": [1],
                 },
@@ -146,7 +152,7 @@ class ChatFlowTest(unittest.TestCase):
             main.vector_search = original_vector_search
             main.gemini_generate = original_gemini_generate
 
-        self.assertIn("Analizujesz spojnosci, napiecia i ryzyka kampanii", seen["prompt"])
+        self.assertIn("Analizujesz spojnosci, napiecia i ryzyka kampanii", seen["calls"][0])
         self.assertIn("Najwiekszym ryzykiem", response.answer)
 
     def test_ask_analysis_falls_back_to_text_synthesis_when_json_says_brak_w_notatkach(self):
@@ -240,7 +246,12 @@ class ChatFlowTest(unittest.TestCase):
             seen["calls"].append(prompt)
             if kwargs.get("response_mime_type") == "application/json":
                 return "nie-json"
-            return "- Kampania zaczyna sie w Shackles, w Port Peril.\n- Rozdzial 1 obraca sie wokol sprawy Morna."
+            return (
+                "- Kampania zaczyna sie w Shackles, w Port Peril.\n"
+                "- Rozdzial 1 obraca sie wokol sprawy Morna.\n"
+                "- Stawki startowe sa polityczne i portowe.\n"
+                "- To ustawia konflikt juz od pierwszej czesci."
+            )
 
         try:
             main.vector_search = fake_vector_search
@@ -257,8 +268,81 @@ class ChatFlowTest(unittest.TestCase):
             main.augment_campaign_hits = original_augment_campaign_hits
             main.gemini_generate = original_gemini_generate
 
-        self.assertEqual(len(seen["calls"]), 3)
+        self.assertEqual(len(seen["calls"]), 4)
         self.assertIn("Port Peril", response.answer)
+        self.assertIn("sprawy Morna", response.answer)
+
+    def test_ask_campaign_overview_retries_when_initial_answer_is_too_thin(self):
+        original_vector_search = main.vector_search
+        original_gemini_generate = main.gemini_generate
+        original_augment_campaign_hits = main.augment_campaign_hits
+        seen = {"calls": []}
+
+        hits = [
+            {
+                "chunk_id": 1,
+                "doc_id": "doc-r1",
+                "doc_type": "gdoc",
+                "chunk_text": "Rozdzial 1 zaczyna sie w Port Peril i koncentruje na sprawie Morna.",
+                "distance": 0.2,
+                "title": "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+                "folder": "02 Sessions",
+                "path_hint": "02 Sessions / Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+            },
+            {
+                "chunk_id": 2,
+                "doc_id": "doc-shackles",
+                "doc_type": "gdoc",
+                "chunk_text": "Shackles i Port Peril stanowia realia startowe kampanii.",
+                "distance": 0.25,
+                "title": "Przewodnik po Shackles",
+                "folder": "01 Bible",
+                "path_hint": "01 Bible / Przewodnik po Shackles",
+            },
+        ]
+
+        def fake_vector_search(question, top_k):
+            return hits
+
+        def fake_gemini_generate(prompt, **kwargs):
+            seen["calls"].append(prompt)
+            if kwargs.get("response_mime_type") == "application/json":
+                return main.json.dumps(
+                    {
+                        "format": "bullets",
+                        "bullets": [
+                            "Kampania zaczyna sie w Port Peril.",
+                            "Rozdzial 1 dotyczy sprawy Morna.",
+                        ],
+                        "used_context": [1, 2],
+                    },
+                    ensure_ascii=False,
+                )
+            return (
+                "- Kampania zaczyna sie w Shackles, w Port Peril.\n"
+                "- Rozdzial 1 nosi tytul Cienie w Port Peril i obraca sie wokol sprawy Morna.\n"
+                "- Sprawa Morna wyznacza pierwszy konkretny konflikt kampanii.\n"
+                "- Shackles ustawia polityke dlugow, reputacji i przemocy.\n"
+                "- To tlo nadaje kampanii stawki juz od pierwszej czesci."
+            )
+
+        try:
+            main.vector_search = fake_vector_search
+            main.augment_campaign_hits = lambda question, current_hits, top_k: current_hits
+            main.gemini_generate = fake_gemini_generate
+            response = main.ask(
+                main.AskRequest(
+                    question="Co to kampania Krew Na Gwiazdach?",
+                    include_sources=False,
+                )
+            )
+        finally:
+            main.vector_search = original_vector_search
+            main.augment_campaign_hits = original_augment_campaign_hits
+            main.gemini_generate = original_gemini_generate
+
+        self.assertEqual(len(seen["calls"]), 2)
+        self.assertIn("Shackles", response.answer)
         self.assertIn("sprawy Morna", response.answer)
 
     def test_ask_campaign_answer_falls_back_to_text_when_json_says_brak_w_notatkach(self):
