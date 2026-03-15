@@ -486,13 +486,28 @@ def build_v1_router(
     @router.post("/imports/canonical-files", response_model=CanonicalImportResponse)
     def v1_import_canonical_files(request: CanonicalImportRequest):
         trace = _new_trace()
-        try:
-            imported = canonical_import_service.import_folder(
-                source_path=request.source_path,
-                dry_run=request.dry_run,
-                replace_existing=request.replace_existing,
-                reindex_after_import=request.reindex_after_import,
+        if bool(request.source_path) == bool(request.source_drive_folder_id):
+            raise _api_error(
+                400,
+                request_trace=trace,
+                code="invalid_import_source",
+                message="Provide exactly one of source_path or source_drive_folder_id.",
             )
+        try:
+            if request.source_drive_folder_id:
+                imported = canonical_import_service.import_drive_folder(
+                    folder_id=request.source_drive_folder_id,
+                    dry_run=request.dry_run,
+                    replace_existing=request.replace_existing,
+                    reindex_after_import=request.reindex_after_import,
+                )
+            else:
+                imported = canonical_import_service.import_folder(
+                    source_path=request.source_path or "",
+                    dry_run=request.dry_run,
+                    replace_existing=request.replace_existing,
+                    reindex_after_import=request.reindex_after_import,
+                )
         except FileNotFoundError as exc:
             raise _api_error(
                 404,
@@ -505,6 +520,13 @@ def build_v1_router(
                 400,
                 request_trace=trace,
                 code="invalid_source_path",
+                message=str(exc),
+            )
+        except PermissionError as exc:
+            raise _api_error(
+                403,
+                request_trace=trace,
+                code="drive_access_denied",
                 message=str(exc),
             )
 

@@ -24,7 +24,7 @@ Nowy kontrakt dla klienta chatowego i UI worldbuildingu:
 
 - `POST /v1/chat` - glowny endpoint asystenta z trybami `create`, `guard`, `editor`
 - `POST /v1/assistant/actions` - wykonanie akcji zwrotnych z `next_actions`
-- `POST /v1/imports/canonical-files` - import lokalnego folderu `txt/md/docx` do Google Docs
+- `POST /v1/imports/canonical-files` - import z lokalnego folderu albo z folderu Google Drive
 - `GET /v1/conversations`
 - `POST /v1/conversations`
 - `GET /v1/conversations/{conversation_id}/messages`
@@ -120,6 +120,17 @@ Przykladowy request importu kanonu z lokalnego folderu:
 ```json
 {
   "source_path": "C:\\Users\\sular\\Desktop\\NoweMateriałyKampanii\\Krew_na_Gwiazdach_CANONICAL_2026_03_08_2046",
+  "dry_run": true,
+  "replace_existing": true,
+  "reindex_after_import": true
+}
+```
+
+Przykladowy request importu z folderu Google Drive:
+
+```json
+{
+  "source_drive_folder_id": "1U4b9Abw835oo7vPkMUJBMkJF5cGnQSw7",
   "dry_run": true,
   "replace_existing": true,
   "reindex_after_import": true

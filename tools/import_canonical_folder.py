@@ -14,12 +14,16 @@ from app.canonical_import_service import CanonicalImportService
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Import lokalnych plikow kanonu do Google Docs.")
-    parser.add_argument("--path", required=True, help="Sciezka do folderu z plikami txt/md/docx.")
+    parser = argparse.ArgumentParser(description="Import plikow kanonu do Google Docs.")
+    parser.add_argument("--path", help="Sciezka do lokalnego folderu z plikami txt/md/docx.")
+    parser.add_argument("--drive-folder-id", help="ID folderu Google Drive z plikami kanonu.")
     parser.add_argument("--apply", action="store_true", help="Wykonaj import. Bez tego dziala dry-run.")
     parser.add_argument("--no-replace", action="store_true", help="Nie nadpisuj istniejacych dokumentow.")
     parser.add_argument("--no-reindex", action="store_true", help="Nie odpalaj reindeksu po imporcie.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if bool(args.path) == bool(args.drive_folder_id):
+        parser.error("Podaj dokladnie jedno z: --path albo --drive-folder-id")
+    return args
 
 
 def main_cli() -> int:
@@ -29,12 +33,20 @@ def main_cli() -> int:
         drive_store=drive_store,
         reindex_fn=main.reindex_after_apply_default,
     )
-    result = service.import_folder(
-        source_path=args.path,
-        dry_run=not args.apply,
-        replace_existing=not args.no_replace,
-        reindex_after_import=not args.no_reindex,
-    )
+    if args.drive_folder_id:
+        result = service.import_drive_folder(
+            folder_id=args.drive_folder_id,
+            dry_run=not args.apply,
+            replace_existing=not args.no_replace,
+            reindex_after_import=not args.no_reindex,
+        )
+    else:
+        result = service.import_folder(
+            source_path=args.path,
+            dry_run=not args.apply,
+            replace_existing=not args.no_replace,
+            reindex_after_import=not args.no_reindex,
+        )
     print(
         json.dumps(
             {

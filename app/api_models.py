@@ -214,7 +214,8 @@ class WorldModelSearchResponse(RequestTrace):
 
 
 class CanonicalImportRequest(BaseModel):
-    source_path: str = Field(..., min_length=1)
+    source_path: Optional[str] = None
+    source_drive_folder_id: Optional[str] = None
     dry_run: bool = True
     replace_existing: bool = True
     reindex_after_import: bool = True

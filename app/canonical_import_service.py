@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 import re
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
-from xml.etree import ElementTree
 
-from .drive_store import DriveStore
+from googleapiclient.errors import HttpError
+
+from .drive_store import (
+    DOCX_MIME,
+    GOOGLE_DOC_MIME,
+    TEXT_MARKDOWN_MIME,
+    TEXT_PLAIN_MIME,
+    DriveFileInfo,
+    DriveStore,
+    decode_docx_bytes,
+    decode_google_export_text,
+)
 from .models_v2 import DocumentRef, WorldEntityType
 from .text_normalization import normalize_text_artifacts
 
 
 SUPPORTED_IMPORT_EXTENSIONS = {".txt", ".md", ".docx"}
+SUPPORTED_DRIVE_MIME_TYPES = {GOOGLE_DOC_MIME, TEXT_PLAIN_MIME, TEXT_MARKDOWN_MIME, DOCX_MIME}
 TIMESTAMP_SUFFIX_RE = re.compile(r"_\d{4}_\d{2}_\d{2}_\d{4}$")
-WORD_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 SKIPPED_SUPPORT_FILES = {"manifest.txt", "readme.txt", "readme.md"}
 
 
@@ -47,76 +56,31 @@ class CanonicalImportResult:
     warnings: list[str] | None = None
 
 
-def _collapse_blank_lines(lines: Iterable[str]) -> str:
-    collapsed: list[str] = []
-    blank = False
-    for raw in lines:
-        line = raw.rstrip()
-        if not line:
-            if blank:
-                continue
-            collapsed.append("")
-            blank = True
-            continue
-        collapsed.append(line)
-        blank = False
-    return "\n".join(collapsed).strip()
+@dataclass
+class CanonicalImportSourceFile:
+    source_path: str
+    source_name: str
+    format: str
+    text: str
 
 
-def _normalize_import_title(path: Path) -> str:
-    stem = TIMESTAMP_SUFFIX_RE.sub("", path.stem).strip()
+def _normalize_import_title(name: str) -> str:
+    stem = Path(name).stem
+    stem = TIMESTAMP_SUFFIX_RE.sub("", stem).strip()
     return re.sub(r"\s+", " ", stem).strip()
-
-
-def _extract_docx_inline_text(node: ElementTree.Element) -> str:
-    parts: list[str] = []
-    for child in node.iter():
-        tag = child.tag.rsplit("}", 1)[-1]
-        if tag == "t":
-            parts.append(child.text or "")
-        elif tag == "tab":
-            parts.append("\t")
-        elif tag in {"br", "cr"}:
-            parts.append("\n")
-    return "".join(parts)
-
-
-def read_local_docx(path: Path) -> str:
-    with zipfile.ZipFile(path) as archive:
-        raw = archive.read("word/document.xml")
-
-    root = ElementTree.fromstring(raw)
-    body = root.find("./w:body", WORD_NS)
-    if body is None:
-        return ""
-
-    lines: list[str] = []
-    for child in list(body):
-        tag = child.tag.rsplit("}", 1)[-1]
-        if tag == "p":
-            text = _extract_docx_inline_text(child).strip()
-            lines.append(text)
-        elif tag == "tbl":
-            for row in child.findall("./w:tr", WORD_NS):
-                cells = [_collapse_blank_lines(_extract_docx_inline_text(cell).splitlines()) for cell in row.findall("./w:tc", WORD_NS)]
-                cells = [cell.strip() for cell in cells]
-                if any(cells):
-                    lines.append(" | ".join(cells))
-
-    return normalize_text_artifacts(_collapse_blank_lines(lines))
 
 
 def read_local_canonical_text(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix == ".docx":
-        return read_local_docx(path)
+        return decode_docx_bytes(path.read_bytes())
     if suffix in {".txt", ".md"}:
         return normalize_text_artifacts(path.read_text(encoding="utf-8-sig"))
     raise ValueError(f"Unsupported file type: {path.suffix}")
 
 
-def classify_canonical_file(path: Path) -> tuple[str, str, WorldEntityType]:
-    title = _normalize_import_title(path)
+def classify_canonical_name(name: str) -> tuple[str, str, WorldEntityType]:
+    title = _normalize_import_title(name)
     key = title.lower()
 
     exact_map = {
@@ -145,53 +109,129 @@ def classify_canonical_file(path: Path) -> tuple[str, str, WorldEntityType]:
     return "01 Bible", title, WorldEntityType.other
 
 
+def classify_canonical_file(path: Path) -> tuple[str, str, WorldEntityType]:
+    return classify_canonical_name(path.name)
+
+
 @dataclass
 class CanonicalImportService:
     drive_store: DriveStore
     reindex_fn: Optional[Callable[[list[DocumentRef]], dict]] = None
 
-    def import_folder(
-        self,
-        *,
-        source_path: str,
-        dry_run: bool = True,
-        replace_existing: bool = True,
-        reindex_after_import: bool = True,
-    ) -> CanonicalImportResult:
+    def _iter_local_files(self, source_path: str) -> Iterable[CanonicalImportSourceFile]:
         root = Path(source_path).expanduser()
         if not root.exists():
             raise FileNotFoundError(f"Source path not found: {source_path}")
         if not root.is_dir():
             raise ValueError(f"Source path is not a directory: {source_path}")
 
-        results: list[CanonicalImportFileResult] = []
-        reindex_targets: list[DocumentRef] = []
-        warnings: list[str] = []
-
         files = sorted([path for path in root.rglob("*") if path.is_file()], key=lambda item: str(item).lower())
         for path in files:
             suffix = path.suffix.lower()
             if suffix not in SUPPORTED_IMPORT_EXTENSIONS:
+                yield CanonicalImportSourceFile(
+                    source_path=str(path),
+                    source_name=path.name,
+                    format=suffix.lstrip(".") or "unknown",
+                    text="__UNSUPPORTED__",
+                )
+                continue
+            if path.name.lower() in SKIPPED_SUPPORT_FILES:
+                yield CanonicalImportSourceFile(
+                    source_path=str(path),
+                    source_name=path.name,
+                    format=suffix.lstrip("."),
+                    text="__SKIP_SUPPORT__",
+                )
+                continue
+            yield CanonicalImportSourceFile(
+                source_path=str(path),
+                source_name=path.name,
+                format=suffix.lstrip("."),
+                text=read_local_canonical_text(path).strip(),
+            )
+
+    def _read_drive_source_file(self, item: DriveFileInfo) -> CanonicalImportSourceFile:
+        if item.name.lower() in SKIPPED_SUPPORT_FILES:
+            return CanonicalImportSourceFile(
+                source_path=f"gdrive://{item.file_id}",
+                source_name=item.name,
+                format=item.mime_type,
+                text="__SKIP_SUPPORT__",
+            )
+        if item.mime_type not in SUPPORTED_DRIVE_MIME_TYPES:
+            return CanonicalImportSourceFile(
+                source_path=f"gdrive://{item.file_id}",
+                source_name=item.name,
+                format=item.mime_type,
+                text="__UNSUPPORTED__",
+            )
+        try:
+            text = self.drive_store.read_drive_file_text(item.file_id, item.mime_type).strip()
+        except HttpError as exc:
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 403:
+                raise PermissionError(f"Drive file is not accessible: {item.name}") from exc
+            if status == 404:
+                raise FileNotFoundError(f"Drive file not found: {item.name}") from exc
+            raise
+        return CanonicalImportSourceFile(
+            source_path=f"gdrive://{item.file_id}",
+            source_name=item.name,
+            format=item.mime_type,
+            text=text,
+        )
+
+    def _iter_drive_files(self, folder_id: str) -> Iterable[CanonicalImportSourceFile]:
+        try:
+            items = self.drive_store.list_drive_folder_files(folder_id)
+        except HttpError as exc:
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 403:
+                raise PermissionError(f"Drive folder is not accessible: {folder_id}") from exc
+            if status == 404:
+                raise FileNotFoundError(f"Drive folder not found: {folder_id}") from exc
+            raise
+        if not items:
+            raise FileNotFoundError(f"Drive folder is empty or not accessible: {folder_id}")
+        for item in items:
+            yield self._read_drive_source_file(item)
+
+    def _process_sources(
+        self,
+        *,
+        source_label: str,
+        source_files: Iterable[CanonicalImportSourceFile],
+        dry_run: bool,
+        replace_existing: bool,
+        reindex_after_import: bool,
+    ) -> CanonicalImportResult:
+        results: list[CanonicalImportFileResult] = []
+        reindex_targets: list[DocumentRef] = []
+        warnings: list[str] = []
+
+        for item in source_files:
+            if item.text == "__UNSUPPORTED__":
                 results.append(
                     CanonicalImportFileResult(
-                        source_path=str(path),
-                        source_name=path.name,
-                        format=suffix.lstrip(".") or "unknown",
+                        source_path=item.source_path,
+                        source_name=item.source_name,
+                        format=item.format,
                         folder=None,
                         title=None,
                         entity_type=None,
                         action="skip",
                         status="skipped",
-                        message="Unsupported extension.",
+                        message="Unsupported extension or Drive MIME type.",
                     )
                 )
                 continue
-            if path.name.lower() in SKIPPED_SUPPORT_FILES:
+            if item.text == "__SKIP_SUPPORT__":
                 results.append(
                     CanonicalImportFileResult(
-                        source_path=str(path),
-                        source_name=path.name,
-                        format=suffix.lstrip("."),
+                        source_path=item.source_path,
+                        source_name=item.source_name,
+                        format=item.format,
                         folder=None,
                         title=None,
                         entity_type=None,
@@ -202,14 +242,14 @@ class CanonicalImportService:
                 )
                 continue
 
-            folder, title, entity_type = classify_canonical_file(path)
-            text = read_local_canonical_text(path).strip()
+            folder, title, entity_type = classify_canonical_name(item.source_name)
+            text = item.text.strip()
             if not text:
                 results.append(
                     CanonicalImportFileResult(
-                        source_path=str(path),
-                        source_name=path.name,
-                        format=suffix.lstrip("."),
+                        source_path=item.source_path,
+                        source_name=item.source_name,
+                        format=item.format,
                         folder=folder,
                         title=title,
                         entity_type=entity_type.value,
@@ -224,9 +264,9 @@ class CanonicalImportService:
             if existing and not replace_existing:
                 results.append(
                     CanonicalImportFileResult(
-                        source_path=str(path),
-                        source_name=path.name,
-                        format=suffix.lstrip("."),
+                        source_path=item.source_path,
+                        source_name=item.source_name,
+                        format=item.format,
                         folder=folder,
                         title=title,
                         entity_type=entity_type.value,
@@ -244,9 +284,9 @@ class CanonicalImportService:
                 action = "replace_doc" if existing else "create_doc"
                 results.append(
                     CanonicalImportFileResult(
-                        source_path=str(path),
-                        source_name=path.name,
-                        format=suffix.lstrip("."),
+                        source_path=item.source_path,
+                        source_name=item.source_name,
+                        format=item.format,
                         folder=folder,
                         title=title,
                         entity_type=entity_type.value,
@@ -266,9 +306,9 @@ class CanonicalImportService:
                 reindex_targets.append(target)
                 results.append(
                     CanonicalImportFileResult(
-                        source_path=str(path),
-                        source_name=path.name,
-                        format=suffix.lstrip("."),
+                        source_path=item.source_path,
+                        source_name=item.source_name,
+                        format=item.format,
                         folder=folder,
                         title=title,
                         entity_type=entity_type.value,
@@ -277,7 +317,7 @@ class CanonicalImportService:
                         chars=len(text),
                         doc_id=existing.doc_id,
                         path=existing.path_hint,
-                        message="Existing Google Doc replaced from local canonical file.",
+                        message="Existing Google Doc replaced from canonical source.",
                     )
                 )
             else:
@@ -286,9 +326,9 @@ class CanonicalImportService:
                 reindex_targets.append(target)
                 results.append(
                     CanonicalImportFileResult(
-                        source_path=str(path),
-                        source_name=path.name,
-                        format=suffix.lstrip("."),
+                        source_path=item.source_path,
+                        source_name=item.source_name,
+                        format=item.format,
                         folder=folder,
                         title=title,
                         entity_type=entity_type.value,
@@ -297,7 +337,7 @@ class CanonicalImportService:
                         chars=len(text),
                         doc_id=created.doc_id,
                         path=created.path_hint,
-                        message="Google Doc created from local canonical file.",
+                        message="Google Doc created from canonical source.",
                     )
                 )
 
@@ -315,7 +355,7 @@ class CanonicalImportService:
         imported_count = created_count + updated_count
 
         return CanonicalImportResult(
-            source_path=str(root),
+            source_path=source_label,
             dry_run=dry_run,
             imported_count=imported_count,
             created_count=created_count,
@@ -324,4 +364,36 @@ class CanonicalImportService:
             results=results,
             reindex_result=reindex_result,
             warnings=warnings,
+        )
+
+    def import_folder(
+        self,
+        *,
+        source_path: str,
+        dry_run: bool = True,
+        replace_existing: bool = True,
+        reindex_after_import: bool = True,
+    ) -> CanonicalImportResult:
+        return self._process_sources(
+            source_label=str(Path(source_path).expanduser()),
+            source_files=self._iter_local_files(source_path),
+            dry_run=dry_run,
+            replace_existing=replace_existing,
+            reindex_after_import=reindex_after_import,
+        )
+
+    def import_drive_folder(
+        self,
+        *,
+        folder_id: str,
+        dry_run: bool = True,
+        replace_existing: bool = True,
+        reindex_after_import: bool = True,
+    ) -> CanonicalImportResult:
+        return self._process_sources(
+            source_label=f"gdrive://{folder_id}",
+            source_files=self._iter_drive_files(folder_id),
+            dry_run=dry_run,
+            replace_existing=replace_existing,
+            reindex_after_import=reindex_after_import,
         )

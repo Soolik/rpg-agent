@@ -35,6 +35,7 @@ from app.models_v2 import (
 )
 from app.routes_v1 import build_v1_router
 from app.chat_service import DirectChatStream, StreamPlan
+from app.drive_store import DriveFileInfo
 
 
 class FakeDriveStore:
@@ -42,6 +43,8 @@ class FakeDriveStore:
         self.docs = {}
         self.created = []
         self.replaced = []
+        self.drive_folder_files = {}
+        self.drive_file_text = {}
 
     def list_world_docs(self):
         return list(self.docs.values())
@@ -64,6 +67,12 @@ class FakeDriveStore:
 
     def replace_doc(self, doc_ref, content):
         self.replaced.append({"doc_ref": doc_ref, "content": content})
+
+    def list_drive_folder_files(self, folder_id):
+        return self.drive_folder_files.get(folder_id, [])
+
+    def read_drive_file_text(self, file_id, mime_type):
+        return self.drive_file_text[file_id]
 
 
 class FakePlanner:
@@ -644,6 +653,26 @@ class RoutesV1Test(unittest.TestCase):
         self.assertTrue(any(item["title"] == "Campaign Bible" and item["action"] == "create_doc" for item in body["results"]))
         self.assertTrue(any(item["folder"] == "03 NPC" and item["title"] == "NPCs" for item in body["results"]))
         self.assertEqual(reindex_calls, [])
+
+    def test_v1_canonical_import_from_drive_folder_dry_run(self):
+        drive_store = FakeDriveStore()
+        drive_store.drive_folder_files["folder-123"] = [
+            DriveFileInfo(file_id="file-1", name="Campaign Bible_2026_03_08_2046.docx", mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", parents=["folder-123"]),
+            DriveFileInfo(file_id="file-2", name="README.txt", mime_type="text/plain", parents=["folder-123"]),
+        ]
+        drive_store.drive_file_text["file-1"] = "# Campaign Bible\n\nTekst z Drive."
+        router = self.build_router(drive_store=drive_store)
+
+        body = self.route_endpoint(router, "/v1/imports/canonical-files", "POST")(
+            request=CanonicalImportRequest(
+                source_drive_folder_id="folder-123",
+                dry_run=True,
+            )
+        ).model_dump(mode="json")
+
+        self.assertEqual(body["source_path"], "gdrive://folder-123")
+        self.assertTrue(any(item["title"] == "Campaign Bible" and item["action"] == "create_doc" for item in body["results"]))
+        self.assertTrue(any(item["source_name"] == "README.txt" and item["status"] == "skipped" for item in body["results"]))
 
     def test_v1_world_model_change_accept_marks_old_proposal_superseded(self):
         workflow_store = FakeWorkflowStore()

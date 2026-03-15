@@ -6,8 +6,10 @@ from pathlib import Path
 from app.canonical_import_service import (
     CanonicalImportService,
     classify_canonical_file,
+    classify_canonical_name,
     read_local_canonical_text,
 )
+from app.drive_store import DriveFileInfo
 from app.models_v2 import DocumentRef
 
 
@@ -16,6 +18,8 @@ class FakeDriveStore:
         self.docs = {}
         self.created = []
         self.replaced = []
+        self.drive_folder_files = {}
+        self.drive_file_text = {}
 
     def find_doc(self, *, folder=None, title=None, doc_id=None):
         if folder and title:
@@ -30,6 +34,12 @@ class FakeDriveStore:
 
     def replace_doc(self, doc_ref, content):
         self.replaced.append({"doc_ref": doc_ref, "content": content})
+
+    def list_drive_folder_files(self, folder_id):
+        return self.drive_folder_files.get(folder_id, [])
+
+    def read_drive_file_text(self, file_id, mime_type):
+        return self.drive_file_text[file_id]
 
 
 def build_minimal_docx(path: Path, body_xml: str) -> None:
@@ -69,6 +79,12 @@ class CanonicalImportServiceTest(unittest.TestCase):
         self.assertEqual(folder, "02 Sessions")
         self.assertIn("Rozdzial 1", title)
         self.assertEqual(entity_type.value, "session")
+
+    def test_classify_drive_name_uses_same_mapping(self):
+        folder, title, entity_type = classify_canonical_name("Rules And Tone_2026_03_08_2046.docx")
+        self.assertEqual(folder, "01 Bible")
+        self.assertEqual(title, "Rules And Tone")
+        self.assertEqual(entity_type.value, "rules")
 
     def test_read_local_docx_extracts_paragraphs_and_table_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -128,6 +144,21 @@ class CanonicalImportServiceTest(unittest.TestCase):
         self.assertEqual(len(drive_store.replaced), 1)
         self.assertEqual(len(drive_store.created), 1)
         self.assertEqual(result.reindex_result["count"], 2)
+
+    def test_import_drive_folder_creates_docs_from_drive_items(self):
+        drive_store = FakeDriveStore()
+        drive_store.drive_folder_files["folder-123"] = [
+            DriveFileInfo(file_id="file-1", name="Glossary_2026_03_08_2046.docx", mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", parents=["folder-123"]),
+            DriveFileInfo(file_id="file-2", name="README.txt", mime_type="text/plain", parents=["folder-123"]),
+        ]
+        drive_store.drive_file_text["file-1"] = "Haslo 1\nDefinicja"
+        service = CanonicalImportService(drive_store=drive_store, reindex_fn=None)
+
+        result = service.import_drive_folder(folder_id="folder-123", dry_run=True)
+
+        self.assertEqual(result.source_path, "gdrive://folder-123")
+        self.assertTrue(any(item.title == "Glossary" and item.action == "create_doc" for item in result.results))
+        self.assertTrue(any(item.source_name == "README.txt" and item.status == "skipped" for item in result.results))
 
 
 if __name__ == "__main__":

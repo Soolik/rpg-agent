@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import re
+import zipfile
 from dataclasses import dataclass
+from io import BytesIO
 from typing import Dict, List, Optional
+from xml.etree import ElementTree
 
 import google.auth
 from googleapiclient.discovery import build
@@ -12,6 +15,10 @@ from .text_normalization import normalize_text_artifacts
 
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+TEXT_PLAIN_MIME = "text/plain"
+TEXT_MARKDOWN_MIME = "text/markdown"
+WORD_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
@@ -20,6 +27,68 @@ HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 def decode_google_export_text(data: bytes) -> str:
     text = data.decode("utf-8-sig", errors="ignore")
     return normalize_text_artifacts(text)
+
+
+def decode_docx_bytes(data: bytes) -> str:
+    with zipfile.ZipFile(BytesIO(data)) as archive:
+        raw = archive.read("word/document.xml")
+
+    root = ElementTree.fromstring(raw)
+    body = root.find("./w:body", WORD_NS)
+    if body is None:
+        return ""
+
+    lines: list[str] = []
+    for child in list(body):
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            text = _extract_docx_inline_text(child).strip()
+            lines.append(text)
+        elif tag == "tbl":
+            for row in child.findall("./w:tr", WORD_NS):
+                cells = [_collapse_blank_lines(_extract_docx_inline_text(cell).splitlines()) for cell in row.findall("./w:tc", WORD_NS)]
+                cells = [cell.strip() for cell in cells]
+                if any(cells):
+                    lines.append(" | ".join(cells))
+
+    return normalize_text_artifacts(_collapse_blank_lines(lines))
+
+
+def _collapse_blank_lines(lines: List[str]) -> str:
+    collapsed: list[str] = []
+    blank = False
+    for raw in lines:
+        line = raw.rstrip()
+        if not line:
+            if blank:
+                continue
+            collapsed.append("")
+            blank = True
+            continue
+        collapsed.append(line)
+        blank = False
+    return "\n".join(collapsed).strip()
+
+
+def _extract_docx_inline_text(node: ElementTree.Element) -> str:
+    parts: list[str] = []
+    for child in node.iter():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "t":
+            parts.append(child.text or "")
+        elif tag == "tab":
+            parts.append("\t")
+        elif tag in {"br", "cr"}:
+            parts.append("\n")
+    return "".join(parts)
+
+
+@dataclass
+class DriveFileInfo:
+    file_id: str
+    name: str
+    mime_type: str
+    parents: list[str]
 
 
 def normalize_section_name(section: str) -> str:
@@ -111,6 +180,10 @@ class DriveStore:
         drive = self._drive()
         data = drive.files().export(fileId=file_id, mimeType="text/plain").execute()
         return decode_google_export_text(data)
+
+    def _download_file_bytes(self, file_id: str) -> bytes:
+        drive = self._drive()
+        return drive.files().get_media(fileId=file_id).execute()
 
     def _folder_query_docs(self, folder_id: str) -> List[WorldDocInfo]:
         drive = self._drive()
@@ -207,6 +280,43 @@ class DriveStore:
 
         docs.sort(key=lambda d: (d.folder, d.title.lower()))
         return docs
+
+    def list_drive_folder_files(self, folder_id: str) -> List[DriveFileInfo]:
+        drive = self._drive()
+        out: List[DriveFileInfo] = []
+        page_token = None
+        while True:
+            resp = drive.files().list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                fields="nextPageToken, files(id, name, mimeType, parents)",
+                pageToken=page_token,
+                pageSize=200,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            for item in resp.get("files", []):
+                out.append(
+                    DriveFileInfo(
+                        file_id=item["id"],
+                        name=item["name"],
+                        mime_type=item["mimeType"],
+                        parents=item.get("parents", []),
+                    )
+                )
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        out.sort(key=lambda item: item.name.lower())
+        return out
+
+    def read_drive_file_text(self, file_id: str, mime_type: str) -> str:
+        if mime_type == GOOGLE_DOC_MIME:
+            return self._export_plain_text(file_id)
+        if mime_type in {TEXT_PLAIN_MIME, TEXT_MARKDOWN_MIME}:
+            return decode_google_export_text(self._download_file_bytes(file_id))
+        if mime_type == DOCX_MIME:
+            return decode_docx_bytes(self._download_file_bytes(file_id))
+        raise ValueError(f"Unsupported Drive file type: {mime_type}")
 
     def _infer_core_folder(self, title: str) -> str:
         if title in ("Campaign Bible", "Glossary", "Rules And Tone"):
