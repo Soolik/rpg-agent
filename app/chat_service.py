@@ -22,6 +22,7 @@ from .api_models import (
 from .canon_guard import build_continuity_report
 from .chat_models import ChatRequest, ChatResponse
 from .conversation_store import ConversationMessageRecord, ConversationRecord, ConversationStore, NullConversationStore
+from .doc_canon import strip_reference_block
 from .routes_v2 import build_context_for_planner
 from .world_model_store import NullWorldModelStore, WorldModelStore
 
@@ -91,18 +92,17 @@ def _continuity_for_response(
     response: ChatResponse,
     world_model_store: WorldModelStore | NullWorldModelStore,
 ) -> Optional[ContinuityReport]:
-    text = response.artifact_text or response.reply
+    text = strip_reference_block(response.artifact_text or response.reply)
     if not text:
         return None
-    entities = world_model_store.list_entities(limit=200)
-    threads = world_model_store.list_threads(limit=200)
+    entities = world_model_store.list_entities(limit=1000)
+    threads = world_model_store.list_threads(limit=500)
     allow_new_names = response.artifact_type == "npc_brief"
     return build_continuity_report(
         message=message,
         generated_text=text,
         known_entity_names=[entity.name for entity in entities],
         known_thread_names=[thread.title for thread in threads],
-        extra_allowed_names=response.references,
         allow_proposed_new_names=allow_new_names,
     )
 

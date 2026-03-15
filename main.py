@@ -68,6 +68,7 @@ from app.creative_artifacts import (
     strip_section_marker,
     trim_to_complete_sentences,
 )
+from app.doc_canon import sync_doc_backed_entities
 from app.drive_store import DriveStore, decode_google_export_text
 from app.google_drive_oauth_service import GoogleDriveOAuthConfig, GoogleDriveOAuthService
 from app.google_drive_oauth_store import GoogleDriveOAuthStore
@@ -3410,6 +3411,7 @@ def index_world_docs(docs: List[WorldDocInfo], *, clean: bool = False) -> Dict[s
     indexed_docs = 0
     skipped_docs = 0
     changed_docs = 0
+    doc_backed_docs: List[tuple[WorldDocInfo, str]] = []
     for doc in docs:
         if not doc.doc_id:
             skipped_docs += 1
@@ -3433,6 +3435,7 @@ def index_world_docs(docs: List[WorldDocInfo], *, clean: bool = False) -> Dict[s
                 continue
         else:
             cleaned = sanitize_for_rag(raw)
+            doc_backed_docs.append((doc, cleaned))
             chunks = chunk_text(cleaned)
             if not chunks:
                 sync_world_doc_state(
@@ -3457,12 +3460,18 @@ def index_world_docs(docs: List[WorldDocInfo], *, clean: bool = False) -> Dict[s
         total_chunks += len(chunks)
         indexed_docs += 1
 
+    doc_backed_entities = sync_doc_backed_entities(
+        campaign_id=CAMPAIGN_ID,
+        connection_factory=db_conn,
+        docs_with_content=doc_backed_docs,
+    )
     return {
         "ok": True,
         "indexed_docs": indexed_docs,
         "indexed_chunks": total_chunks,
         "skipped_docs": skipped_docs,
         "changed_docs": changed_docs,
+        "doc_backed_entities": doc_backed_entities,
         "clean": clean,
     }
 
