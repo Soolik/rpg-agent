@@ -31,6 +31,8 @@ class RoutesWebTest(unittest.TestCase):
         self.assertIn('loginBtn: byId("loginBtn")', body)
         self.assertIn('{"apiBase": "/v1"}', body)
         self.assertNotIn("&quot;apiBase&quot;", body)
+        self.assertIn('e.message.addEventListener("keydown"', body)
+        self.assertIn('if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing) return;', body)
         self.assertIn("/v1", body)
 
 

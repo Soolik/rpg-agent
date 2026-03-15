@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
+import unicodedata
 
 from .api_models import AssistantMode
 
@@ -42,12 +43,16 @@ EDITOR_HINTS = (
 )
 
 GUARD_HINTS = (
+    "sprawdz to z kanonem",
+    "sprawdz ten tekst",
+    "sprawdz ten opis",
+    "sprawdz ten fragment",
     "sprawdz continuity",
-    "sprawdz ciaglosc",
-    "sprawdz zgodnosc",
+    "sprawdz ciaglosc tego tekstu",
+    "sprawdz zgodnosc tego tekstu",
     "czy to pasuje do kanonu",
-    "czy to jest zgodne z kanonem",
-    "wykryj sprzecznosci",
+    "czy ten tekst jest zgodny z kanonem",
+    "wykryj sprzecznosci w tekscie",
     "przejrzyj pod katem kanonu",
 )
 
@@ -75,7 +80,10 @@ class AssistantDecision:
 
 
 def _normalized(text: str) -> str:
-    return " ".join((text or "").strip().lower().split())
+    compact = " ".join((text or "").strip().lower().split())
+    return "".join(
+        char for char in unicodedata.normalize("NFKD", compact) if not unicodedata.combining(char)
+    )
 
 
 def infer_assistant_decision(

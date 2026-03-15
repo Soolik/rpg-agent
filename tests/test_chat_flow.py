@@ -31,6 +31,75 @@ class ChatFlowTest(unittest.TestCase):
         )
         self.assertEqual(artifact_type, "pre_session_brief")
 
+    def test_is_campaign_question_recognizes_port_peril(self):
+        self.assertTrue(main.is_campaign_question("Co to jest Port Peril?"))
+
+    def test_render_campaign_out_uses_human_fallback_and_bullets(self):
+        missing = main.render_campaign_out(
+            main.CampaignOut(format="bullets", bullets=["brak w notatkach"])
+        )
+        self.assertIn("W notatkach kampanii", missing)
+
+        detailed = main.render_campaign_out(
+            main.CampaignOut(
+                format="bullets",
+                bullets=[
+                    "Captain Mira ukrywa kontakt z Red Blade przed rada portu.",
+                    "Red Blade naciska na decyzje polityczne przez dlugi i przysiegi.",
+                ],
+            )
+        )
+        self.assertIn("- Captain Mira ukrywa kontakt z Red Blade przed rada portu.", detailed)
+        self.assertNotIn("1. Captain Mira", detailed)
+
+    def test_ask_auto_uses_campaign_path_when_vector_hits_are_strong(self):
+        original_vector_search = main.vector_search
+        original_gemini_generate = main.gemini_generate
+        seen = {}
+
+        def fake_vector_search(question, top_k):
+            seen["vector_question"] = question
+            return [
+                {
+                    "chunk_id": 1,
+                    "doc_id": "doc-1",
+                    "doc_type": "gdoc",
+                    "chunk_text": "Port Peril to portowe centrum intryg w kampanii.",
+                    "distance": 0.81,
+                    "title": "Campaign Bible",
+                    "folder": "01 Bible",
+                    "path_hint": "01 Bible / Campaign Bible",
+                }
+            ]
+
+        def fake_gemini_generate(prompt, **kwargs):
+            seen["prompt"] = prompt
+            return main.json.dumps(
+                {
+                    "format": "bullets",
+                    "bullets": ["Port Peril jest glownym portem i politycznym punktem zapalnym kampanii."],
+                    "used_context": [1],
+                },
+                ensure_ascii=False,
+            )
+
+        try:
+            main.vector_search = fake_vector_search
+            main.gemini_generate = fake_gemini_generate
+            response = main.ask(
+                main.AskRequest(
+                    question="Jakie postacie tam wystepuja?",
+                    include_sources=True,
+                )
+            )
+        finally:
+            main.vector_search = original_vector_search
+            main.gemini_generate = original_gemini_generate
+
+        self.assertIn("Port Peril jest glownym portem", response.answer)
+        self.assertIn("KONTEKST (kazdy blok zawiera title, folder, doc_type i tresc chunku):", seen["prompt"])
+        self.assertEqual(response.sources[0]["title"], "Campaign Bible")
+
     def test_chat_answer_returns_human_text_with_sources(self):
         original_ask = main.ask
         try:

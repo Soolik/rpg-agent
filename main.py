@@ -5,6 +5,7 @@ import os
 import re
 import uuid
 import hashlib
+import unicodedata
 from copy import deepcopy
 from contextvars import ContextVar
 import google.auth
@@ -751,9 +752,15 @@ def vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
         for (cid, d, t, c, dist, title, folder, path_hint) in rows
     ]
 
+def normalize_match_text(text: str) -> str:
+    compact = " ".join((text or "").strip().lower().split())
+    return "".join(
+        char for char in unicodedata.normalize("NFKD", compact) if not unicodedata.combining(char)
+    )
+
 
 def is_campaign_question(text: str) -> bool:
-    t = text.lower()
+    t = normalize_match_text(text)
     keywords = [
         "kampania",
         "krew na gwiazdach",
@@ -2592,6 +2599,111 @@ ODPOWIEDZ (tylko JSON):
 """.strip()
 
 
+def is_campaign_question(text: str) -> bool:
+    normalized = normalize_match_text(text)
+    keywords = [
+        "kampania",
+        "krew na gwiazdach",
+        "port peril",
+        "red blade",
+        "captain mira",
+        "black eel",
+        "morna",
+        "marcellus vhal",
+        "shackles",
+        "kanon",
+        "world model",
+        "watek",
+        "thread",
+        "npc",
+        "mg",
+        "sesj",
+        "fabul",
+        "scen",
+        "lokac",
+        "frakc",
+        "rozdzial",
+        "chapter",
+        "bible",
+        "glossary",
+        "rules",
+        "timeline",
+        "akt",
+        "prolog",
+        "dlug",
+        "przysieg",
+        "aukcj",
+        "zamach",
+    ]
+    return any(keyword in normalized for keyword in keywords)
+
+
+def has_likely_campaign_hits(hits: List[Dict[str, Any]], threshold: float = 0.88) -> bool:
+    if not hits:
+        return False
+    best_distance = min(float(hit.get("distance") or 999.0) for hit in hits)
+    return best_distance <= threshold
+
+
+def render_campaign_out(out: CampaignOut) -> str:
+    not_found = "W notatkach kampanii nie znalazlem bezposredniej odpowiedzi na to pytanie."
+
+    if out.format == "table" and out.table:
+        cols = out.table.get("columns") or []
+        rows = out.table.get("rows") or []
+        if not cols or not isinstance(cols, list):
+            return not_found
+        header = "| " + " | ".join(str(c) for c in cols) + " |"
+        sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+        body_lines = []
+        for row in rows:
+            if isinstance(row, list):
+                body_lines.append("| " + " | ".join(str(item) for item in row) + " |")
+        return "\n".join([header, sep] + body_lines).strip() or not_found
+
+    bullets = [bullet.strip() for bullet in (out.bullets or []) if bullet and bullet.strip()]
+    if not bullets:
+        return not_found
+    normalized_bullets = [normalize_match_text(bullet) for bullet in bullets]
+    if all("brak w notatkach" in bullet for bullet in normalized_bullets):
+        return not_found
+    if len(bullets) == 1:
+        return bullets[0]
+    return "\n".join(f"- {bullet}" for bullet in bullets)
+
+
+def build_campaign_prompt(question: str, context: str) -> str:
+    return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Odpowiadasz po polsku.
+
+ZASADY:
+1) Uzywaj wylacznie faktow z KONTEKSTU.
+2) Odpowiadaj mozliwie konkretnie i pelnymi zdaniami, ale bez dopowiadania faktow spoza kontekstu.
+3) Dla pytan o postacie, frakcje, lokacje i watki podawaj nie tylko nazwy, ale tez krotka role lub znaczenie kazdego elementu.
+4) Dla pytan o logike, spojnosc lub stawki kampanii wypisz, co jest potwierdzone w notatkach, jakie sa napiecia lub ryzyka i co pozostaje niejasne.
+5) Jesli czegos nie ma w kontekscie, zwroc JSON z format="bullets" i bullets=["brak w notatkach"].
+6) Nie spekuluj i nie lacz faktow spoza kontekstu.
+7) W used_context podaj numery blokow, z ktorych skorzystales.
+8) Zwracaj wylacznie JSON. Bez markdown i bez tekstu dookola.
+
+Dozwolony JSON:
+{{
+  "format": "bullets" | "table",
+  "bullets": ["..."],
+  "table": {{"columns": ["..."], "rows": [["..."]]}},
+  "used_context": [1,2,3]
+}}
+
+KONTEKST (kazdy blok zawiera title, folder, doc_type i tresc chunku):
+{context}
+
+PYTANIE:
+{question}
+
+ODPOWIEDZ (tylko JSON):
+""".strip()
+
+
 GITHUB_API = "https://api.github.com"
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "Soolik")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "rpg-agent")
@@ -2974,6 +3086,7 @@ def ctx_slice(h: Dict[str, Any]) -> str:
 def ask(req: AskRequest):
     try:
         q = req.question.strip()
+        hits: List[Dict[str, Any]] = []
 
         if req.mode in ("campaign", "scene"):
             campaign_mode = True
@@ -2981,12 +3094,16 @@ def ask(req: AskRequest):
             campaign_mode = False
         else:
             campaign_mode = is_campaign_question(q)
+            if not campaign_mode:
+                hits = vector_search(q, req.top_k)
+                campaign_mode = has_likely_campaign_hits(hits)
 
         if not campaign_mode:
             answer = gemini_generate(build_general_prompt(q)).strip()
             return AskResponse(answer=answer, sources=[])
 
-        hits = vector_search(q, req.top_k)
+        if not hits:
+            hits = vector_search(q, req.top_k)
         context = build_campaign_context(hits)
         prompt = build_campaign_prompt(q, context)
 

@@ -271,6 +271,35 @@ class ChatServiceTest(unittest.TestCase):
         self.assertEqual(response.mode, AssistantMode.guard)
         self.assertIn("Guard Report", response.title)
 
+    def test_run_auto_keeps_campaign_analysis_in_chat_mode_without_candidate_text(self):
+        seen = {}
+
+        def fake_chat(req):
+            seen["message"] = req.message
+            return ChatResponse(kind="answer", reply="To wyglada na analize kampanii.", references=[])
+
+        store = FakeConversationStore()
+        service = self.build_service(fake_chat, store)
+        response = service.run(
+            trace=RequestTrace(request_id="req-6", trace_id="req-6"),
+            message="Sprawdź mi zgodność logiczną kampanii Krew Na Gwiazdach.",
+            assistant_mode=AssistantMode.auto,
+            intent="auto",
+            artifact_type=None,
+            source_title=None,
+            candidate_text=None,
+            include_sources=False,
+            include_telemetry=False,
+            save_output=False,
+            output_title=None,
+            conversation_id=None,
+            conversation_title=None,
+        )
+
+        self.assertEqual(response.mode, AssistantMode.create)
+        self.assertEqual(response.reply_markdown, "To wyglada na analize kampanii.")
+        self.assertIn("Sprawdź mi zgodność logiczną kampanii Krew Na Gwiazdach.", seen["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

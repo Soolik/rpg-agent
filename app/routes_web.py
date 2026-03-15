@@ -309,6 +309,11 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
   e.newConv.addEventListener("click", newConversation);
   e.refreshConv.addEventListener("click", loadConvs);
   e.send.addEventListener("click", sendMessage);
+  e.message.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing) return;
+    ev.preventDefault();
+    if (!e.send.disabled) sendMessage();
+  });
   e.clear.addEventListener("click", () => { e.message.value = ""; e.candidate.value = ""; e.outputTitle.value = ""; e.saveOutput.checked = false; });
   renderAuth();
   renderConvs();
