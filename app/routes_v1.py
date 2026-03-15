@@ -539,6 +539,7 @@ def build_v1_router(
             created_count=imported.created_count,
             updated_count=imported.updated_count,
             skipped_count=imported.skipped_count,
+            error_count=imported.error_count,
             warnings=imported.warnings or [],
             reindex_result=imported.reindex_result,
             results=[

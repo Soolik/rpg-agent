@@ -229,7 +229,7 @@ class CanonicalImportFileView(BaseModel):
     title: Optional[str] = None
     entity_type: Optional[str] = None
     action: str
-    status: Literal["planned", "created", "updated", "skipped"]
+    status: Literal["planned", "created", "updated", "skipped", "error"]
     chars: int = 0
     doc_id: Optional[str] = None
     path: Optional[str] = None
@@ -243,6 +243,7 @@ class CanonicalImportResponse(RequestTrace):
     created_count: int = 0
     updated_count: int = 0
     skipped_count: int = 0
+    error_count: int = 0
     warnings: List[str] = Field(default_factory=list)
     reindex_result: Optional[Dict[str, Any]] = None
     results: List[CanonicalImportFileView] = Field(default_factory=list)

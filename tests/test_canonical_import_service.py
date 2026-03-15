@@ -42,6 +42,13 @@ class FakeDriveStore:
         return self.drive_file_text[file_id]
 
 
+class FailingCreateDriveStore(FakeDriveStore):
+    def create_doc(self, *, folder, title, content, entity_type):
+        if title == "NPCs":
+            raise RuntimeError("quota exceeded for test")
+        return super().create_doc(folder=folder, title=title, content=content, entity_type=entity_type)
+
+
 def build_minimal_docx(path: Path, body_xml: str) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr(
@@ -159,6 +166,36 @@ class CanonicalImportServiceTest(unittest.TestCase):
         self.assertEqual(result.source_path, "gdrive://folder-123")
         self.assertTrue(any(item.title == "Glossary" and item.action == "create_doc" for item in result.results))
         self.assertTrue(any(item.source_name == "README.txt" and item.status == "skipped" for item in result.results))
+
+    def test_import_folder_continues_when_create_doc_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Campaign Bible_2026_03_08_2046.txt").write_text("Bible text", encoding="utf-8")
+            (root / "NPCs_2026_03_08_2046.txt").write_text("Captain Mira", encoding="utf-8")
+
+            drive_store = FailingCreateDriveStore()
+            drive_store.docs[("01 Bible", "Campaign Bible")] = DocumentRef(
+                folder="01 Bible",
+                title="Campaign Bible",
+                doc_id="doc-existing",
+                path_hint="01 Bible/Campaign Bible",
+            )
+            service = CanonicalImportService(drive_store=drive_store, reindex_fn=lambda targets: {"ok": True, "count": len(targets)})
+
+            result = service.import_folder(
+                source_path=str(root),
+                dry_run=False,
+                replace_existing=True,
+                reindex_after_import=True,
+            )
+
+        self.assertEqual(result.updated_count, 1)
+        self.assertEqual(result.created_count, 0)
+        self.assertEqual(result.imported_count, 1)
+        self.assertEqual(result.error_count, 1)
+        self.assertTrue(any(item.title == "NPCs" and item.status == "error" for item in result.results))
+        self.assertEqual(result.reindex_result["count"], 1)
+        self.assertTrue(any("create_doc failed for 03 NPC/NPCs" in warning for warning in result.warnings or []))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -51,6 +52,7 @@ class CanonicalImportResult:
     created_count: int
     updated_count: int
     skipped_count: int
+    error_count: int
     results: list[CanonicalImportFileResult]
     reindex_result: dict | None = None
     warnings: list[str] | None = None
@@ -117,6 +119,31 @@ def classify_canonical_file(path: Path) -> tuple[str, str, WorldEntityType]:
 class CanonicalImportService:
     drive_store: DriveStore
     reindex_fn: Optional[Callable[[list[DocumentRef]], dict]] = None
+
+    def _describe_write_error(self, exc: Exception) -> str:
+        if isinstance(exc, HttpError):
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            reason = None
+            detail_message = None
+            content = getattr(exc, "content", None)
+            if content:
+                try:
+                    payload = json.loads(content.decode("utf-8", errors="ignore"))
+                    errors = payload.get("error", {}).get("errors", [])
+                    if errors:
+                        detail_message = errors[0].get("message")
+                        reason = errors[0].get("reason")
+                except Exception:
+                    pass
+            if reason == "storageQuotaExceeded":
+                return "Drive storage quota exceeded while creating a Google Doc."
+            if status == 403:
+                return detail_message or "Google Drive denied write access for this document."
+            if status == 404:
+                return detail_message or "Target Google Drive document or folder was not found."
+            if detail_message:
+                return detail_message
+        return str(exc)
 
     def _iter_local_files(self, source_path: str) -> Iterable[CanonicalImportSourceFile]:
         root = Path(source_path).expanduser()
@@ -302,44 +329,84 @@ class CanonicalImportService:
 
             if existing and existing.doc_id:
                 target = DocumentRef(folder=existing.folder, title=existing.title, doc_id=existing.doc_id, path_hint=existing.path_hint)
-                self.drive_store.replace_doc(target, text)
-                reindex_targets.append(target)
-                results.append(
-                    CanonicalImportFileResult(
-                        source_path=item.source_path,
-                        source_name=item.source_name,
-                        format=item.format,
-                        folder=folder,
-                        title=title,
-                        entity_type=entity_type.value,
-                        action="replace_doc",
-                        status="updated",
-                        chars=len(text),
-                        doc_id=existing.doc_id,
-                        path=existing.path_hint,
-                        message="Existing Google Doc replaced from canonical source.",
+                try:
+                    self.drive_store.replace_doc(target, text)
+                    reindex_targets.append(target)
+                    results.append(
+                        CanonicalImportFileResult(
+                            source_path=item.source_path,
+                            source_name=item.source_name,
+                            format=item.format,
+                            folder=folder,
+                            title=title,
+                            entity_type=entity_type.value,
+                            action="replace_doc",
+                            status="updated",
+                            chars=len(text),
+                            doc_id=existing.doc_id,
+                            path=existing.path_hint,
+                            message="Existing Google Doc replaced from canonical source.",
+                        )
                     )
-                )
+                except Exception as exc:
+                    message = self._describe_write_error(exc)
+                    warnings.append(f"replace_doc failed for {folder}/{title}: {message}")
+                    results.append(
+                        CanonicalImportFileResult(
+                            source_path=item.source_path,
+                            source_name=item.source_name,
+                            format=item.format,
+                            folder=folder,
+                            title=title,
+                            entity_type=entity_type.value,
+                            action="replace_doc",
+                            status="error",
+                            chars=len(text),
+                            doc_id=existing.doc_id,
+                            path=existing.path_hint,
+                            message=message,
+                        )
+                    )
             else:
-                created = self.drive_store.create_doc(folder=folder, title=title, content=text, entity_type=entity_type)
-                target = DocumentRef(folder=created.folder, title=created.title, doc_id=created.doc_id, path_hint=created.path_hint)
-                reindex_targets.append(target)
-                results.append(
-                    CanonicalImportFileResult(
-                        source_path=item.source_path,
-                        source_name=item.source_name,
-                        format=item.format,
-                        folder=folder,
-                        title=title,
-                        entity_type=entity_type.value,
-                        action="create_doc",
-                        status="created",
-                        chars=len(text),
-                        doc_id=created.doc_id,
-                        path=created.path_hint,
-                        message="Google Doc created from canonical source.",
+                try:
+                    created = self.drive_store.create_doc(folder=folder, title=title, content=text, entity_type=entity_type)
+                    target = DocumentRef(folder=created.folder, title=created.title, doc_id=created.doc_id, path_hint=created.path_hint)
+                    reindex_targets.append(target)
+                    results.append(
+                        CanonicalImportFileResult(
+                            source_path=item.source_path,
+                            source_name=item.source_name,
+                            format=item.format,
+                            folder=folder,
+                            title=title,
+                            entity_type=entity_type.value,
+                            action="create_doc",
+                            status="created",
+                            chars=len(text),
+                            doc_id=created.doc_id,
+                            path=created.path_hint,
+                            message="Google Doc created from canonical source.",
+                        )
                     )
-                )
+                except Exception as exc:
+                    message = self._describe_write_error(exc)
+                    warnings.append(f"create_doc failed for {folder}/{title}: {message}")
+                    results.append(
+                        CanonicalImportFileResult(
+                            source_path=item.source_path,
+                            source_name=item.source_name,
+                            format=item.format,
+                            folder=folder,
+                            title=title,
+                            entity_type=entity_type.value,
+                            action="create_doc",
+                            status="error",
+                            chars=len(text),
+                            doc_id=None,
+                            path=f"{folder}/{title}",
+                            message=message,
+                        )
+                    )
 
         reindex_result = None
         if not dry_run and reindex_after_import and reindex_targets and self.reindex_fn:
@@ -352,6 +419,7 @@ class CanonicalImportService:
         created_count = sum(1 for item in results if item.status == "created")
         updated_count = sum(1 for item in results if item.status == "updated")
         skipped_count = sum(1 for item in results if item.status == "skipped")
+        error_count = sum(1 for item in results if item.status == "error")
         imported_count = created_count + updated_count
 
         return CanonicalImportResult(
@@ -361,6 +429,7 @@ class CanonicalImportService:
             created_count=created_count,
             updated_count=updated_count,
             skipped_count=skipped_count,
+            error_count=error_count,
             results=results,
             reindex_result=reindex_result,
             warnings=warnings,

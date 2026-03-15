@@ -75,6 +75,11 @@ class FakeDriveStore:
         return self.drive_file_text[file_id]
 
 
+class FailingCreateDriveStore(FakeDriveStore):
+    def create_doc(self, *, folder, title, content, entity_type):
+        raise RuntimeError("quota exceeded for test")
+
+
 class FakePlanner:
     def propose(self, request, world_docs, world_context):
         return ChangeProposal(
@@ -673,6 +678,26 @@ class RoutesV1Test(unittest.TestCase):
         self.assertEqual(body["source_path"], "gdrive://folder-123")
         self.assertTrue(any(item["title"] == "Campaign Bible" and item["action"] == "create_doc" for item in body["results"]))
         self.assertTrue(any(item["source_name"] == "README.txt" and item["status"] == "skipped" for item in body["results"]))
+
+    def test_v1_canonical_import_returns_partial_results_on_write_error(self):
+        drive_store = FailingCreateDriveStore()
+        drive_store.drive_folder_files["folder-123"] = [
+            DriveFileInfo(file_id="file-1", name="NPCs_2026_03_08_2046.docx", mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", parents=["folder-123"]),
+        ]
+        drive_store.drive_file_text["file-1"] = "Captain Mira"
+        router = self.build_router(drive_store=drive_store)
+
+        body = self.route_endpoint(router, "/v1/imports/canonical-files", "POST")(
+            request=CanonicalImportRequest(
+                source_drive_folder_id="folder-123",
+                dry_run=False,
+            )
+        ).model_dump(mode="json")
+
+        self.assertEqual(body["imported_count"], 0)
+        self.assertEqual(body["error_count"], 1)
+        self.assertTrue(any(item["status"] == "error" for item in body["results"]))
+        self.assertTrue(any("create_doc failed for 03 NPC/NPCs" in warning for warning in body["warnings"]))
 
     def test_v1_world_model_change_accept_marks_old_proposal_superseded(self):
         workflow_store = FakeWorkflowStore()
