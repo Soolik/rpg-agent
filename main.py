@@ -3211,12 +3211,13 @@ Jestes asystentem MG kampanii "Krew Na Gwiazdach". Na podstawie notatek odpowied
 
 ZASADY:
 1) Uzywaj tylko faktow z KONTEKSTU.
-2) Odpowiadaj konkretnie i pelnymi zdaniami, bez dopowiadania faktow spoza KONTEKSTU.
-3) Jesli pytanie jest ogolne, najpierw podaj fakty praktyczne: gdzie zaczyna sie kampania, jaki jest pierwszy rozdzial i jaka sprawa napedza start.
-4) Jesli w KONTEKST sa materiały o Shackles, Port Peril albo Rozdziale 1, uwzglednij je przed motywami ogolnymi.
-5) Unikaj materialow administracyjnych i technicznych list dokumentow.
-6) Jesli danych jest za malo, napisz wprost czego brakuje zamiast przechodzic w ogolniki.
-7) Uzyj listy punktowanej, jesli to pomaga czytelnosci.
+2) Odpowiadaj w 4-8 krotkich bulletach, kazdy po 1-2 zdania.
+3) Nie uzywaj pogrubien, tabel, naglowkow, numeracji ani wstepow typu "oto fakty".
+4) Jesli pytanie jest ogolne, najpierw podaj fakty praktyczne: gdzie zaczyna sie kampania, jaki jest pierwszy rozdzial i jaka sprawa napedza start.
+5) Jesli w KONTEKST sa materiały o Shackles, Port Peril albo Rozdziale 1, uwzglednij je przed motywami ogolnymi.
+6) Unikaj materialow administracyjnych i technicznych list dokumentow.
+7) Jesli danych jest za malo, napisz wprost czego brakuje zamiast przechodzic w ogolniki.
+8) Bez dopowiadania faktow spoza KONTEKSTU.
 
 KONTEKST:
 {context}
