@@ -100,6 +100,55 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("KONTEKST (kazdy blok zawiera title, folder, doc_type i tresc chunku):", seen["prompt"])
         self.assertEqual(response.sources[0]["title"], "Campaign Bible")
 
+    def test_ask_uses_analysis_prompt_for_campaign_coherence_questions(self):
+        original_vector_search = main.vector_search
+        original_gemini_generate = main.gemini_generate
+        seen = {}
+
+        def fake_vector_search(question, top_k):
+            return [
+                {
+                    "chunk_id": 1,
+                    "doc_id": "doc-1",
+                    "doc_type": "gdoc",
+                    "chunk_text": "Tavin Morn ginie w zamachu, a Red Blade naciska na dlugi i przysiegi w porcie.",
+                    "distance": 0.82,
+                    "title": "Campaign Bible",
+                    "folder": "01 Bible",
+                    "path_hint": "01 Bible / Campaign Bible",
+                }
+            ]
+
+        def fake_gemini_generate(prompt, **kwargs):
+            seen["prompt"] = prompt
+            return main.json.dumps(
+                {
+                    "format": "bullets",
+                    "bullets": [
+                        "Zamach na Tavina Morna daje kampanii mocny punkt zapalny, bo laczy polityke portu, dlugi i przysiegi w jedno zdarzenie.",
+                        "Najwiekszym ryzykiem jest to, czy notatki dostatecznie wyjasniaja zaleznosc miedzy Red Blade, dlugami i eskalacja przemocy.",
+                    ],
+                    "used_context": [1],
+                },
+                ensure_ascii=False,
+            )
+
+        try:
+            main.vector_search = fake_vector_search
+            main.gemini_generate = fake_gemini_generate
+            response = main.ask(
+                main.AskRequest(
+                    question="Sprawdz mi zgodnosc logiczna kampanii Krew Na Gwiazdach.",
+                    include_sources=False,
+                )
+            )
+        finally:
+            main.vector_search = original_vector_search
+            main.gemini_generate = original_gemini_generate
+
+        self.assertIn("Analizujesz spojnosci, napiecia i ryzyka kampanii", seen["prompt"])
+        self.assertIn("Najwiekszym ryzykiem", response.answer)
+
     def test_chat_answer_returns_human_text_with_sources(self):
         original_ask = main.ask
         try:

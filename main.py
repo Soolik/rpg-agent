@@ -2704,6 +2704,57 @@ ODPOWIEDZ (tylko JSON):
 """.strip()
 
 
+def is_campaign_analysis_question(text: str) -> bool:
+    normalized = normalize_match_text(text)
+    hints = (
+        "zgodnosc logiczna",
+        "spojnosc",
+        "logicz",
+        "czy to ma sens",
+        "czy to sie trzyma kupy",
+        "luki",
+        "slabe punkty",
+        "ryzyka",
+        "sprzeczn",
+    )
+    return any(hint in normalized for hint in hints)
+
+
+def build_campaign_analysis_prompt(question: str, context: str) -> str:
+    return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Analizujesz spojnosci, napiecia i ryzyka kampanii na podstawie notatek.
+
+ZASADY:
+1) Uzywaj wylacznie faktow z KONTEKSTU.
+2) Mozesz laczyc fakty z kilku blokow i wyciagac ostrozne wnioski, ale tylko jesli wynikaja bezposrednio z notatek.
+3) Dla pytan o spojnnosc, logike i stawki wypisz:
+   - co jest juz dobrze osadzone w notatkach,
+   - jakie sa napiecia, ryzyka lub potencjalne niejasnosci,
+   - czego nadal brakuje lub co warto doprecyzowac.
+4) Kazdy bullet ma byc pelnym zdaniem i zawierac konkret kampanijny, a nie ogolnik.
+5) Jesli kontekst jest za slaby, zwroc JSON z format="bullets" i bullets=["brak w notatkach"].
+6) Nie dopowiadaj faktow spoza kontekstu.
+7) W used_context podaj numery blokow, z ktorych skorzystales.
+8) Zwracaj wylacznie JSON. Bez markdown i bez tekstu dookola.
+
+Dozwolony JSON:
+{{
+  "format": "bullets" | "table",
+  "bullets": ["..."],
+  "table": {{"columns": ["..."], "rows": [["..."]]}},
+  "used_context": [1,2,3]
+}}
+
+KONTEKST (kazdy blok zawiera title, folder, doc_type i tresc chunku):
+{context}
+
+PYTANIE:
+{question}
+
+ODPOWIEDZ (tylko JSON):
+""".strip()
+
+
 GITHUB_API = "https://api.github.com"
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "Soolik")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "rpg-agent")
@@ -3105,7 +3156,8 @@ def ask(req: AskRequest):
         if not hits:
             hits = vector_search(q, req.top_k)
         context = build_campaign_context(hits)
-        prompt = build_campaign_prompt(q, context)
+        prompt_builder = build_campaign_analysis_prompt if is_campaign_analysis_question(q) else build_campaign_prompt
+        prompt = prompt_builder(q, context)
 
         raw = gemini_generate(
             prompt,
