@@ -154,7 +154,7 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
     buffer.length = 0;
   }
   function renderMarkdown(text) {
-    const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+    const lines = String(text || "").replace(/\\r\\n/g, "\\n").split("\\n");
     const out = [];
     const paragraph = [];
     const list = [];

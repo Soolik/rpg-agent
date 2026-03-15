@@ -37,6 +37,7 @@ class RoutesWebTest(unittest.TestCase):
         self.assertIn('e.message.addEventListener("keydown"', body)
         self.assertIn('if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing) return;', body)
         self.assertIn('include_sources: true', body)
+        self.assertIn('replace(/\\r\\n/g, "\\n").split("\\n");', body)
         self.assertIn("window.location.assign('/v1/auth/google-drive/start'); return false;", body)
         self.assertIn('window.addEventListener("focus"', body)
         self.assertIn('window.addEventListener("pageshow"', body)
