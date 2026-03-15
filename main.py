@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from app.applier import ProposalApplier
-from app.chat_service import DirectChatStream
+from app.chat_service import DirectChatStream, StreamPlan
 from app.chat_models import (
     ArtifactType,
     AskRequest,
@@ -2809,6 +2809,7 @@ app.include_router(
         world_model_store=world_model_store_v2,
         conversation_store=conversation_store_v1,
         applier=proposal_applier_v2,
+        reindex_fn=reindex_after_apply_default,
     )
 )
 
@@ -2958,7 +2959,7 @@ def ask_text(req: AskRequest):
     return resp.answer + "\n"
 
 
-def stream_chat(req: ChatRequest) -> Optional[DirectChatStream]:
+def stream_chat(req: ChatRequest) -> StreamPlan:
     resolved_artifact_type = infer_artifact_type(req.message, req.artifact_type)
     explicit_intent = req.intent != "auto"
     resolved_intent = req.intent if explicit_intent else detect_chat_intent(req.message)
@@ -2966,21 +2967,25 @@ def stream_chat(req: ChatRequest) -> Optional[DirectChatStream]:
         resolved_intent = "creative"
 
     if resolved_intent != "answer":
-        return None
+        return StreamPlan(selected_mode="buffered", reason="intent_requires_buffered_stream")
     if req.include_sources or req.include_telemetry or req.save_output or resolved_artifact_type or req.source_title:
-        return None
+        return StreamPlan(selected_mode="buffered", reason="features_require_buffered_stream")
     if "KONTEKST ROZMOWY:" in req.message or "PODSUMOWANIE ROZMOWY:" in req.message:
-        return None
+        return StreamPlan(selected_mode="buffered", reason="conversation_context_requires_buffered_stream")
     if is_campaign_question(req.message):
-        return None
+        return StreamPlan(selected_mode="buffered", reason="campaign_question_requires_buffered_stream")
 
     try:
-        return DirectChatStream(
-            chunks=gemini_generate_stream(build_general_prompt(req.message.strip())),
-            kind="answer",
+        return StreamPlan(
+            selected_mode="direct",
+            reason="simple_answer_direct_stream_enabled",
+            handle=DirectChatStream(
+                chunks=gemini_generate_stream(build_general_prompt(req.message.strip())),
+                kind="answer",
+            ),
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        return StreamPlan(selected_mode="buffered", reason=f"direct_stream_initialization_failed: {exc}")
 
 
 @app.post("/chat", response_model=ChatResponse)

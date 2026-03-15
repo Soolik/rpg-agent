@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from .api_models import (
     AssistantMode,
     ChatArtifact,
+    ChatStreamDebug,
     ContinuityReport,
     NextAction,
     RequestTrace,
@@ -30,6 +31,8 @@ SUMMARY_TRIGGER_MESSAGES = 10
 SUMMARY_KEEP_RECENT_MESSAGES = 6
 SUMMARY_MAX_LINES = 8
 SUMMARY_MAX_CHARS = 1200
+SUMMARY_REFRESH_MIN_NEW_MESSAGES = 4
+SUMMARY_REFRESH_MIN_NEW_CHARS = 1000
 
 
 def _api_error(status_code: int, *, request_trace: RequestTrace, code: str, message: str) -> HTTPException:
@@ -51,6 +54,13 @@ class DirectChatStream:
     artifact_type: Optional[str] = None
     references: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class StreamPlan:
+    selected_mode: str
+    reason: str
+    handle: Optional[DirectChatStream] = None
 
 
 def _saved_output_from_chat(response: ChatResponse) -> Optional[SavedOutputRef]:
@@ -365,7 +375,7 @@ class ChatService:
         *,
         chat_request_cls: Type[ChatRequest],
         chat_fn: Callable[[ChatRequest], ChatResponse],
-        chat_stream_fn: Optional[Callable[[ChatRequest], Optional[DirectChatStream]]] = None,
+        chat_stream_fn: Optional[Callable[[ChatRequest], StreamPlan]] = None,
         drive_store,
         planner,
         consistency_planner=None,
@@ -503,7 +513,22 @@ class ChatService:
                 )
             return
 
-        summary_cutoff = max(0, len(messages) - SUMMARY_KEEP_RECENT_MESSAGES)
+        summary_text, summary_message_count = self._conversation_summary_state(conversation)
+        unsummarized_messages = messages[summary_message_count:] if summary_message_count < len(messages) else []
+        unsummarized_chars = sum(len(message.content or "") for message in unsummarized_messages)
+
+        should_refresh = False
+        if not summary_text:
+            should_refresh = True
+        elif len(unsummarized_messages) >= SUMMARY_REFRESH_MIN_NEW_MESSAGES:
+            should_refresh = True
+        elif unsummarized_chars >= SUMMARY_REFRESH_MIN_NEW_CHARS:
+            should_refresh = True
+
+        if not should_refresh:
+            return
+
+        summary_cutoff = max(summary_message_count, len(messages) - SUMMARY_KEEP_RECENT_MESSAGES)
         summary_text = _summarize_messages(messages[:summary_cutoff])
         self.conversation_store.update_conversation_metadata(
             conversation.conversation_id,
@@ -583,6 +608,7 @@ class ChatService:
                 conversation_id=conversation_id,
             ),
             output=_saved_output_from_chat(response),
+            stream_debug=None,
             telemetry=response.telemetry,
             continuity=continuity,
         )
@@ -636,6 +662,7 @@ class ChatService:
                 conversation_id=conversation_id,
             ),
             output=None,
+            stream_debug=None,
             telemetry=None,
             continuity=continuity,
         )
@@ -741,9 +768,11 @@ class ChatService:
             conversation_title=conversation_title,
         )
 
-        handle: Optional[DirectChatStream] = None
-        if self.chat_stream_fn and assistant_mode == AssistantMode.create:
-            handle = self.chat_stream_fn(
+        stream_plan = StreamPlan(selected_mode="buffered", reason="stream_backend_unavailable")
+        if assistant_mode != AssistantMode.create:
+            stream_plan = StreamPlan(selected_mode="buffered", reason="assistant_mode_requires_buffered_stream")
+        elif self.chat_stream_fn:
+            stream_plan = self.chat_stream_fn(
                 self.chat_request_cls(
                     message=composed_message,
                     intent=intent,
@@ -757,6 +786,7 @@ class ChatService:
                     output_title=output_title,
                 )
             )
+        handle = stream_plan.handle
 
         if not handle:
             response = self.run(
@@ -773,6 +803,11 @@ class ChatService:
                 output_title=output_title,
                 conversation_id=conversation_id,
                 conversation_title=conversation_title,
+            )
+            response.stream_debug = ChatStreamDebug(
+                requested=True,
+                selected_mode="buffered",
+                reason=stream_plan.reason,
             )
             return self.stream(response)
 
@@ -793,7 +828,11 @@ class ChatService:
                     "trace_id": trace.trace_id,
                     "conversation_id": conversation.conversation_id if conversation else None,
                     "title": "Odpowiedz",
-                    "stream_mode": "direct",
+                    "stream_debug": {
+                        "requested": True,
+                        "selected_mode": "direct",
+                        "reason": stream_plan.reason,
+                    },
                 },
             )
 
@@ -821,6 +860,11 @@ class ChatService:
                     conversation_id=conversation.conversation_id if conversation else None,
                     conversation_title=conversation.title if conversation else None,
                 )
+                final_response.stream_debug = ChatStreamDebug(
+                    requested=True,
+                    selected_mode="direct",
+                    reason=stream_plan.reason,
+                )
                 self._append_assistant_message(conversation, response=final_response)
                 self._refresh_conversation_summary(conversation)
                 yield _sse_event("complete", final_response.model_dump(mode="json"))
@@ -847,7 +891,15 @@ class ChatService:
                     "trace_id": response.trace_id,
                     "conversation_id": response.conversation_id,
                     "title": response.title,
-                    "stream_mode": "buffered",
+                    "stream_debug": (
+                        response.stream_debug.model_dump(mode="json")
+                        if response.stream_debug
+                        else {
+                            "requested": True,
+                            "selected_mode": "buffered",
+                            "reason": "buffered_stream_render",
+                        }
+                    ),
                 },
             )
             for chunk in _stream_chunks(response.reply_markdown):

@@ -28,6 +28,7 @@ class FakeConversationStore:
         self.conversations = {}
         self.messages = {}
         self.next_id = 1
+        self.metadata_updates = []
 
     def create_conversation(self, *, title="", metadata=None):
         conversation_id = f"conv-{self.next_id}"
@@ -79,6 +80,7 @@ class FakeConversationStore:
         conversation = self.conversations.get(conversation_id)
         if not conversation:
             return None
+        self.metadata_updates.append({"conversation_id": conversation_id, "metadata_patch": metadata_patch})
         conversation.metadata = {
             **(conversation.metadata or {}),
             **(metadata_patch or {}),
@@ -175,6 +177,43 @@ class ChatServiceTest(unittest.TestCase):
         updated = store.get_conversation(conversation.conversation_id)
         self.assertTrue(updated.metadata["summary_text"].startswith("PODSUMOWANIE ROZMOWY:"))
         self.assertGreater(updated.metadata["summary_message_count"], 0)
+
+    def test_run_does_not_refresh_summary_when_only_small_unsummarized_delta_exists(self):
+        def fake_chat(_req):
+            return ChatResponse(kind="answer", reply="Krotka odpowiedz.", references=[])
+
+        store = FakeConversationStore()
+        conversation = store.create_conversation(
+            title="Red Blade",
+            metadata={
+                "summary_text": "PODSUMOWANIE ROZMOWY:\n- U: Red Blade naciska.",
+                "summary_message_count": 10,
+            },
+        )
+        for idx in range(10):
+            role = "user" if idx % 2 == 0 else "assistant"
+            kind = "input" if role == "user" else "answer"
+            store.append_message(conversation.conversation_id, role=role, content=f"Stara wiadomosc {idx}", kind=kind)
+
+        service = self.build_service(fake_chat, store)
+        service.run(
+            trace=RequestTrace(request_id="req-3", trace_id="req-3"),
+            message="Krotki dopisek.",
+            assistant_mode=AssistantMode.create,
+            intent="answer",
+            artifact_type=None,
+            source_title=None,
+            candidate_text=None,
+            include_sources=False,
+            include_telemetry=False,
+            save_output=False,
+            output_title=None,
+            conversation_id=conversation.conversation_id,
+            conversation_title=None,
+        )
+
+        summary_updates = [item for item in store.metadata_updates if "summary_text" in item["metadata_patch"]]
+        self.assertEqual(summary_updates, [])
 
 
 if __name__ == "__main__":

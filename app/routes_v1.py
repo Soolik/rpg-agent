@@ -10,6 +10,9 @@ from .api_models import (
     AssistantActionResponse,
     AssistantActionType,
     AssistantMode,
+    CanonicalImportFileView,
+    CanonicalImportRequest,
+    CanonicalImportResponse,
     ConversationCreateRequest,
     ConversationListResponse,
     ConversationMessageCreateRequest,
@@ -36,10 +39,11 @@ from .api_models import (
     WorldModelThreadListResponse,
 )
 from .applier import ProposalApplier
-from .chat_service import ChatService, DirectChatStream
-from .canon_guard import normalize_key
+from .canonical_import_service import CanonicalImportService
+from .chat_service import ChatService, StreamPlan
 from .chat_models import ChatRequest, ChatResponse
 from .conversation_store import ConversationStore, NullConversationStore
+from .world_model_service import WorldModelService
 from .world_model_store import NullWorldModelStore, WorldModelStore
 from .workflow_store import NullWorkflowStore, WorkflowStore
 from .workflow_service import WorkflowService
@@ -61,75 +65,11 @@ def _api_error(status_code: int, *, request_trace: RequestTrace, code: str, mess
         },
     )
 
-def _search_world_model(
-    query: str,
-    *,
-    world_model_store: WorldModelStore | NullWorldModelStore,
-    limit: int,
-) -> list[WorldModelSearchItem]:
-    qkey = normalize_key(query)
-    if not qkey:
-        return []
-
-    items: list[WorldModelSearchItem] = []
-
-    for entity in world_model_store.list_entities(limit=max(limit * 3, 50)):
-        haystack = normalize_key(" ".join(filter(None, [entity.name, entity.description, " ".join(entity.tags)])))
-        if qkey not in haystack:
-            continue
-        score = 120 if qkey == normalize_key(entity.name) else 90 if qkey in normalize_key(entity.name) else 60
-        items.append(
-            WorldModelSearchItem(
-                record_type="entity",
-                record_id=entity.id,
-                title=entity.name,
-                snippet=entity.description[:220],
-                entity_kind=entity.entity_kind,
-                score=score,
-            )
-        )
-
-    for thread in world_model_store.list_threads(limit=max(limit * 3, 50)):
-        haystack = normalize_key(" ".join(filter(None, [thread.thread_id or "", thread.title, thread.last_change, thread.status or ""])))
-        if qkey not in haystack:
-            continue
-        score = 115 if qkey == normalize_key(thread.title) else 85 if qkey in normalize_key(thread.title) else 55
-        items.append(
-            WorldModelSearchItem(
-                record_type="thread",
-                record_id=thread.id,
-                title=thread.title,
-                snippet=thread.last_change[:220],
-                status=thread.status,
-                score=score,
-            )
-        )
-
-    for session in world_model_store.list_sessions(limit=max(limit * 3, 50)):
-        haystack = normalize_key(" ".join(filter(None, [session.session_summary, session.source_title or ""])))
-        if qkey not in haystack:
-            continue
-        score = 70 if qkey in normalize_key(session.source_title or "") else 50
-        items.append(
-            WorldModelSearchItem(
-                record_type="session",
-                record_id=session.id,
-                title=session.source_title or f"Session {session.id}",
-                snippet=session.session_summary[:220],
-                source_title=session.source_title,
-                score=score,
-            )
-        )
-
-    items.sort(key=lambda item: (item.score, item.record_id), reverse=True)
-    return items[:limit]
-
-
 def build_v1_router(
     *,
     chat_request_cls: Type[ChatRequest],
     chat_fn: Callable[[ChatRequest], ChatResponse],
-    chat_stream_fn: Optional[Callable[[ChatRequest], Optional[DirectChatStream]]] = None,
+    chat_stream_fn: Optional[Callable[[ChatRequest], StreamPlan]] = None,
     health_fn: Callable[[], dict],
     drive_store,
     planner,
@@ -138,6 +78,7 @@ def build_v1_router(
     world_model_store: Optional[WorldModelStore | NullWorldModelStore] = None,
     conversation_store: Optional[ConversationStore | NullConversationStore] = None,
     applier: Optional[ProposalApplier] = None,
+    reindex_fn: Optional[Callable[[list], dict]] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/v1", tags=["v1"])
     store = workflow_store or NullWorkflowStore()
@@ -161,6 +102,8 @@ def build_v1_router(
         workflow_store=store,
         applier=proposal_applier,
     )
+    world_model_service = WorldModelService(world_model_store=model_store)
+    canonical_import_service = CanonicalImportService(drive_store=drive_store, reindex_fn=reindex_fn)
 
     @router.get("/health", response_model=V1HealthResponse)
     def v1_health():
@@ -505,7 +448,7 @@ def build_v1_router(
         return WorldModelEntityListResponse(
             request_id=trace.request_id,
             trace_id=trace.trace_id,
-            items=model_store.list_entities(limit=safe_limit, kind=kind),
+            items=world_model_service.list_entities(limit=safe_limit, kind=kind),
         )
 
     @router.get("/world-model/threads", response_model=WorldModelThreadListResponse)
@@ -515,7 +458,7 @@ def build_v1_router(
         return WorldModelThreadListResponse(
             request_id=trace.request_id,
             trace_id=trace.trace_id,
-            items=model_store.list_threads(limit=safe_limit, status=status),
+            items=world_model_service.list_threads(limit=safe_limit, status=status),
         )
 
     @router.get("/world-model/sessions", response_model=WorldModelSessionListResponse)
@@ -525,19 +468,74 @@ def build_v1_router(
         return WorldModelSessionListResponse(
             request_id=trace.request_id,
             trace_id=trace.trace_id,
-            items=model_store.list_sessions(limit=safe_limit),
+            items=world_model_service.list_sessions(limit=safe_limit),
         )
 
     @router.get("/world-model/search", response_model=WorldModelSearchResponse)
     def v1_search_world_model(q: str, limit: int = 20):
         trace = _new_trace()
         safe_limit = max(1, min(limit, 50))
-        items = _search_world_model(q, world_model_store=model_store, limit=safe_limit)
+        items = world_model_service.search(q, limit=safe_limit)
         return WorldModelSearchResponse(
             request_id=trace.request_id,
             trace_id=trace.trace_id,
             query=q,
             items=items,
+        )
+
+    @router.post("/imports/canonical-files", response_model=CanonicalImportResponse)
+    def v1_import_canonical_files(request: CanonicalImportRequest):
+        trace = _new_trace()
+        try:
+            imported = canonical_import_service.import_folder(
+                source_path=request.source_path,
+                dry_run=request.dry_run,
+                replace_existing=request.replace_existing,
+                reindex_after_import=request.reindex_after_import,
+            )
+        except FileNotFoundError as exc:
+            raise _api_error(
+                404,
+                request_trace=trace,
+                code="source_path_not_found",
+                message=str(exc),
+            )
+        except ValueError as exc:
+            raise _api_error(
+                400,
+                request_trace=trace,
+                code="invalid_source_path",
+                message=str(exc),
+            )
+
+        return CanonicalImportResponse(
+            request_id=trace.request_id,
+            trace_id=trace.trace_id,
+            source_path=imported.source_path,
+            dry_run=imported.dry_run,
+            imported_count=imported.imported_count,
+            created_count=imported.created_count,
+            updated_count=imported.updated_count,
+            skipped_count=imported.skipped_count,
+            warnings=imported.warnings or [],
+            reindex_result=imported.reindex_result,
+            results=[
+                CanonicalImportFileView(
+                    source_path=item.source_path,
+                    source_name=item.source_name,
+                    format=item.format,
+                    folder=item.folder,
+                    title=item.title,
+                    entity_type=item.entity_type,
+                    action=item.action,
+                    status=item.status,  # type: ignore[arg-type]
+                    chars=item.chars,
+                    doc_id=item.doc_id,
+                    path=item.path,
+                    message=item.message,
+                )
+                for item in imported.results
+            ],
         )
 
     def accept_world_model_change_impl(

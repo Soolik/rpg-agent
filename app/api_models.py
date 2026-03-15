@@ -51,6 +51,12 @@ class ChatArtifact(BaseModel):
     format: Literal["markdown", "plain_text"] = "markdown"
 
 
+class ChatStreamDebug(BaseModel):
+    requested: bool = False
+    selected_mode: Literal["direct", "buffered", "disabled"] = "disabled"
+    reason: str = ""
+
+
 class NextAction(BaseModel):
     type: Literal[
         "continue_conversation",
@@ -143,6 +149,7 @@ class V1ChatResponse(RequestTrace):
     warnings: List[str] = Field(default_factory=list)
     next_actions: List[NextAction] = Field(default_factory=list)
     output: Optional[SavedOutputRef] = None
+    stream_debug: Optional[ChatStreamDebug] = None
     telemetry: Optional[Dict[str, Any]] = None
     continuity: Optional[ContinuityReport] = None
 
@@ -204,6 +211,40 @@ class WorldModelSearchItem(BaseModel):
 class WorldModelSearchResponse(RequestTrace):
     query: str
     items: List[WorldModelSearchItem] = Field(default_factory=list)
+
+
+class CanonicalImportRequest(BaseModel):
+    source_path: str = Field(..., min_length=1)
+    dry_run: bool = True
+    replace_existing: bool = True
+    reindex_after_import: bool = True
+
+
+class CanonicalImportFileView(BaseModel):
+    source_path: str
+    source_name: str
+    format: str
+    folder: Optional[str] = None
+    title: Optional[str] = None
+    entity_type: Optional[str] = None
+    action: str
+    status: Literal["planned", "created", "updated", "skipped"]
+    chars: int = 0
+    doc_id: Optional[str] = None
+    path: Optional[str] = None
+    message: str = ""
+
+
+class CanonicalImportResponse(RequestTrace):
+    source_path: str
+    dry_run: bool = True
+    imported_count: int = 0
+    created_count: int = 0
+    updated_count: int = 0
+    skipped_count: int = 0
+    warnings: List[str] = Field(default_factory=list)
+    reindex_result: Optional[Dict[str, Any]] = None
+    results: List[CanonicalImportFileView] = Field(default_factory=list)
 
 
 class WorldModelChangeProposalRequest(BaseModel):

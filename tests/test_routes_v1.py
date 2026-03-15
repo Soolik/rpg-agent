@@ -1,5 +1,7 @@
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 
 from fastapi import HTTPException
 
@@ -7,6 +9,7 @@ from app.api_models import (
     AssistantActionRequest,
     AssistantActionType,
     AssistantMode,
+    CanonicalImportRequest,
     ConversationCreateRequest,
     ConversationMessageCreateRequest,
     ProposalStatus,
@@ -31,12 +34,36 @@ from app.models_v2 import (
     WorldThreadRecord,
 )
 from app.routes_v1 import build_v1_router
-from app.chat_service import DirectChatStream
+from app.chat_service import DirectChatStream, StreamPlan
 
 
 class FakeDriveStore:
+    def __init__(self):
+        self.docs = {}
+        self.created = []
+        self.replaced = []
+
     def list_world_docs(self):
-        return []
+        return list(self.docs.values())
+
+    def find_doc(self, *, folder=None, title=None, doc_id=None):
+        if doc_id:
+            for doc in self.docs.values():
+                if doc.doc_id == doc_id:
+                    return doc
+            return None
+        if folder and title:
+            return self.docs.get((folder, title))
+        return None
+
+    def create_doc(self, *, folder, title, content, entity_type):
+        doc = DocumentRef(folder=folder, title=title, doc_id=f"doc-{len(self.created) + 1}", path_hint=f"{folder}/{title}")
+        self.docs[(folder, title)] = doc
+        self.created.append({"folder": folder, "title": title, "content": content, "entity_type": entity_type})
+        return doc
+
+    def replace_doc(self, doc_ref, content):
+        self.replaced.append({"doc_ref": doc_ref, "content": content})
 
 
 class FakePlanner:
@@ -283,18 +310,19 @@ class FakeConversationStore:
 
 
 class RoutesV1Test(unittest.TestCase):
-    def build_router(self, chat_fn=None, chat_stream_fn=None, workflow_store=None, conversation_store=None):
+    def build_router(self, chat_fn=None, chat_stream_fn=None, workflow_store=None, conversation_store=None, drive_store=None, reindex_fn=None):
         return build_v1_router(
             chat_request_cls=ChatRequest,
             chat_fn=chat_fn or (lambda req: ChatResponse(kind="answer", reply="OK", references=[])),
             chat_stream_fn=chat_stream_fn,
             health_fn=lambda: {"ok": True, "campaign_id": "kng", "revision": "rev-1"},
-            drive_store=FakeDriveStore(),
+            drive_store=drive_store or FakeDriveStore(),
             planner=FakePlanner(),
             workflow_store=workflow_store or FakeWorkflowStore(),
             world_model_store=FakeWorldModelStore(),
             conversation_store=conversation_store or FakeConversationStore(),
             applier=FakeApplier(),
+            reindex_fn=reindex_fn,
         )
 
     def route_endpoint(self, router, path, method):
@@ -412,7 +440,11 @@ class RoutesV1Test(unittest.TestCase):
 
         def fake_stream(req):
             seen["message"] = req.message
-            return DirectChatStream(chunks=iter(["Pierwszy ", "token ", "streamu."]))
+            return StreamPlan(
+                selected_mode="direct",
+                reason="test_direct_stream",
+                handle=DirectChatStream(chunks=iter(["Pierwszy ", "token ", "streamu."])),
+            )
 
         def fail_chat(_req):
             raise AssertionError("chat_fn should not be called for direct stream")
@@ -425,7 +457,8 @@ class RoutesV1Test(unittest.TestCase):
         body = asyncio.run(self.collect_stream(response))
 
         self.assertEqual(seen["message"], "Opowiedz krotko o idei tego API.")
-        self.assertIn('"stream_mode": "direct"', body)
+        self.assertIn('"selected_mode": "direct"', body)
+        self.assertIn('"reason": "test_direct_stream"', body)
         self.assertIn("Pierwszy token streamu.", body)
         self.assertIn("event: complete", body)
 
@@ -580,6 +613,37 @@ class RoutesV1Test(unittest.TestCase):
         self.assertEqual(body["query"], "Red Blade")
         self.assertTrue(any(item["record_type"] == "thread" for item in body["items"]))
         self.assertTrue(any(item["record_type"] == "session" for item in body["items"]))
+
+    def test_v1_canonical_import_dry_run_maps_local_files(self):
+        drive_store = FakeDriveStore()
+        reindex_calls = []
+        router = self.build_router(
+            drive_store=drive_store,
+            reindex_fn=lambda targets: reindex_calls.append(targets) or {"ok": True},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Campaign Bible_2026_03_08_2046.txt").write_text("# Campaign Bible\n\nTest.", encoding="utf-8")
+            (root / "NPCs_2026_03_08_2046.txt").write_text("Captain Mira", encoding="utf-8")
+            (root / "README.txt").write_text("skip me", encoding="utf-8")
+
+            body = self.route_endpoint(router, "/v1/imports/canonical-files", "POST")(
+                request=CanonicalImportRequest(
+                    source_path=str(root),
+                    dry_run=True,
+                    replace_existing=True,
+                    reindex_after_import=True,
+                )
+            ).model_dump(mode="json")
+
+        self.assertEqual(body["created_count"], 0)
+        self.assertEqual(body["updated_count"], 0)
+        self.assertEqual(body["imported_count"], 0)
+        self.assertEqual(body["skipped_count"], 1)
+        self.assertTrue(any(item["title"] == "Campaign Bible" and item["action"] == "create_doc" for item in body["results"]))
+        self.assertTrue(any(item["folder"] == "03 NPC" and item["title"] == "NPCs" for item in body["results"]))
+        self.assertEqual(reindex_calls, [])
 
     def test_v1_world_model_change_accept_marks_old_proposal_superseded(self):
         workflow_store = FakeWorkflowStore()
