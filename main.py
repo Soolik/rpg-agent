@@ -1553,7 +1553,11 @@ def should_use_setting_only_creative_context(message: str, canonical_names: List
     return all(name in NPC_BROAD_SETTING_ANCHORS for name in meaningful_names)
 
 
-def collect_disallowed_character_names(message: str, canonical_names: List[str]) -> List[str]:
+def collect_disallowed_character_names(
+    message: str,
+    canonical_names: List[str],
+    structured_context: str,
+) -> List[str]:
     names: List[str] = []
     seen = set()
 
@@ -1569,6 +1573,9 @@ def collect_disallowed_character_names(message: str, canonical_names: List[str])
         add_name(prior_name)
     for name in canonical_names:
         if not canonical_name_looks_like_broad_setting_anchor(name):
+            add_name(name)
+    for kind, name in re.findall(r"(?im)^\s*-\s*(npc|character|person)\s*:\s*(.+?)\s*$", structured_context or ""):
+        if normalize_match_text(kind) in {"npc", "character", "person"}:
             add_name(name)
 
     if world_model_store_v2:
@@ -3014,7 +3021,11 @@ def generate_structured_creative_artifact(
         section_values["# Pre-Session Brief"] = ""
     original_character_request = artifact_type == "npc_brief" and message_requests_original_character(message)
     setting_only_request = artifact_type == "npc_brief" and should_use_setting_only_creative_context(message, canonical_names)
-    disallowed_character_names = collect_disallowed_character_names(message, canonical_names) if original_character_request else []
+    disallowed_character_names = (
+        collect_disallowed_character_names(message, canonical_names, structured_context)
+        if original_character_request
+        else []
+    )
     blocked_story_anchors = NPC_BLOCKED_STORY_ANCHORS if setting_only_request else []
     specs = creative_section_specs(artifact_type)
     for spec in specs:
