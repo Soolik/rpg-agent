@@ -48,6 +48,13 @@ class ChatFlowTest(unittest.TestCase):
     def test_is_campaign_question_recognizes_port_peril(self):
         self.assertTrue(main.is_campaign_question("Co to jest Port Peril?"))
 
+    def test_infer_artifact_type_recognizes_character_request_as_npc_brief(self):
+        artifact_type = main.infer_artifact_type(
+            "Wymyśl mi postać piracką pasującą do Shackles.",
+            None,
+        )
+        self.assertEqual(artifact_type, "npc_brief")
+
     def test_ask_source_question_returns_docs_based_answer_without_model_call(self):
         original_drive_store = getattr(main, "drive_store_v2", None)
         original_gemini_generate = main.gemini_generate
@@ -845,6 +852,29 @@ class ChatFlowTest(unittest.TestCase):
         self.assertEqual(response.kind, "creative")
         self.assertEqual(response.artifact_type, "session_hooks")
         self.assertEqual(captured["artifact_type"], "session_hooks")
+
+    def test_chat_creative_character_request_defaults_to_npc_brief(self):
+        original_generate_creative_artifact = main.generate_creative_artifact
+        captured = {}
+
+        def fake_generate_creative_artifact(**kwargs):
+            captured.update(kwargs)
+            return "Imie:\nTalia Vane", []
+
+        try:
+            main.generate_creative_artifact = fake_generate_creative_artifact
+
+            response = main.chat(
+                main.ChatRequest(
+                    message="Wymysl mi postac piracka pasujaca do Shackles.",
+                )
+            )
+        finally:
+            main.generate_creative_artifact = original_generate_creative_artifact
+
+        self.assertEqual(response.kind, "creative")
+        self.assertEqual(response.artifact_type, "npc_brief")
+        self.assertEqual(captured["artifact_type"], "npc_brief")
 
     def test_chat_explicit_proposal_intent_is_not_overridden_by_creative_artifact_type(self):
         original_planner = main.planner_v2

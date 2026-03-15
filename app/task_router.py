@@ -80,6 +80,17 @@ ARTIFACT_HINTS = (
     ("session_report", ("raport z sesji", "podsumowanie sesji", "session report")),
 )
 
+CHARACTER_CREATION_VERBS = ("wymysl", "pomysl", "zaproponuj", "stworz")
+CHARACTER_CREATION_NOUNS = (
+    "postac",
+    "bohatera",
+    "bohaterke",
+    "pirata",
+    "piratke",
+    "kapitana",
+    "kapitanke",
+)
+
 CREATIVE_MARKERS = (
     "wymysl ",
     "pomysl ",
@@ -144,6 +155,10 @@ def _normalized(text: str) -> str:
 def _infer_artifact_type(message_norm: str, requested_artifact_type: Optional[str]) -> Optional[ArtifactType]:
     if requested_artifact_type:
         return requested_artifact_type  # type: ignore[return-value]
+    if any(verb in message_norm for verb in CHARACTER_CREATION_VERBS) and any(
+        noun in message_norm for noun in CHARACTER_CREATION_NOUNS
+    ):
+        return "npc_brief"
     for candidate_artifact, hints in ARTIFACT_HINTS:
         if any(hint in message_norm for hint in hints):
             return candidate_artifact  # type: ignore[return-value]

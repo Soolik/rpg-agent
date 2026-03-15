@@ -67,6 +67,17 @@ ARTIFACT_HINTS = (
     ("session_report", ("raport z sesji", "podsumowanie sesji", "session report")),
 )
 
+CHARACTER_CREATION_VERBS = ("wymysl", "pomysl", "zaproponuj", "stworz")
+CHARACTER_CREATION_NOUNS = (
+    "postac",
+    "bohatera",
+    "bohaterke",
+    "pirata",
+    "piratke",
+    "kapitana",
+    "kapitanke",
+)
+
 
 @dataclass(frozen=True)
 class AssistantDecision:
@@ -117,6 +128,10 @@ def infer_assistant_decision(
 
     artifact_type = requested_artifact_type
     if not artifact_type and mode == AssistantMode.create:
+        if any(verb in message_norm for verb in CHARACTER_CREATION_VERBS) and any(
+            noun in message_norm for noun in CHARACTER_CREATION_NOUNS
+        ):
+            artifact_type = "npc_brief"
         for candidate_artifact, hints in ARTIFACT_HINTS:
             if any(hint in message_norm for hint in hints):
                 artifact_type = candidate_artifact

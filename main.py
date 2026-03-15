@@ -1590,25 +1590,34 @@ def infer_artifact_type(message: str, requested: Optional[ArtifactType]) -> Opti
     if requested:
         return requested
 
-    lowered = (message or "").strip().lower()
-    if not lowered:
+    normalized = " ".join(
+        "".join(
+            ch for ch in unicodedata.normalize("NFKD", (message or "").strip().lower()) if not unicodedata.combining(ch)
+        ).split()
+    )
+    if not normalized:
         return None
 
-    if ("briefing" in lowered or "brief" in lowered) and "sesj" in lowered:
+    if ("briefing" in normalized or "brief" in normalized) and "sesj" in normalized:
         return "pre_session_brief"
-    if "raport sesji" in lowered or "raport z sesji" in lowered or "session report" in lowered:
+    if "raport sesji" in normalized or "raport z sesji" in normalized or "session report" in normalized:
         return "session_report"
-    if "player summary" in lowered or "podsumowanie dla graczy" in lowered:
+    if "player summary" in normalized or "podsumowanie dla graczy" in normalized:
         return "player_summary"
-    if "gm brief" in lowered or "briefing mg" in lowered:
+    if "gm brief" in normalized or "briefing mg" in normalized:
         return "gm_brief"
-    if "hook" in lowered:
+    if "hook" in normalized:
         return "session_hooks"
-    if "scene seed" in lowered or ("scene" in lowered and "seed" in lowered):
+    if "scene seed" in normalized or ("scene" in normalized and "seed" in normalized):
         return "scene_seed"
-    if "npc brief" in lowered or "nowego npc" in lowered or "nowy npc" in lowered:
+    if "npc brief" in normalized or "nowego npc" in normalized or "nowy npc" in normalized:
         return "npc_brief"
-    if "twist" in lowered:
+    if any(verb in normalized for verb in ("wymysl", "pomysl", "zaproponuj", "stworz")) and any(
+        noun in normalized
+        for noun in ("postac", "bohatera", "bohaterke", "pirata", "piratke", "kapitana", "kapitanke")
+    ):
+        return "npc_brief"
+    if "twist" in normalized:
         return "twist_pack"
     return None
 
