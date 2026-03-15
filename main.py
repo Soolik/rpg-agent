@@ -38,6 +38,7 @@ from app.chat_models import (
     SessionPatch,
     ThreadPatch,
 )
+from app.consistency_service import ConsistencyService
 from app.conversation_store import ConversationStore
 from app.creative_artifacts import (
     append_missing_artifact_sections,
@@ -84,11 +85,15 @@ from app.models_v2 import (
 )
 from app.planner import PlannerService
 from app.request_auth import GCLOUD_CLIENT_ID, GoogleRequestAuth, RequestAuthMiddleware, SignedSessionAuth
+from app.retrieval_service import HybridRetrievalService
 from app.routed_drive_store import RoutedDriveStore
 from app.routes_web import build_web_router
 from app.routes_v1 import build_v1_router
 from app.routes_v2 import build_context_for_planner, build_v2_router
 from app.text_normalization import normalize_text_artifacts
+from app.world_fact_service import WorldFactService
+from app.world_fact_store import WorldFactStore
+from app.world_model_service import WorldModelService
 from app.world_model_store import WorldModelStore
 from app.workflow_store import WorkflowStore
 from googleapiclient.discovery import build
@@ -286,16 +291,78 @@ def chunk_text(text: str, max_chars: int = 2400, overlap: int = 400) -> List[str
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not text:
         return []
+    heading_re = re.compile(r"(?m)^(#{1,6})\s+(.+?)\s*$")
+    matches = list(heading_re.finditer(text))
+    if not matches:
+        return _window_text(text, max_chars=max_chars, overlap=overlap)
+
+    sections: List[str] = []
+    if matches[0].start() > 0:
+        preamble = text[:matches[0].start()].strip()
+        if preamble:
+            sections.append(preamble)
+
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        section_text = text[start:end].strip()
+        if section_text:
+            sections.append(section_text)
+
+    chunks: List[str] = []
+    buffer = ""
+    for section in sections:
+        candidate = section if not buffer else buffer + "\n\n" + section
+        if len(candidate) <= max_chars:
+            buffer = candidate
+            continue
+        if buffer:
+            chunks.extend(_window_text(buffer, max_chars=max_chars, overlap=overlap))
+            buffer = ""
+        if len(section) <= max_chars:
+            buffer = section
+            continue
+        chunks.extend(_window_text(section, max_chars=max_chars, overlap=overlap))
+
+    if buffer:
+        chunks.extend(_window_text(buffer, max_chars=max_chars, overlap=overlap))
+
+    deduped: List[str] = []
+    seen = set()
+    for chunk in chunks:
+        normalized_chunk = chunk.strip()
+        if not normalized_chunk or normalized_chunk in seen:
+            continue
+        seen.add(normalized_chunk)
+        deduped.append(normalized_chunk)
+    return deduped
+
+
+def _window_text(text: str, *, max_chars: int, overlap: int) -> List[str]:
     chunks: List[str] = []
     i = 0
     n = len(text)
     while i < n:
         end = min(n, i + max_chars)
-        chunks.append(text[i:end])
+        window = text[i:end].strip()
+        if window:
+            chunks.append(window)
         if end >= n:
             break
-        i = max(0, end - overlap)
+        next_index = max(0, end - overlap)
+        if next_index <= i:
+            break
+        i = next_index
     return chunks
+
+
+def chunk_section_title(chunk_text: str) -> Optional[str]:
+    for line in (chunk_text or "").splitlines():
+        stripped = line.strip()
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", stripped)
+        if match:
+            return match.group(2).strip()
+    return None
 
 
 def chunk_threads(text: str) -> List[str]:
@@ -606,6 +673,8 @@ def reset_campaign_data(
         "world_entities": 0,
         "world_threads": 0,
         "world_sessions": 0,
+        "world_facts": 0,
+        "entity_relations": 0,
         "conversation_messages": 0,
         "conversations": 0,
         "apply_runs": 0,
@@ -640,6 +709,12 @@ def reset_campaign_data(
                 cur.execute("select count(*) from world_sessions where campaign_id = %s", (CAMPAIGN_ID,))
                 deleted["world_sessions"] = int(cur.fetchone()[0])
                 cur.execute("delete from world_sessions where campaign_id = %s", (CAMPAIGN_ID,))
+                cur.execute("select count(*) from world_facts where campaign_id = %s", (CAMPAIGN_ID,))
+                deleted["world_facts"] = int(cur.fetchone()[0])
+                cur.execute("delete from world_facts where campaign_id = %s", (CAMPAIGN_ID,))
+                cur.execute("select count(*) from entity_relations where campaign_id = %s", (CAMPAIGN_ID,))
+                deleted["entity_relations"] = int(cur.fetchone()[0])
+                cur.execute("delete from entity_relations where campaign_id = %s", (CAMPAIGN_ID,))
 
             if clear_snapshots:
                 cur.execute("select count(*) from doc_snapshots where campaign_id = %s", (CAMPAIGN_ID,))
@@ -758,6 +833,7 @@ def upsert_chunks(doc: WorldDocInfo, doc_type: str, chunks: List[str], embedding
             )
             for chunk_ordinal, (t, emb) in enumerate(zip(chunks, embeddings), start=1):
                 cid = str(uuid.uuid4())
+                section_title = chunk_section_title(t)
                 cur.execute(
                     """
                     insert into chunks (id, campaign_id, doc_id, doc_type, chunk_text, embedding, metadata, updated_at)
@@ -777,6 +853,7 @@ def upsert_chunks(doc: WorldDocInfo, doc_type: str, chunks: List[str], embedding
                                 "folder": doc.folder,
                                 "path_hint": doc.path_hint,
                                 "chunk_ordinal": chunk_ordinal,
+                                "section_title": section_title,
                             }
                         ),
                         now,
@@ -785,7 +862,21 @@ def upsert_chunks(doc: WorldDocInfo, doc_type: str, chunks: List[str], embedding
         conn.commit()
 
 
-def vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
+def _row_to_chunk_hit(row: tuple[Any, ...]) -> Dict[str, Any]:
+    return {
+        "chunk_id": row[0],
+        "doc_id": row[1],
+        "doc_type": row[2],
+        "chunk_text": row[3],
+        "distance": float(row[4]),
+        "title": row[5],
+        "folder": row[6],
+        "path_hint": row[7],
+        "section_title": row[8] if len(row) > 8 else "",
+    }
+
+
+def raw_vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
     q_emb = gemini_embed([question])[0]
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -799,7 +890,8 @@ def vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
                     (c.embedding <-> %s::vector) as distance,
                     coalesce(wd.title, c.metadata->>'title', '') as title,
                     coalesce(wd.folder, c.metadata->>'folder', '') as folder,
-                    coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', '') as path_hint
+                    coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', '') as path_hint,
+                    coalesce(c.metadata->>'section_title', '') as section_title
                 from chunks c
                 left join world_docs wd
                     on wd.campaign_id = c.campaign_id
@@ -811,22 +903,10 @@ def vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
                 (q_emb, CAMPAIGN_ID, q_emb, top_k),
             )
             rows = cur.fetchall()
-    return [
-        {
-            "chunk_id": cid,
-            "doc_id": d,
-            "doc_type": t,
-            "chunk_text": c,
-            "distance": float(dist),
-            "title": title,
-            "folder": folder,
-            "path_hint": path_hint,
-        }
-        for (cid, d, t, c, dist, title, folder, path_hint) in rows
-    ]
+    return [_row_to_chunk_hit(row) for row in rows]
 
 
-def vector_search_in_docs(question: str, doc_ids: List[str], top_k: int) -> List[Dict[str, Any]]:
+def raw_vector_search_in_docs(question: str, doc_ids: List[str], top_k: int) -> List[Dict[str, Any]]:
     if not doc_ids:
         return []
     q_emb = gemini_embed([question])[0]
@@ -842,7 +922,8 @@ def vector_search_in_docs(question: str, doc_ids: List[str], top_k: int) -> List
                     (c.embedding <-> %s::vector) as distance,
                     coalesce(wd.title, c.metadata->>'title', '') as title,
                     coalesce(wd.folder, c.metadata->>'folder', '') as folder,
-                    coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', '') as path_hint
+                    coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', '') as path_hint,
+                    coalesce(c.metadata->>'section_title', '') as section_title
                 from chunks c
                 left join world_docs wd
                     on wd.campaign_id = c.campaign_id
@@ -855,19 +936,182 @@ def vector_search_in_docs(question: str, doc_ids: List[str], top_k: int) -> List
                 (q_emb, CAMPAIGN_ID, doc_ids, q_emb, top_k),
             )
             rows = cur.fetchall()
-    return [
-        {
-            "chunk_id": cid,
-            "doc_id": d,
-            "doc_type": t,
-            "chunk_text": c,
-            "distance": float(dist),
-            "title": title,
-            "folder": folder,
-            "path_hint": path_hint,
-        }
-        for (cid, d, t, c, dist, title, folder, path_hint) in rows
-    ]
+    return [_row_to_chunk_hit(row) for row in rows]
+
+
+def lexical_search(question: str, top_k: int) -> List[Dict[str, Any]]:
+    normalized = " ".join((question or "").strip().split())
+    if not normalized:
+        return []
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    with ranked as (
+                        select
+                            c.id,
+                            c.doc_id,
+                            c.doc_type,
+                            c.chunk_text,
+                            greatest(
+                                ts_rank_cd(
+                                    to_tsvector(
+                                        'simple',
+                                        concat_ws(
+                                            ' ',
+                                            coalesce(wd.title, c.metadata->>'title', ''),
+                                            coalesce(wd.folder, c.metadata->>'folder', ''),
+                                            coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', ''),
+                                            coalesce(c.metadata->>'section_title', ''),
+                                            c.chunk_text
+                                        )
+                                    ),
+                                    websearch_to_tsquery('simple', %s)
+                                ),
+                                0
+                            ) as score,
+                            coalesce(wd.title, c.metadata->>'title', '') as title,
+                            coalesce(wd.folder, c.metadata->>'folder', '') as folder,
+                            coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', '') as path_hint,
+                            coalesce(c.metadata->>'section_title', '') as section_title
+                        from chunks c
+                        left join world_docs wd
+                            on wd.campaign_id = c.campaign_id
+                           and wd.doc_id = c.doc_id
+                        where c.campaign_id = %s
+                          and to_tsvector(
+                                'simple',
+                                concat_ws(
+                                    ' ',
+                                    coalesce(wd.title, c.metadata->>'title', ''),
+                                    coalesce(wd.folder, c.metadata->>'folder', ''),
+                                    coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', ''),
+                                    coalesce(c.metadata->>'section_title', ''),
+                                    c.chunk_text
+                                )
+                            ) @@ websearch_to_tsquery('simple', %s)
+                    )
+                    select id, doc_id, doc_type, chunk_text, (1.0 - least(score, 1.0)) as distance, title, folder, path_hint, section_title
+                    from ranked
+                    order by score desc, id desc
+                    limit %s
+                    """,
+                    (normalized, CAMPAIGN_ID, normalized, top_k),
+                )
+                rows = cur.fetchall()
+    except Exception:
+        return []
+    return [_row_to_chunk_hit(row) for row in rows]
+
+
+def lexical_search_in_docs(question: str, doc_ids: List[str], top_k: int) -> List[Dict[str, Any]]:
+    normalized = " ".join((question or "").strip().split())
+    if not normalized or not doc_ids:
+        return []
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    with ranked as (
+                        select
+                            c.id,
+                            c.doc_id,
+                            c.doc_type,
+                            c.chunk_text,
+                            greatest(
+                                ts_rank_cd(
+                                    to_tsvector(
+                                        'simple',
+                                        concat_ws(
+                                            ' ',
+                                            coalesce(wd.title, c.metadata->>'title', ''),
+                                            coalesce(wd.folder, c.metadata->>'folder', ''),
+                                            coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', ''),
+                                            coalesce(c.metadata->>'section_title', ''),
+                                            c.chunk_text
+                                        )
+                                    ),
+                                    websearch_to_tsquery('simple', %s)
+                                ),
+                                0
+                            ) as score,
+                            coalesce(wd.title, c.metadata->>'title', '') as title,
+                            coalesce(wd.folder, c.metadata->>'folder', '') as folder,
+                            coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', '') as path_hint,
+                            coalesce(c.metadata->>'section_title', '') as section_title
+                        from chunks c
+                        left join world_docs wd
+                            on wd.campaign_id = c.campaign_id
+                           and wd.doc_id = c.doc_id
+                        where c.campaign_id = %s
+                          and c.doc_id = any(%s)
+                          and to_tsvector(
+                                'simple',
+                                concat_ws(
+                                    ' ',
+                                    coalesce(wd.title, c.metadata->>'title', ''),
+                                    coalesce(wd.folder, c.metadata->>'folder', ''),
+                                    coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', ''),
+                                    coalesce(c.metadata->>'section_title', ''),
+                                    c.chunk_text
+                                )
+                            ) @@ websearch_to_tsquery('simple', %s)
+                    )
+                    select id, doc_id, doc_type, chunk_text, (1.0 - least(score, 1.0)) as distance, title, folder, path_hint, section_title
+                    from ranked
+                    order by score desc, id desc
+                    limit %s
+                    """,
+                    (normalized, CAMPAIGN_ID, doc_ids, normalized, top_k),
+                )
+                rows = cur.fetchall()
+    except Exception:
+        return []
+    return [_row_to_chunk_hit(row) for row in rows]
+
+
+def hybrid_search(question: str, top_k: int) -> List[Dict[str, Any]]:
+    if not question.strip():
+        return []
+    if not hybrid_retrieval_v1:
+        return raw_vector_search(question, top_k)
+    return hybrid_retrieval_v1.retrieve(question, top_k=top_k)
+
+
+def hybrid_search_in_docs(question: str, doc_ids: List[str], top_k: int) -> List[Dict[str, Any]]:
+    if not question.strip() or not doc_ids:
+        return []
+    doc_id_set = set(doc_ids)
+    scoped_docs = [doc for doc in drive_store_v2.list_world_docs() if doc.doc_id in doc_id_set]
+    lists: List[List[Dict[str, Any]]] = []
+    vector_hits = raw_vector_search_in_docs(question, doc_ids, max(top_k * 2, 8))
+    lexical_hits = lexical_search_in_docs(question, doc_ids, max(top_k * 2, 8))
+    if vector_hits:
+        lists.append(vector_hits)
+    if lexical_hits:
+        lists.append(lexical_hits)
+    if not lists:
+        return []
+    temp_service = HybridRetrievalService(
+        vector_search_fn=raw_vector_search,
+        vector_search_in_docs_fn=raw_vector_search_in_docs,
+        lexical_search_fn=lexical_search,
+        lexical_search_in_docs_fn=lexical_search_in_docs,
+        list_docs_fn=lambda: scoped_docs,
+        structured_search_fn=world_model_service_v1.search if world_model_service_v1 else None,
+    )
+    ranked = temp_service._rerank(question, lists, scoped_docs)
+    return ranked[: max(top_k, 1)]
+
+
+def vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
+    return hybrid_search(question, top_k)
+
+
+def vector_search_in_docs(question: str, doc_ids: List[str], top_k: int) -> List[Dict[str, Any]]:
+    return hybrid_search_in_docs(question, doc_ids, top_k)
 
 
 def leading_chunks_for_docs(doc_ids: List[str], limit_per_doc: int = 1, total_limit: int = 12) -> List[Dict[str, Any]]:
@@ -3007,248 +3251,6 @@ def build_campaign_source_answer(question: str, docs: List[WorldDocInfo]) -> str
     return "\n".join(lines)
 
 
-NUMBERED_SECTION_RE = re.compile(r"(?m)^(?P<num>\d+)\.\s+(?P<title>[^\n]+)\s*$")
-
-
-def _find_campaign_doc(title: str) -> Optional[WorldDocInfo]:
-    drive_store = globals().get("drive_store_v2")
-    if drive_store is None:
-        return None
-
-    try:
-        if hasattr(drive_store, "find_doc"):
-            found = drive_store.find_doc(title=title)
-            if found:
-                return found
-    except TypeError:
-        pass
-    except Exception:
-        return None
-
-    try:
-        for doc in drive_store.list_world_docs():
-            if doc.title == title:
-                return doc
-    except Exception:
-        return None
-    return None
-
-
-def _read_campaign_doc_text(title: str) -> str:
-    drive_store = globals().get("drive_store_v2")
-    if drive_store is None or not hasattr(drive_store, "read_doc"):
-        return ""
-    doc = _find_campaign_doc(title)
-    if not doc:
-        return ""
-    try:
-        return normalize_text_artifacts(drive_store.read_doc(doc))
-    except Exception:
-        return ""
-
-
-def split_numbered_sections(text: str) -> List[tuple[str, str]]:
-    normalized = normalize_text_artifacts(text or "").strip()
-    if not normalized:
-        return []
-    matches = list(NUMBERED_SECTION_RE.finditer(normalized))
-    if not matches:
-        return []
-
-    sections: List[tuple[str, str]] = []
-    for index, match in enumerate(matches):
-        start = match.end()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
-        title = match.group("title").strip()
-        body = normalized[start:end].strip()
-        sections.append((title, body))
-    return sections
-
-
-def find_numbered_section_body(text: str, *needles: str) -> str:
-    normalized_needles = [normalize_match_text(needle) for needle in needles if needle]
-    if not normalized_needles:
-        return ""
-    for title, body in split_numbered_sections(text):
-        normalized_title = normalize_match_text(title)
-        if any(needle in normalized_title for needle in normalized_needles):
-            return body
-    return ""
-
-
-def compact_doc_excerpt(text: str, *, max_sentences: int = 2, max_chars: int = 420) -> str:
-    cleaned = re.sub(r"\s+", " ", normalize_text_artifacts(text or "")).strip()
-    if not cleaned:
-        return ""
-    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
-    excerpt = " ".join(sentences[:max_sentences]).strip() if sentences else cleaned
-    if not excerpt:
-        excerpt = cleaned
-    if len(excerpt) <= max_chars:
-        return excerpt
-    shortened = excerpt[:max_chars].rstrip(" ,;:-")
-    last_stop = max(shortened.rfind(". "), shortened.rfind("? "), shortened.rfind("! "))
-    if last_stop >= max_chars // 2:
-        shortened = shortened[: last_stop + 1].rstrip()
-    return shortened.rstrip() + ("." if shortened and shortened[-1] not in ".!?" else "")
-
-
-def extract_named_lines(text: str, *, limit: int = 4) -> List[str]:
-    names: List[str] = []
-    seen = set()
-    for raw_line in normalize_text_artifacts(text or "").splitlines():
-        line = raw_line.strip()
-        if not line or ":" in line or line.endswith("."):
-            continue
-        if len(line) > 80 or len(line) < 4:
-            continue
-        if re.match(r"^\d+\.\s+", line):
-            continue
-        if not re.match(r"^[A-Z][A-Za-z0-9\"' -]+$", line):
-            continue
-        if line in seen:
-            continue
-        seen.add(line)
-        names.append(line)
-        if len(names) >= limit:
-            break
-    return names
-
-
-def build_campaign_overview_doc_answer() -> tuple[Optional[str], List[WorldDocInfo]]:
-    bible_doc = _find_campaign_doc("Campaign Bible")
-    shackles_doc = _find_campaign_doc("Przewodnik po Shackles")
-    chapter_doc = _find_campaign_doc("Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
-    morn_doc = _find_campaign_doc("Dossier Morna - sprawa Black Eel")
-
-    bible_text = _read_campaign_doc_text("Campaign Bible")
-    shackles_text = _read_campaign_doc_text("Przewodnik po Shackles")
-    chapter_text = _read_campaign_doc_text("Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
-    morn_text = _read_campaign_doc_text("Dossier Morna - sprawa Black Eel")
-
-    if not any([bible_text, shackles_text, chapter_text, morn_text]):
-        return None, []
-
-    premise = compact_doc_excerpt(find_numbered_section_body(bible_text, "premisa"), max_sentences=2)
-    shackles_everyday = compact_doc_excerpt(find_numbered_section_body(shackles_text, "czym shackles jest"), max_sentences=2)
-    port_reality = compact_doc_excerpt(find_numbered_section_body(shackles_text, "jak wygladaja porty"), max_sentences=1)
-    chapter_start = compact_doc_excerpt(find_numbered_section_body(chapter_text, "streszczenie dla mg"), max_sentences=2)
-    central_conflict = compact_doc_excerpt(find_numbered_section_body(bible_text, "centralny konflikt"), max_sentences=2)
-    morn_core = compact_doc_excerpt(find_numbered_section_body(morn_text, "rdzen sprawy"), max_sentences=2)
-
-    bullets: List[str] = []
-    if premise:
-        bullets.append(f"- Kampania ma taki punkt wyjscia: {premise}")
-    if shackles_everyday or port_reality:
-        setting = " ".join(part for part in [shackles_everyday, port_reality] if part).strip()
-        bullets.append(f"- Realia kampanii sa mocno osadzone w Shackles i Port Peril: {setting}")
-    if chapter_start:
-        bullets.append(f"- Pierwsza konkretna czesc kampanii zaczyna sie tak: {chapter_start}")
-    if morn_core:
-        bullets.append(f"- Jednym z najwazniejszych watkow startowych jest sprawa Morna / Black Eel: {morn_core}")
-    if central_conflict:
-        bullets.append(f"- Szeroka stawka kampanii jest taka: {central_conflict}")
-    if chapter_start or central_conflict:
-        combined = " ".join(part for part in [chapter_start, central_conflict] if part).strip()
-        bullets.append(
-            f"- Dla bohaterow oznacza to wejscie w kampanie od razu przez konflikt polityczny, dlugi, przysiegi i presje publiczna: {compact_doc_excerpt(combined, max_sentences=2)}"
-        )
-
-    docs = [doc for doc in [bible_doc, shackles_doc, chapter_doc, morn_doc] if doc]
-    return ("\n".join(bullets).strip() or None), docs
-
-
-def build_first_part_doc_answer() -> tuple[Optional[str], List[WorldDocInfo]]:
-    chapter_doc = _find_campaign_doc("Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
-    shackles_doc = _find_campaign_doc("Przewodnik po Shackles")
-
-    chapter_text = _read_campaign_doc_text("Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
-    shackles_text = _read_campaign_doc_text("Przewodnik po Shackles")
-    if not chapter_text:
-        return None, []
-
-    summary = find_numbered_section_body(chapter_text, "streszczenie dla mg")
-    background = find_numbered_section_body(chapter_text, "tlo", "motywy")
-    characters = find_numbered_section_body(chapter_text, "postacie")
-    shackles_everyday = find_numbered_section_body(shackles_text, "czym shackles jest")
-    shackles_ports = find_numbered_section_body(shackles_text, "jak wygladaja porty")
-
-    names = extract_named_lines(characters, limit=4)
-    start_excerpt = compact_doc_excerpt(summary, max_sentences=2)
-    issue_excerpt = compact_doc_excerpt(background or summary, max_sentences=2)
-    location_excerpt = compact_doc_excerpt(" ".join(part for part in [shackles_everyday, shackles_ports] if part), max_sentences=2)
-    tension_excerpt = compact_doc_excerpt(background, max_sentences=2)
-
-    bullets: List[str] = []
-    if start_excerpt:
-        bullets.append(f"- Rozdzial 1 zaczyna sie w taki sposob: {start_excerpt}")
-    if issue_excerpt:
-        bullets.append(f"- Glowna sprawa startowa wyglada tak: {issue_excerpt}")
-    if names:
-        bullets.append(f"- Najwazniejsze postacie tej czesci to: {', '.join(names)}.")
-    if location_excerpt:
-        bullets.append(f"- Najwazniejsze lokacje i realia tej czesci to Port Peril i Shackles: {location_excerpt}")
-    if tension_excerpt:
-        bullets.append(f"- Najwazniejsze napiecia polityczne w pierwszej czesci to: {tension_excerpt}")
-    if start_excerpt or tension_excerpt:
-        combined = " ".join(part for part in [start_excerpt, tension_excerpt] if part).strip()
-        bullets.append(f"- Dla dalszej kampanii ta pierwsza czesc ustawia taki kierunek: {compact_doc_excerpt(combined, max_sentences=2)}")
-
-    docs = [doc for doc in [chapter_doc, shackles_doc] if doc]
-    return ("\n".join(bullets).strip() or None), docs
-
-
-def build_morn_doc_answer() -> tuple[Optional[str], List[WorldDocInfo]]:
-    morn_doc = _find_campaign_doc("Dossier Morna - sprawa Black Eel")
-    chapter_doc = _find_campaign_doc("Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
-    shackles_doc = _find_campaign_doc("Przewodnik po Shackles")
-
-    morn_text = _read_campaign_doc_text("Dossier Morna - sprawa Black Eel")
-    chapter_text = _read_campaign_doc_text("Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
-    shackles_text = _read_campaign_doc_text("Przewodnik po Shackles")
-    if not morn_text:
-        return None, []
-
-    core = find_numbered_section_body(morn_text, "rdzen sprawy")
-    cargo = find_numbered_section_body(morn_text, "ladunek")
-    target = find_numbered_section_body(morn_text, "co trzymal morn")
-    packet = find_numbered_section_body(morn_text, "pakiecie u halvine")
-    chapter_summary = find_numbered_section_body(chapter_text, "streszczenie dla mg")
-    shackles_ports = find_numbered_section_body(shackles_text, "jak wygladaja porty")
-
-    names = extract_named_lines(core, limit=4)
-
-    bullets: List[str] = []
-    if core:
-        bullets.append(f"- Sama sprawa Morna / Black Eel wyglada tak: {compact_doc_excerpt(core, max_sentences=2)}")
-    if names:
-        bullets.append(f"- Najwazniejsze osoby w tej sprawie to: {', '.join(names)}.")
-    elif core:
-        bullets.append(f"- Po stronie ludzi zaangazowanych najwazniejszy jest ten rdzen sprawy: {compact_doc_excerpt(core, max_sentences=1)}")
-    if cargo:
-        bullets.append(f"- Kluczowy ladunek i material dowodowy wyglada tak: {compact_doc_excerpt(cargo, max_sentences=2)}")
-    if packet or target:
-        combined = " ".join(part for part in [target, packet] if part).strip()
-        bullets.append(f"- Morn stal sie celem i trzymal takie dokumenty lub kopie: {compact_doc_excerpt(combined, max_sentences=2)}")
-    if chapter_summary or shackles_ports:
-        combined = " ".join(part for part in [chapter_summary, shackles_ports] if part).strip()
-        bullets.append(f"- Ta sprawa laczy sie z Shackles, Port Peril i startem kampanii tak: {compact_doc_excerpt(combined, max_sentences=2)}")
-
-    docs = [doc for doc in [morn_doc, chapter_doc, shackles_doc] if doc]
-    return ("\n".join(bullets).strip() or None), docs
-
-
-def build_doc_grounded_campaign_answer(question: str) -> tuple[Optional[str], List[WorldDocInfo]]:
-    normalized = normalize_match_text(question)
-    if is_morn_campaign_question(question):
-        return build_morn_doc_answer()
-    if is_first_part_campaign_question(question) or "pierwszej czesci" in normalized:
-        return build_first_part_doc_answer()
-    if is_campaign_overview_question(question):
-        return build_campaign_overview_doc_answer()
-    return None, []
-
-
 def boosted_doc_titles_for_question(question: str) -> List[str]:
     normalized = normalize_match_text(question)
     titles: List[str] = []
@@ -4057,10 +4059,74 @@ def build_world_model_store() -> Optional[WorldModelStore]:
     return WorldModelStore(campaign_id=CAMPAIGN_ID, connection_factory=db_conn)
 
 
+def build_world_fact_store() -> Optional[WorldFactStore]:
+    if not DB_URL:
+        return None
+    return WorldFactStore(campaign_id=CAMPAIGN_ID, connection_factory=db_conn)
+
+
 def build_conversation_store() -> Optional[ConversationStore]:
     if not DB_URL:
         return None
     return ConversationStore(campaign_id=CAMPAIGN_ID, connection_factory=db_conn)
+
+
+def rebuild_world_fact_projection() -> Optional[Dict[str, int]]:
+    if not world_fact_service_v1:
+        return None
+    try:
+        return world_fact_service_v1.rebuild_projection()
+    except Exception:
+        return None
+
+
+def build_planner_context_for_instruction(instruction: str) -> str:
+    base_context = build_context_for_planner(drive_store_v2)
+    sections: List[str] = []
+
+    if world_fact_service_v1:
+        try:
+            facts = world_fact_service_v1.search_facts(instruction, limit=8)
+        except Exception:
+            facts = []
+        if facts:
+            fact_lines = [
+                f"- {fact.subject_name} | {fact.predicate} | {fact.object_value}"
+                for fact in facts
+            ]
+            sections.append("## WORLD FACTS\n" + "\n".join(fact_lines))
+
+    if world_model_service_v1:
+        try:
+            structured_hits = world_model_service_v1.search(instruction, limit=8)
+        except Exception:
+            structured_hits = []
+        if structured_hits:
+            structured_lines = [
+                f"- {item.record_type}: {item.title} | {item.snippet}"
+                for item in structured_hits
+            ]
+            sections.append("## STRUCTURED LOOKUP\n" + "\n".join(structured_lines))
+
+    try:
+        chunk_hits = hybrid_search(instruction, 8)
+    except Exception:
+        chunk_hits = []
+    if chunk_hits:
+        chunk_blocks = []
+        for index, hit in enumerate(chunk_hits, start=1):
+            header = " | ".join(
+                part for part in [
+                    f"title={hit.get('title') or ''}",
+                    f"folder={hit.get('folder') or ''}",
+                    f"section={hit.get('section_title') or ''}",
+                ] if part
+            )
+            chunk_blocks.append(f"[{index}] {header}\n{ctx_slice(hit)}")
+        sections.append("## CHUNK RETRIEVAL\n" + "\n\n".join(chunk_blocks))
+
+    sections.append("## FALLBACK DOC CONTEXT\n" + base_context)
+    return "\n\n".join(section for section in sections if section.strip())
 
 
 def doc_type_for_indexing(doc: WorldDocInfo) -> str:
@@ -4149,6 +4215,7 @@ def index_world_docs(docs: List[WorldDocInfo], *, clean: bool = False) -> Dict[s
         connection_factory=db_conn,
         docs_with_content=doc_backed_docs,
     )
+    fact_projection = rebuild_world_fact_projection()
     return {
         "ok": True,
         "indexed_docs": indexed_docs,
@@ -4156,6 +4223,7 @@ def index_world_docs(docs: List[WorldDocInfo], *, clean: bool = False) -> Dict[s
         "skipped_docs": skipped_docs,
         "changed_docs": changed_docs,
         "doc_backed_entities": doc_backed_entities,
+        "world_fact_projection": fact_projection,
         "clean": clean,
     }
 
@@ -4202,10 +4270,34 @@ google_drive_oauth_service_v1 = build_google_drive_oauth_service()
 drive_store_v2 = build_routed_drive_store(base_store=base_drive_store_v2, oauth_service=google_drive_oauth_service_v1)
 workflow_store_v2 = build_workflow_store()
 world_model_store_v2 = build_world_model_store()
+world_fact_store_v1 = build_world_fact_store()
 conversation_store_v1 = build_conversation_store()
 planner_v2 = PlannerService(generate_text_fn=planner_generate_json)
 consistency_planner_v2 = PlannerService(generate_text_fn=planner_generate_text)
-proposal_applier_v2 = ProposalApplier(drive_store=drive_store_v2, reindex_fn=reindex_after_apply_default)
+world_model_service_v1 = WorldModelService(world_model_store=world_model_store_v2) if world_model_store_v2 else None
+world_fact_service_v1 = (
+    WorldFactService(world_model_store=world_model_store_v2, world_fact_store=world_fact_store_v1)
+    if world_model_store_v2 and world_fact_store_v1
+    else None
+)
+consistency_service_v1 = (
+    ConsistencyService(world_model_store=world_model_store_v2, world_fact_store=world_fact_store_v1)
+    if world_model_store_v2 and world_fact_store_v1
+    else None
+)
+hybrid_retrieval_v1 = HybridRetrievalService(
+    vector_search_fn=raw_vector_search,
+    vector_search_in_docs_fn=raw_vector_search_in_docs,
+    lexical_search_fn=lexical_search,
+    lexical_search_in_docs_fn=lexical_search_in_docs,
+    list_docs_fn=lambda: drive_store_v2.list_world_docs(),
+    structured_search_fn=world_model_service_v1.search if world_model_service_v1 else None,
+)
+proposal_applier_v2 = ProposalApplier(
+    drive_store=drive_store_v2,
+    reindex_fn=reindex_after_apply_default,
+    consistency_service=consistency_service_v1,
+)
 app.include_router(build_web_router(google_client_id=GOOGLE_OAUTH_CLIENT_ID))
 app.include_router(
     build_v2_router(
@@ -4216,6 +4308,8 @@ app.include_router(
         campaign_id=CAMPAIGN_ID,
         workflow_store=workflow_store_v2,
         world_model_store=world_model_store_v2,
+        applier=proposal_applier_v2,
+        planner_context_builder=build_planner_context_for_instruction,
     )
 )
 app.include_router(
@@ -4227,8 +4321,10 @@ app.include_router(
         drive_store=drive_store_v2,
         planner=planner_v2,
         consistency_planner=consistency_planner_v2,
+        planner_context_builder=build_planner_context_for_instruction,
         workflow_store=workflow_store_v2,
         world_model_store=world_model_store_v2,
+        world_fact_store=world_fact_store_v1,
         conversation_store=conversation_store_v1,
         applier=proposal_applier_v2,
         reindex_fn=reindex_after_apply_default,
@@ -4308,8 +4404,7 @@ def ask(req: AskRequest):
         q = extract_latest_user_message(raw_question) or raw_question
         source_question = is_campaign_source_question(q)
         morn_question = is_morn_campaign_question(q)
-        first_part_question = is_first_part_campaign_question(q) or "pierwszej czesci" in normalize_match_text(q)
-        overview_question = is_campaign_overview_question(q)
+        first_part_question = is_first_part_campaign_question(q)
         hits: List[Dict[str, Any]] = []
         analysis_mode = False
 
@@ -4324,7 +4419,7 @@ def ask(req: AskRequest):
         elif req.mode == "general":
             campaign_mode = False
         else:
-            campaign_mode = source_question or overview_question or first_part_question or morn_question or is_campaign_question(q)
+            campaign_mode = source_question or is_campaign_question(q)
             if not campaign_mode:
                 hits = vector_search(q, req.top_k)
                 campaign_mode = has_likely_campaign_hits(hits)
@@ -4332,12 +4427,6 @@ def ask(req: AskRequest):
         if not campaign_mode:
             answer = gemini_generate(build_general_prompt(q)).strip()
             return AskResponse(answer=answer, sources=[])
-
-        if not source_question and not analysis_mode and (overview_question or first_part_question or morn_question):
-            doc_answer, doc_answer_docs = build_doc_grounded_campaign_answer(q)
-            if doc_answer:
-                sources = source_records_from_docs(doc_answer_docs) if req.include_sources else []
-                return AskResponse(answer=doc_answer, sources=sources)
 
         if not hits:
             hits = vector_search(q, req.top_k)
@@ -4926,6 +5015,7 @@ def sync_generated_session_patch(req: IngestAndSyncSessionRequest, patch: Sessio
     response = world_model_store_v2.sync_session_patch(sync_request)
     if response is None:
         raise HTTPException(status_code=503, detail="World model store is not configured")
+    rebuild_world_fact_projection()
     return response
 
 

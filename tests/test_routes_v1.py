@@ -27,9 +27,13 @@ from app.models_v2 import (
     ApplyChangesResponse,
     AppliedActionResult,
     ChangeProposal,
+    ChangeValidationReport,
     DocumentAction,
     DocumentRef,
     ProposalDetail,
+    ValidationIssue,
+    EntityRelationRecord,
+    WorldFactRecord,
     WorldEntityRecord,
     WorldEntityType,
     WorldSessionRecord,
@@ -201,6 +205,52 @@ class FakeWorldModelStore:
         ]
 
 
+class FakeWorldFactStore:
+    def list_facts(self, limit=20, subject_name=None, predicate=None):
+        items = [
+            WorldFactRecord(
+                id=1,
+                campaign_id="kng",
+                subject_type="thread",
+                subject_name="Red Blade",
+                predicate="status",
+                object_value="active",
+                source_type="world_model.thread",
+                source_ref="2",
+                confidence=1.0,
+                updated_at="2026-03-14T00:00:00+00:00",
+            )
+        ]
+        if subject_name:
+            items = [item for item in items if item.subject_name == subject_name]
+        if predicate:
+            items = [item for item in items if item.predicate == predicate]
+        return items[:limit]
+
+    def list_relations(self, limit=20, source_name=None, target_name=None, relation_type=None):
+        items = [
+            EntityRelationRecord(
+                id=1,
+                campaign_id="kng",
+                source_name="Red Blade",
+                relation_type="mentions",
+                target_name="Captain Mira",
+                evidence="Red Blade naciska na Captain Mira.",
+                source_type="world_model.thread",
+                source_ref="2",
+                confidence=0.8,
+                updated_at="2026-03-14T00:00:00+00:00",
+            )
+        ]
+        if source_name:
+            items = [item for item in items if item.source_name == source_name]
+        if target_name:
+            items = [item for item in items if item.target_name == target_name]
+        if relation_type:
+            items = [item for item in items if item.relation_type == relation_type]
+        return items[:limit]
+
+
 class FakeWorkflowStore:
     def __init__(self):
         self.proposals = {
@@ -311,6 +361,17 @@ class FakeApplier:
                 )
             ],
             reindex_result={"ok": True, "mode": "partial"},
+            validation=ChangeValidationReport(
+                ok=True,
+                issues=[
+                    ValidationIssue(
+                        code="fact_conflict",
+                        severity="warning",
+                        message="Test validation payload.",
+                        target=request.proposal.actions[0].target,
+                    )
+                ],
+            ),
         )
 
 
@@ -385,7 +446,7 @@ class FakeConversationStore:
 
 
 class RoutesV1Test(unittest.TestCase):
-    def build_router(self, chat_fn=None, chat_stream_fn=None, workflow_store=None, conversation_store=None, drive_store=None, reindex_fn=None, oauth_service=None, campaign_reset_fn=None):
+    def build_router(self, chat_fn=None, chat_stream_fn=None, workflow_store=None, conversation_store=None, drive_store=None, reindex_fn=None, oauth_service=None, campaign_reset_fn=None, world_fact_store=None):
         return build_v1_router(
             chat_request_cls=ChatRequest,
             chat_fn=chat_fn or (lambda req: ChatResponse(kind="answer", reply="OK", references=[])),
@@ -395,6 +456,7 @@ class RoutesV1Test(unittest.TestCase):
             planner=FakePlanner(),
             workflow_store=workflow_store or FakeWorkflowStore(),
             world_model_store=FakeWorldModelStore(),
+            world_fact_store=world_fact_store or FakeWorldFactStore(),
             conversation_store=conversation_store or FakeConversationStore(),
             applier=FakeApplier(),
             reindex_fn=reindex_fn,
@@ -625,19 +687,15 @@ class RoutesV1Test(unittest.TestCase):
         self.assertIn("Guard Report", body["reply_markdown"])
         self.assertIn("Konfliktow krytycznych brak", body["reply_markdown"])
 
-    def test_v1_editor_mode_forces_proposal_intent(self):
-        seen = {}
-
-        def fake_chat(req):
-            seen["intent"] = req.intent
-            return ChatResponse(
+    def test_v1_editor_mode_requires_confirmation_before_execution(self):
+        router = self.build_router(
+            chat_fn=lambda req: ChatResponse(
                 kind="proposal",
                 reply="Plan zmian gotowy.",
                 proposal_id=44,
                 references=[],
             )
-
-        router = self.build_router(chat_fn=fake_chat)
+        )
 
         body = self.route_endpoint(router, "/v1/chat", "POST")(
             request=V1ChatRequest(
@@ -646,11 +704,9 @@ class RoutesV1Test(unittest.TestCase):
             )
         ).model_dump(mode="json")
 
-        self.assertEqual(seen["intent"], "proposal")
         self.assertEqual(body["mode"], AssistantMode.editor.value)
-        self.assertEqual(body["proposal_id"], 44)
-        self.assertTrue(any(action["type"] == "accept_world_change" for action in body["next_actions"]))
-        self.assertTrue(any(action["type"] == "reject_world_change" for action in body["next_actions"]))
+        self.assertIsNone(body["proposal_id"])
+        self.assertIn("Nic jeszcze nie zostalo zapisane ani edytowane.", body["reply_markdown"])
 
     def test_v1_conversation_routes_return_saved_history(self):
         conversation_store = FakeConversationStore()
@@ -691,6 +747,7 @@ class RoutesV1Test(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertEqual(body["proposal"]["status"], ProposalStatus.accepted.value)
         self.assertIsNotNone(body["apply_run_id"])
+        self.assertTrue(body["validation"]["ok"])
 
     def test_v1_assistant_action_revise_uses_chat_service(self):
         router = self.build_router(
@@ -772,6 +829,15 @@ class RoutesV1Test(unittest.TestCase):
         self.assertEqual(body["query"], "Red Blade")
         self.assertTrue(any(item["record_type"] == "thread" for item in body["items"]))
         self.assertTrue(any(item["record_type"] == "session" for item in body["items"]))
+
+    def test_v1_world_model_projection_endpoints_return_facts_and_relations(self):
+        router = self.build_router()
+
+        facts_body = self.route_endpoint(router, "/v1/world-model/facts", "GET")(subject_name="Red Blade").model_dump(mode="json")
+        relations_body = self.route_endpoint(router, "/v1/world-model/relations", "GET")(source_name="Red Blade").model_dump(mode="json")
+
+        self.assertEqual(facts_body["items"][0]["predicate"], "status")
+        self.assertEqual(relations_body["items"][0]["target_name"], "Captain Mira")
 
     def test_v1_canonical_import_dry_run_maps_local_files(self):
         drive_store = FakeDriveStore()
@@ -866,6 +932,7 @@ class RoutesV1Test(unittest.TestCase):
             accept_body = accept_body.model_dump(mode="json")
 
         self.assertEqual(accept_body["proposal"]["status"], ProposalStatus.accepted.value)
+        self.assertTrue(accept_body["validation"]["ok"])
         self.assertEqual(workflow_store.proposals[12].proposal["proposal_status"], ProposalStatus.superseded.value)
 
     def test_v1_world_model_change_reject_sets_status(self):

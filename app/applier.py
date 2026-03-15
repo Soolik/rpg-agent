@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List, Optional
 
+from .consistency_service import ConsistencyService
+from .document_executor import DocumentExecutor
 from .drive_store import DriveStore
 from .models_v2 import (
-    ActionType,
     ApplyChangesRequest,
     ApplyChangesResponse,
     AppliedActionResult,
@@ -13,9 +14,17 @@ from .models_v2 import (
 
 
 class ProposalApplier:
-    def __init__(self, drive_store: DriveStore, reindex_fn: Optional[Callable[[List[DocumentRef]], Dict]] = None):
+    def __init__(
+        self,
+        drive_store: DriveStore,
+        reindex_fn: Optional[Callable[[List[DocumentRef]], Dict]] = None,
+        consistency_service: Optional[ConsistencyService] = None,
+        document_executor: Optional[DocumentExecutor] = None,
+    ):
         self.drive_store = drive_store
         self.reindex_fn = reindex_fn
+        self.consistency_service = consistency_service
+        self.document_executor = document_executor or DocumentExecutor(drive_store=drive_store)
 
     def apply(self, request: ApplyChangesRequest) -> ApplyChangesResponse:
         if not request.approved:
@@ -23,85 +32,34 @@ class ProposalApplier:
 
         results: List[AppliedActionResult] = []
         reindex_targets: List[DocumentRef] = []
+        prepared_actions = [self.document_executor.preview_action(action) for action in request.proposal.actions]
+        previews = [prepared.preview for prepared in prepared_actions]
 
-        for action in request.proposal.actions:
+        validation = None
+        if self.consistency_service:
+            validation = self.consistency_service.hard_validate(previews)
+            if not validation.ok:
+                return ApplyChangesResponse(
+                    ok=False,
+                    summary="Apply blocked by hard validation.",
+                    results=[],
+                    previews=previews,
+                    validation=validation,
+                )
+
+        for prepared in prepared_actions:
             try:
-                target = action.target
-
-                if action.action_type == ActionType.create_doc:
-                    if not target:
-                        raise ValueError("create_doc requires target")
-                    created = self.drive_store.create_doc(
-                        folder=target.folder,
-                        title=target.title,
-                        content=action.content or "",
-                        entity_type=action.entity_type,
-                    )
-                    results.append(AppliedActionResult(
-                        action_type=action.action_type,
-                        success=True,
-                        message="Document created",
-                        target=DocumentRef(folder=created.folder, title=created.title, doc_id=created.doc_id, path_hint=created.path_hint),
-                    ))
-                    reindex_targets.append(
-                        DocumentRef(folder=created.folder, title=created.title, doc_id=created.doc_id, path_hint=created.path_hint)
-                    )
-
-                elif action.action_type == ActionType.append_doc:
-                    if not target:
-                        raise ValueError("append_doc requires target")
-                    self.drive_store.append_doc(target, action.content or "")
-                    results.append(AppliedActionResult(
-                        action_type=action.action_type,
-                        success=True,
-                        message="Content appended",
-                        target=target,
-                    ))
-                    reindex_targets.append(target)
-
-                elif action.action_type == ActionType.replace_doc:
-                    if not target:
-                        raise ValueError("replace_doc requires target")
-                    self.drive_store.replace_doc(target, action.content or "")
-                    results.append(AppliedActionResult(
-                        action_type=action.action_type,
-                        success=True,
-                        message="Document replaced",
-                        target=target,
-                    ))
-                    reindex_targets.append(target)
-
-                elif action.action_type == ActionType.replace_section:
-                    if not target:
-                        raise ValueError("replace_section requires target")
-                    if not action.section:
-                        raise ValueError("replace_section requires section")
-                    self.drive_store.replace_section(target, action.section, action.content or "")
-                    results.append(AppliedActionResult(
-                        action_type=action.action_type,
-                        success=True,
-                        message=f"Section '{action.section}' replaced",
-                        target=target,
-                    ))
-                    reindex_targets.append(target)
-
-                elif action.action_type in {ActionType.create_if_missing, ActionType.update_tracker_row, ActionType.reindex}:
-                    results.append(AppliedActionResult(
-                        action_type=action.action_type,
-                        success=True,
-                        message="Action acknowledged but requires concrete implementation.",
-                        target=target,
-                    ))
-
-                else:
-                    raise ValueError(f"Unsupported action type: {action.action_type}")
-
+                result = self.document_executor.apply_prepared(prepared)
+                results.append(result)
+                if result.target and result.target.doc_id:
+                    reindex_targets.append(result.target)
             except Exception as exc:
                 results.append(AppliedActionResult(
-                    action_type=action.action_type,
+                    action_type=prepared.action.action_type,
                     success=False,
                     message=str(exc),
-                    target=action.target,
+                    target=prepared.action.target,
+                    details={"preview": prepared.preview.model_dump(mode="json"), "verified": False},
                 ))
 
         reindex_result = None
@@ -117,4 +75,6 @@ class ProposalApplier:
             summary="Apply finished" if ok else "Apply finished with errors",
             results=results,
             reindex_result=reindex_result,
+            previews=previews,
+            validation=validation,
         )

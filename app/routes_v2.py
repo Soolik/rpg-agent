@@ -65,9 +65,11 @@ def build_v2_router(
     campaign_id: Optional[str] = None,
     workflow_store: Optional[WorkflowStore | NullWorkflowStore] = None,
     world_model_store: Optional[WorldModelStore | NullWorldModelStore] = None,
+    applier: Optional[ProposalApplier] = None,
+    planner_context_builder: Optional[Callable[[str], str]] = None,
 ) -> APIRouter:
     router = APIRouter(tags=["world-v2"])
-    applier = ProposalApplier(drive_store=drive_store, reindex_fn=reindex_fn)
+    proposal_applier = applier or ProposalApplier(drive_store=drive_store, reindex_fn=reindex_fn)
     store = workflow_store or NullWorkflowStore()
     model_store = world_model_store or NullWorldModelStore()
 
@@ -171,7 +173,7 @@ def build_v2_router(
     @router.post("/propose_changes")
     def propose_changes(request: ProposeChangesRequest):
         docs = drive_store.list_world_docs()
-        context = build_context_for_planner(drive_store)
+        context = planner_context_builder(request.instruction) if planner_context_builder else build_context_for_planner(drive_store)
         proposal = planner.propose(request=request, world_docs=docs, world_context=context)
         proposal_id = store.save_proposal(request, proposal)
         if proposal_id is not None:
@@ -186,7 +188,7 @@ def build_v2_router(
     @router.post("/apply_changes", response_model=ApplyChangesResponse)
     def apply_changes(request: ApplyChangesRequest) -> ApplyChangesResponse:
         proposal_id = request.proposal_id or request.proposal.proposal_id
-        response = applier.apply(request)
+        response = proposal_applier.apply(request)
         response.proposal_id = proposal_id
         apply_run_id = store.save_apply_run(request, response)
         response.apply_run_id = apply_run_id
@@ -194,7 +196,7 @@ def build_v2_router(
 
     @router.post("/consistency_check", response_model=ConsistencyCheckResponse)
     def consistency_check(request: ConsistencyCheckRequest) -> ConsistencyCheckResponse:
-        context = build_context_for_planner(drive_store)
+        context = planner_context_builder(request.instruction) if planner_context_builder else build_context_for_planner(drive_store)
         raw = planner.consistency_check(instruction=request.instruction, world_context=context)
         return ConsistencyCheckResponse(
             summary="Consistency check completed",

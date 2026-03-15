@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from .api_models import ProposalStatus, ProposalType, WorldModelChangeView
 from .applier import ProposalApplier
+from .models_v2 import ChangeValidationReport
 from .models_v2 import ApplyChangesRequest, ChangeProposal, ProposeChangesRequest
 from .routes_v2 import build_context_for_planner
 from .workflow_store import NullWorkflowStore, WorkflowStore
@@ -18,6 +19,7 @@ class WorkflowApplyResult:
     summary: str
     results: list
     reindex_result: Optional[dict]
+    validation: Optional[ChangeValidationReport]
 
 
 def proposal_view_from_detail(detail) -> WorldModelChangeView:
@@ -54,6 +56,7 @@ class WorkflowService:
     planner: object
     workflow_store: WorkflowStore | NullWorkflowStore
     applier: ProposalApplier
+    context_builder: Optional[Callable[[str], str]] = None
 
     def propose_change(
         self,
@@ -64,7 +67,7 @@ class WorkflowService:
         supersedes_proposal_id: Optional[int] = None,
     ) -> WorldModelChangeView:
         docs = self.drive_store.list_world_docs()
-        context = build_context_for_planner(self.drive_store)
+        context = self.context_builder(instruction) if self.context_builder else build_context_for_planner(self.drive_store)
         proposal_request = ProposeChangesRequest(
             instruction=instruction,
             mode=mode,
@@ -150,6 +153,7 @@ class WorkflowService:
             summary=apply_response.summary,
             results=apply_response.results,
             reindex_result=apply_response.reindex_result,
+            validation=apply_response.validation,
         )
 
     def reject_change(

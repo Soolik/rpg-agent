@@ -8,7 +8,6 @@ from typing import Callable, Iterable, Optional, Type
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
-from .assistant_decision import infer_assistant_decision
 from .api_models import (
     AssistantMode,
     ChatArtifact,
@@ -19,11 +18,13 @@ from .api_models import (
     SavedOutputRef,
     V1ChatResponse,
 )
-from .canon_guard import build_continuity_report
 from .chat_models import ChatRequest, ChatResponse
+from .consistency_service import ConsistencyService
 from .conversation_store import ConversationMessageRecord, ConversationRecord, ConversationStore, NullConversationStore
 from .doc_canon import strip_reference_block
 from .routes_v2 import build_context_for_planner
+from .task_router import TaskRouter, TaskType
+from .world_fact_store import NullWorldFactStore
 from .world_model_store import NullWorldModelStore, WorldModelStore
 
 
@@ -90,20 +91,15 @@ def _continuity_for_response(
     *,
     message: str,
     response: ChatResponse,
-    world_model_store: WorldModelStore | NullWorldModelStore,
+    consistency_service: ConsistencyService,
 ) -> Optional[ContinuityReport]:
     text = strip_reference_block(response.artifact_text or response.reply)
     if not text:
         return None
-    entities = world_model_store.list_entities(limit=1000)
-    threads = world_model_store.list_threads(limit=500)
-    allow_new_names = response.artifact_type == "npc_brief"
-    return build_continuity_report(
+    return consistency_service.soft_guard(
         message=message,
         generated_text=text,
-        known_entity_names=[entity.name for entity in entities],
-        known_thread_names=[thread.title for thread in threads],
-        allow_proposed_new_names=allow_new_names,
+        artifact_type=response.artifact_type,
     )
 
 
@@ -424,6 +420,8 @@ class ChatService:
         consistency_planner=None,
         world_model_store: Optional[WorldModelStore | NullWorldModelStore] = None,
         conversation_store: Optional[ConversationStore | NullConversationStore] = None,
+        task_router: Optional[TaskRouter] = None,
+        consistency_service: Optional[ConsistencyService] = None,
     ):
         self.chat_request_cls = chat_request_cls
         self.chat_fn = chat_fn
@@ -433,6 +431,11 @@ class ChatService:
         self.consistency_planner = consistency_planner or planner
         self.world_model_store = world_model_store or NullWorldModelStore()
         self.conversation_store = conversation_store or NullConversationStore()
+        self.task_router = task_router or TaskRouter()
+        self.consistency_service = consistency_service or ConsistencyService(
+            world_model_store=self.world_model_store,
+            world_fact_store=NullWorldFactStore(),
+        )
 
     def conversation_storage_enabled(self) -> bool:
         return _conversation_storage_enabled(self.conversation_store)
@@ -653,7 +656,7 @@ class ChatService:
         continuity = _continuity_for_response(
             message=message,
             response=response,
-            world_model_store=self.world_model_store,
+            consistency_service=self.consistency_service,
         )
         reply_markdown = response.artifact_text or response.reply
         return V1ChatResponse(
@@ -696,13 +699,9 @@ class ChatService:
     ) -> V1ChatResponse:
         entities = self.world_model_store.list_entities(limit=200)
         threads = self.world_model_store.list_threads(limit=200)
-        continuity = build_continuity_report(
+        continuity = self.consistency_service.soft_guard(
             message=message,
             generated_text=candidate_text,
-            known_entity_names=[entity.name for entity in entities],
-            known_thread_names=[thread.title for thread in threads],
-            extra_allowed_names=[],
-            allow_proposed_new_names=False,
         )
         reply_markdown = _render_guard_reply(
             candidate_text=candidate_text,
@@ -765,7 +764,7 @@ class ChatService:
             request_id=trace.request_id,
             trace_id=trace.trace_id,
             kind="answer",
-            mode=AssistantMode.auto,
+            mode=mode,
             reply=reply_markdown,
             reply_markdown=reply_markdown,
             title=title,
@@ -819,18 +818,19 @@ class ChatService:
         conversation_title: Optional[str],
         confirmed: bool = False,
     ) -> V1ChatResponse:
-        decision = infer_assistant_decision(
+        task_spec = self.task_router.classify(
             message=message,
             requested_mode=assistant_mode,
+            requested_intent=intent,  # type: ignore[arg-type]
             requested_artifact_type=artifact_type,
             requested_save_output=save_output,
             requested_output_title=output_title,
             candidate_text=candidate_text,
         )
-        effective_mode = decision.mode
-        effective_artifact_type = decision.artifact_type
-        effective_save_output = decision.save_output
-        effective_output_title = decision.output_title
+        effective_mode = task_spec.assistant_mode
+        effective_artifact_type = task_spec.artifact_type
+        effective_save_output = task_spec.save_output
+        effective_output_title = task_spec.output_title
 
         conversation, composed_message = self._prepare_conversation_context(
             trace=trace,
@@ -847,7 +847,7 @@ class ChatService:
             candidate_text=candidate_text,
         )
 
-        if decision.requires_confirmation and not confirmed:
+        if task_spec.requires_confirmation and not confirmed:
             rendered = self._build_confirmation_response(
                 trace=trace,
                 message=message,
@@ -858,8 +858,8 @@ class ChatService:
                 output_title=effective_output_title,
                 conversation_id=conversation.conversation_id if conversation else None,
                 conversation_title=conversation.title if conversation else None,
-                title=decision.confirmation_title or "Potwierdz dzialanie",
-                body=decision.confirmation_body or "Potwierdz, zanim agent wykona trwala operacje.",
+                title=task_spec.confirmation_title or "Potwierdz dzialanie",
+                body=task_spec.confirmation_body or "Potwierdz, zanim agent wykona trwala operacje.",
             )
             conversation = self._maybe_refresh_conversation_title(conversation, response=rendered)
             self._append_assistant_message(conversation, response=rendered)
@@ -883,7 +883,14 @@ class ChatService:
                 conversation_title=conversation.title if conversation else None,
             )
         else:
-            effective_intent = "proposal" if effective_mode == AssistantMode.editor else intent
+            if task_spec.task_type == TaskType.propose_doc_change:
+                effective_intent = "proposal"
+            elif task_spec.task_type == TaskType.ingest_session:
+                effective_intent = "session_sync"
+            elif task_spec.task_type == TaskType.create_artifact and effective_artifact_type is not None:
+                effective_intent = task_spec.chat_intent
+            else:
+                effective_intent = task_spec.chat_intent
             response = self.chat_fn(
                 self.chat_request_cls(
                     message=composed_message,
@@ -930,20 +937,21 @@ class ChatService:
         conversation_title: Optional[str],
         confirmed: bool = False,
     ) -> StreamingResponse:
-        decision = infer_assistant_decision(
+        task_spec = self.task_router.classify(
             message=message,
             requested_mode=assistant_mode,
+            requested_intent=intent,  # type: ignore[arg-type]
             requested_artifact_type=artifact_type,
             requested_save_output=save_output,
             requested_output_title=output_title,
             candidate_text=candidate_text,
         )
-        effective_mode = decision.mode
-        effective_artifact_type = decision.artifact_type
-        effective_save_output = decision.save_output
-        effective_output_title = decision.output_title
+        effective_mode = task_spec.assistant_mode
+        effective_artifact_type = task_spec.artifact_type
+        effective_save_output = task_spec.save_output
+        effective_output_title = task_spec.output_title
 
-        if decision.requires_confirmation and not confirmed:
+        if task_spec.requires_confirmation and not confirmed:
             response = self.run(
                 trace=trace,
                 message=message,
@@ -981,7 +989,7 @@ class ChatService:
             stream_plan = self.chat_stream_fn(
                 self.chat_request_cls(
                     message=composed_message,
-                    intent=intent,
+                    intent=task_spec.chat_intent,
                     artifact_type=effective_artifact_type,
                     source_title=source_title,
                     conversation_id=conversation.conversation_id if conversation else None,

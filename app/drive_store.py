@@ -4,7 +4,7 @@ import re
 import zipfile
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 from xml.etree import ElementTree
 
 import google.auth
@@ -140,6 +140,36 @@ def replace_section_content(document_text: str, section: str, content: str) -> s
     if had_trailing_newline or result:
         result += "\n"
     return result
+
+
+def _paragraph_text(block: dict[str, Any]) -> str:
+    paragraph = block.get("paragraph") or {}
+    parts: list[str] = []
+    for element in paragraph.get("elements", []):
+        text_run = element.get("textRun") or {}
+        content = text_run.get("content")
+        if content:
+            parts.append(content)
+    return "".join(parts)
+
+
+def _heading_details(block: dict[str, Any]) -> tuple[int, str, str] | None:
+    paragraph = block.get("paragraph")
+    if not paragraph:
+        return None
+    text = _paragraph_text(block).strip()
+    if not text:
+        return None
+    style = ((paragraph.get("paragraphStyle") or {}).get("namedStyleType") or "").upper()
+    if style.startswith("HEADING_"):
+        try:
+            return int(style.split("_", 1)[1]), normalize_section_name(text), text
+        except Exception:
+            pass
+    match = HEADING_RE.match(text)
+    if match:
+        return len(match.group(1)), normalize_section_name(match.group(2)), match.group(0).strip()
+    return None
 
 
 @dataclass
@@ -332,12 +362,16 @@ class DriveStore:
             return "06 Threads"
         return "unknown"
 
+    def _resolve_doc_ref(self, doc_ref: DocumentRef) -> DocumentRef:
+        if doc_ref.doc_id:
+            return doc_ref
+        found = self.find_doc(folder=doc_ref.folder, title=doc_ref.title)
+        if not found or not found.doc_id:
+            raise FileNotFoundError(f"Document not found: {doc_ref.folder}/{doc_ref.title}")
+        return DocumentRef(folder=found.folder, title=found.title, doc_id=found.doc_id, path_hint=found.path_hint)
+
     def read_doc(self, doc_ref: DocumentRef) -> str:
-        if not doc_ref.doc_id:
-            found = self.find_doc(folder=doc_ref.folder, title=doc_ref.title)
-            if not found or not found.doc_id:
-                raise FileNotFoundError(f"Document not found: {doc_ref.folder}/{doc_ref.title}")
-            doc_ref = DocumentRef(folder=found.folder, title=found.title, doc_id=found.doc_id, path_hint=found.path_hint)
+        doc_ref = self._resolve_doc_ref(doc_ref)
         return self._export_plain_text(doc_ref.doc_id)
 
     def create_doc(self, folder: str, title: str, content: str, entity_type: WorldEntityType = WorldEntityType.other) -> WorldDocInfo:
@@ -373,11 +407,7 @@ class DriveStore:
         if not content:
             return
         docs = self._docs()
-        if not doc_ref.doc_id:
-            found = self.find_doc(folder=doc_ref.folder, title=doc_ref.title)
-            if not found or not found.doc_id:
-                raise FileNotFoundError(f"Document not found: {doc_ref.folder}/{doc_ref.title}")
-            doc_ref = DocumentRef(folder=found.folder, title=found.title, doc_id=found.doc_id, path_hint=found.path_hint)
+        doc_ref = self._resolve_doc_ref(doc_ref)
 
         doc = docs.documents().get(documentId=doc_ref.doc_id).execute()
         end_index = doc.get("body", {}).get("content", [{}])[-1].get("endIndex", 1)
@@ -392,11 +422,7 @@ class DriveStore:
 
     def replace_doc(self, doc_ref: DocumentRef, content: str) -> None:
         docs = self._docs()
-        if not doc_ref.doc_id:
-            found = self.find_doc(folder=doc_ref.folder, title=doc_ref.title)
-            if not found or not found.doc_id:
-                raise FileNotFoundError(f"Document not found: {doc_ref.folder}/{doc_ref.title}")
-            doc_ref = DocumentRef(folder=found.folder, title=found.title, doc_id=found.doc_id, path_hint=found.path_hint)
+        doc_ref = self._resolve_doc_ref(doc_ref)
 
         doc = docs.documents().get(documentId=doc_ref.doc_id).execute()
         end_index = doc.get("body", {}).get("content", [{}])[-1].get("endIndex", 1)
@@ -409,9 +435,82 @@ class DriveStore:
             docs.documents().batchUpdate(documentId=doc_ref.doc_id, body={"requests": requests}).execute()
 
     def replace_section(self, doc_ref: DocumentRef, section: str, content: str) -> None:
-        current = self.read_doc(doc_ref)
-        updated = replace_section_content(current, section, content)
-        self.replace_doc(doc_ref, updated)
+        docs = self._docs()
+        doc_ref = self._resolve_doc_ref(doc_ref)
+        document = docs.documents().get(documentId=doc_ref.doc_id).execute()
+        body_content = document.get("body", {}).get("content", [])
+        document_end = max(1, (body_content[-1].get("endIndex", 1) if body_content else 1) - 1)
+        normalized_section = normalize_section_name(section)
+        cleaned_content = (content or "").strip()
+
+        found_block = None
+        found_level = None
+        for block in body_content:
+            details = _heading_details(block)
+            if not details:
+                continue
+            level, normalized_title, _ = details
+            if normalized_title == normalized_section:
+                found_block = block
+                found_level = level
+                break
+
+        requests: list[dict[str, Any]] = []
+        if found_block is not None and found_level is not None:
+            body_start = found_block.get("endIndex", 1)
+            body_end = document_end
+            for block in body_content:
+                if block.get("startIndex", 0) <= found_block.get("startIndex", 0):
+                    continue
+                details = _heading_details(block)
+                if not details:
+                    continue
+                level, _, _ = details
+                if level <= found_level:
+                    body_end = block.get("startIndex", document_end)
+                    break
+            if body_end > body_start:
+                requests.append(
+                    {
+                        "deleteContentRange": {
+                            "range": {
+                                "startIndex": body_start,
+                                "endIndex": body_end,
+                            }
+                        }
+                    }
+                )
+            insertion = "\n"
+            if cleaned_content:
+                insertion += cleaned_content
+            if not insertion.endswith("\n"):
+                insertion += "\n"
+            requests.append(
+                {
+                    "insertText": {
+                        "location": {"index": body_start},
+                        "text": insertion,
+                    }
+                }
+            )
+        else:
+            heading = section.strip().strip("# ").strip()
+            insertion = f"\n\n## {heading}\n\n"
+            if cleaned_content:
+                insertion += cleaned_content
+                if not insertion.endswith("\n"):
+                    insertion += "\n"
+            requests.append(
+                {
+                    "insertText": {
+                        "location": {"index": document_end},
+                        "text": insertion,
+                    }
+                }
+            )
+
+        if requests:
+            docs.documents().batchUpdate(documentId=doc_ref.doc_id, body={"requests": requests}).execute()
 
     def find_doc(self, *, folder: Optional[str] = None, title: Optional[str] = None, doc_id: Optional[str] = None) -> Optional[WorldDocInfo]:
         docs = self.list_world_docs()

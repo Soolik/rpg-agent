@@ -87,6 +87,8 @@ class ApplyChangesResponse(BaseModel):
     summary: str
     results: List[AppliedActionResult] = Field(default_factory=list)
     reindex_result: Optional[Dict[str, Any]] = None
+    previews: List["DocumentExecutionPreview"] = Field(default_factory=list)
+    validation: Optional["ChangeValidationReport"] = None
 
 
 class WorldDocInfo(BaseModel):
@@ -248,3 +250,51 @@ class WorldModelCleanupResponse(BaseModel):
     dry_run: bool = True
     duplicate_thread_count: int = 0
     deleted_thread_ids: List[int] = Field(default_factory=list)
+
+
+class WorldFactRecord(BaseModel):
+    id: int
+    campaign_id: str
+    subject_type: str
+    subject_name: str
+    predicate: str
+    object_value: str
+    source_type: str
+    source_ref: Optional[str] = None
+    confidence: float = 1.0
+    updated_at: str
+
+
+class EntityRelationRecord(BaseModel):
+    id: int
+    campaign_id: str
+    source_name: str
+    relation_type: str
+    target_name: str
+    evidence: str = ""
+    source_type: str
+    source_ref: Optional[str] = None
+    confidence: float = 1.0
+    updated_at: str
+
+
+class DocumentExecutionPreview(BaseModel):
+    action_type: ActionType
+    target: Optional[DocumentRef] = None
+    summary: str = ""
+    current_excerpt: str = ""
+    proposed_excerpt: str = ""
+    diff_text: str = ""
+
+
+class ValidationIssue(BaseModel):
+    code: str
+    severity: Literal["info", "warning", "error"] = "warning"
+    message: str
+    target: Optional[DocumentRef] = None
+    evidence: Optional[str] = None
+
+
+class ChangeValidationReport(BaseModel):
+    ok: bool = True
+    issues: List[ValidationIssue] = Field(default_factory=list)

@@ -21,6 +21,7 @@ from .api_models import (
     ConversationMessageCreateRequest,
     ConversationMessageListResponse,
     ConversationResponse,
+    EntityRelationListResponse,
     GoogleDriveOAuthStartResponse,
     GoogleDriveOAuthStatusResponse,
     ProposalStatus,
@@ -39,6 +40,7 @@ from .api_models import (
     WorldModelChangeResponse,
     WorldModelChangeView,
     WorldModelEntityListResponse,
+    WorldFactListResponse,
     WorldModelSearchItem,
     WorldModelSearchResponse,
     WorldModelSessionListResponse,
@@ -48,10 +50,14 @@ from .applier import ProposalApplier
 from .canonical_import_service import CanonicalImportService
 from .chat_service import ChatService, StreamPlan
 from .chat_models import ChatRequest, ChatResponse
+from .consistency_service import ConsistencyService
 from .conversation_store import ConversationStore, NullConversationStore
 from .google_drive_oauth_service import GoogleDriveOAuthError, GoogleDriveOAuthService
 from .request_auth import RequestAuthError, SignedSessionAuth
 from .routed_drive_store import DriveWriteAccessError
+from .task_router import TaskRouter
+from .world_fact_service import WorldFactService
+from .world_fact_store import NullWorldFactStore, WorldFactStore
 from .world_model_service import WorldModelService
 from .world_model_store import NullWorldModelStore, WorldModelStore
 from .workflow_store import NullWorkflowStore, WorkflowStore
@@ -83,8 +89,10 @@ def build_v1_router(
     drive_store,
     planner,
     consistency_planner=None,
+    planner_context_builder: Optional[Callable[[str], str]] = None,
     workflow_store: Optional[WorkflowStore | NullWorkflowStore] = None,
     world_model_store: Optional[WorldModelStore | NullWorldModelStore] = None,
+    world_fact_store: Optional[WorldFactStore | NullWorldFactStore] = None,
     conversation_store: Optional[ConversationStore | NullConversationStore] = None,
     applier: Optional[ProposalApplier] = None,
     reindex_fn: Optional[Callable[[list], dict]] = None,
@@ -95,9 +103,14 @@ def build_v1_router(
     router = APIRouter(prefix="/v1", tags=["v1"])
     store = workflow_store or NullWorkflowStore()
     model_store = world_model_store or NullWorldModelStore()
+    fact_store = world_fact_store or NullWorldFactStore()
     convo_store = conversation_store or NullConversationStore()
     guard_planner = consistency_planner or planner
-    proposal_applier = applier or ProposalApplier(drive_store=drive_store)
+    consistency_service = ConsistencyService(world_model_store=model_store, world_fact_store=fact_store)
+    proposal_applier = applier or ProposalApplier(
+        drive_store=drive_store,
+        consistency_service=consistency_service,
+    )
     chat_service = ChatService(
         chat_request_cls=chat_request_cls,
         chat_fn=chat_fn,
@@ -107,14 +120,18 @@ def build_v1_router(
         consistency_planner=guard_planner,
         world_model_store=model_store,
         conversation_store=convo_store,
+        task_router=TaskRouter(),
+        consistency_service=consistency_service,
     )
     workflow_service = WorkflowService(
         drive_store=drive_store,
         planner=planner,
         workflow_store=store,
         applier=proposal_applier,
+        context_builder=planner_context_builder,
     )
     world_model_service = WorldModelService(world_model_store=model_store)
+    world_fact_service = WorldFactService(world_model_store=model_store, world_fact_store=fact_store)
     canonical_import_service = CanonicalImportService(drive_store=drive_store, reindex_fn=reindex_fn)
     oauth_service = google_drive_oauth_service
 
@@ -540,6 +557,7 @@ def build_v1_router(
                 summary=accepted.summary,
                 results=accepted.results,
                 reindex_result=accepted.reindex_result,
+                validation=accepted.validation,
             )
 
         if request.action_type == AssistantActionType.reject_world_change:
@@ -679,6 +697,44 @@ def build_v1_router(
             items=items,
         )
 
+    @router.get("/world-model/facts", response_model=WorldFactListResponse)
+    def v1_list_world_facts(
+        limit: int = 20,
+        subject_name: Optional[str] = None,
+        predicate: Optional[str] = None,
+    ):
+        trace = _new_trace()
+        safe_limit = max(1, min(limit, 200))
+        return WorldFactListResponse(
+            request_id=trace.request_id,
+            trace_id=trace.trace_id,
+            items=world_fact_service.list_facts(
+                limit=safe_limit,
+                subject_name=subject_name,
+                predicate=predicate,
+            ),
+        )
+
+    @router.get("/world-model/relations", response_model=EntityRelationListResponse)
+    def v1_list_world_relations(
+        limit: int = 20,
+        source_name: Optional[str] = None,
+        target_name: Optional[str] = None,
+        relation_type: Optional[str] = None,
+    ):
+        trace = _new_trace()
+        safe_limit = max(1, min(limit, 200))
+        return EntityRelationListResponse(
+            request_id=trace.request_id,
+            trace_id=trace.trace_id,
+            items=world_fact_service.list_relations(
+                limit=safe_limit,
+                source_name=source_name,
+                target_name=target_name,
+                relation_type=relation_type,
+            ),
+        )
+
     @router.post("/imports/canonical-files", response_model=CanonicalImportResponse)
     def v1_import_canonical_files(request: CanonicalImportRequest):
         trace = _new_trace()
@@ -800,6 +856,7 @@ def build_v1_router(
             summary=accepted.summary,
             results=accepted.results,
             reindex_result=accepted.reindex_result,
+            validation=accepted.validation,
         )
 
     def reject_world_model_change_impl(

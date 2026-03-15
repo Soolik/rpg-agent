@@ -13,9 +13,14 @@ from app.models_v2 import (
 class FakeDriveStore:
     def __init__(self):
         self.appended = []
+        self.docs = {"doc-1": "Captain Mira"}
 
     def append_doc(self, target, content):
         self.appended.append((target, content))
+        self.docs[target.doc_id] = self.docs.get(target.doc_id, "") + "\n\n" + content
+
+    def read_doc(self, target):
+        return self.docs[target.doc_id]
 
 
 class ProposalApplierTest(unittest.TestCase):

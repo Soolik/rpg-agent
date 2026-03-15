@@ -7,7 +7,17 @@ from pydantic import BaseModel, Field
 
 from .chat_models import ArtifactType, ChatIntent
 from .conversation_store import ConversationMessageRecord, ConversationRecord
-from .models_v2 import AppliedActionResult, DocumentAction, DocumentRef, WorldEntityRecord, WorldSessionRecord, WorldThreadRecord
+from .models_v2 import (
+    AppliedActionResult,
+    ChangeValidationReport,
+    DocumentAction,
+    DocumentRef,
+    EntityRelationRecord,
+    WorldEntityRecord,
+    WorldFactRecord,
+    WorldSessionRecord,
+    WorldThreadRecord,
+)
 
 
 class ProposalStatus(str, Enum):
@@ -74,7 +84,7 @@ class NextAction(BaseModel):
 
 
 class ContinuityIssue(BaseModel):
-    code: Literal["new_proper_noun", "possible_name_conflict", "world_model_mismatch", "inferred_claim"] = "new_proper_noun"
+    code: Literal["new_proper_noun", "possible_name_conflict", "world_model_mismatch", "inferred_claim", "fact_conflict"] = "new_proper_noun"
     severity: Literal["info", "warning", "error"] = "warning"
     message: str
     related_name: Optional[str] = None
@@ -216,6 +226,14 @@ class WorldModelSearchResponse(RequestTrace):
     items: List[WorldModelSearchItem] = Field(default_factory=list)
 
 
+class WorldFactListResponse(RequestTrace):
+    items: List[WorldFactRecord] = Field(default_factory=list)
+
+
+class EntityRelationListResponse(RequestTrace):
+    items: List[EntityRelationRecord] = Field(default_factory=list)
+
+
 class GoogleDriveOAuthStatusResponse(RequestTrace):
     configured: bool = False
     connected: bool = False
@@ -335,6 +353,7 @@ class WorldModelChangeApplyResponse(RequestTrace):
     summary: str = ""
     results: List[AppliedActionResult] = Field(default_factory=list)
     reindex_result: Optional[Dict[str, Any]] = None
+    validation: Optional[ChangeValidationReport] = None
 
 
 class AssistantActionRequest(BaseModel):
@@ -364,4 +383,5 @@ class AssistantActionResponse(RequestTrace):
     summary: str = ""
     results: List[AppliedActionResult] = Field(default_factory=list)
     reindex_result: Optional[Dict[str, Any]] = None
+    validation: Optional[ChangeValidationReport] = None
     chat: Optional[V1ChatResponse] = None

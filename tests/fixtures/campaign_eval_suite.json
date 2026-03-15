@@ -1,0 +1,26 @@
+{
+  "questions": [
+    {
+      "name": "morn_case_summary",
+      "prompt": "Co wiesz o sprawie Morna i Black Eel?",
+      "must_include": ["Morn", "Black Eel"],
+      "must_not_include": ["nieistniejaca frakcja"]
+    }
+  ],
+  "planner_cases": [
+    {
+      "name": "update_npc_notes",
+      "instruction": "Zaktualizuj notatki Captain Mira w dokumencie NPC.",
+      "expected_action_types": ["replace_section"],
+      "expected_titles": ["Captain Mira"]
+    }
+  ],
+  "continuity_cases": [
+    {
+      "name": "thread_status_conflict",
+      "message": "Sprawdz zmiane watku Red Blade.",
+      "generated_text": "Name: Red Blade\nStatus: closed",
+      "expected_issue_codes": ["fact_conflict"]
+    }
+  ]
+}
