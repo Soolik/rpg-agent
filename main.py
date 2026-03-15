@@ -2871,9 +2871,146 @@ def is_morn_campaign_question(text: str) -> bool:
     return any(hint in normalized for hint in ("morn", "black eel", "dossier"))
 
 
+def is_campaign_source_question(text: str) -> bool:
+    normalized = normalize_match_text(text)
+    hints = (
+        "skad bierzesz informacje",
+        "skad masz informacje",
+        "z jakich notatek",
+        "z jakich dokumentow",
+        "z jakich plikow",
+        "na podstawie jakich dokumentow",
+        "na podstawie jakich plikow",
+        "czy masz dostep do google docs",
+        "czy masz dostep do google drive",
+        "czy masz dostep do drive",
+        "czy masz dostep do dokumentow",
+        "czy korzystasz z google docs",
+        "czy widzisz google docs",
+    )
+    return any(hint in normalized for hint in hints)
+
+
+PREFERRED_CAMPAIGN_SOURCE_TITLES = [
+    "Campaign Bible",
+    "Przewodnik po Shackles",
+    "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+    "Dossier Morna - sprawa Black Eel",
+    "Places",
+    "NPCs",
+    "Factions",
+    "Secrets",
+    "Events",
+    "Thread Tracker",
+    "Rules And Tone",
+    "Glossary",
+]
+
+
+def list_preferred_campaign_source_docs(limit: int = 10) -> List[WorldDocInfo]:
+    drive_store = globals().get("drive_store_v2")
+    if drive_store is None or not hasattr(drive_store, "list_world_docs"):
+        return []
+
+    try:
+        docs = list(drive_store.list_world_docs())
+    except Exception:
+        return []
+
+    preferred_order = {
+        normalize_match_text(title): index for index, title in enumerate(PREFERRED_CAMPAIGN_SOURCE_TITLES)
+    }
+    seen: set[tuple[str, str]] = set()
+    filtered: List[WorldDocInfo] = []
+    for doc in docs:
+        folder = normalize_match_text(getattr(doc, "folder", "") or "")
+        title = normalize_match_text(getattr(doc, "title", "") or "")
+        if not title:
+            continue
+        if folder.startswith("00 admin") or folder.startswith("08 outputs"):
+            continue
+        key = (folder, title)
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(doc)
+
+    filtered.sort(
+        key=lambda doc: (
+            preferred_order.get(normalize_match_text(doc.title), 999),
+            normalize_match_text(doc.folder),
+            normalize_match_text(doc.title),
+        )
+    )
+    return filtered[:limit]
+
+
+def source_records_from_docs(docs: List[WorldDocInfo]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for doc in docs:
+        entity_type = getattr(doc.entity_type, "value", str(doc.entity_type or "other"))
+        records.append(
+            {
+                "folder": doc.folder,
+                "title": doc.title,
+                "doc_id": doc.doc_id,
+                "path_hint": doc.path_hint,
+                "doc_type": entity_type,
+            }
+        )
+    return records
+
+
+def build_campaign_source_answer(question: str, docs: List[WorldDocInfo]) -> str:
+    normalized = normalize_match_text(question)
+    title_map = {normalize_match_text(doc.title): doc.title for doc in docs}
+
+    def has_title(fragment: str) -> bool:
+        return any(fragment in key for key in title_map)
+
+    access_question = any(
+        hint in normalized
+        for hint in ("czy masz dostep", "czy korzystasz z google docs", "czy widzisz google docs")
+    )
+    lines: List[str] = []
+    if access_question:
+        lines.append(
+            "- Tak. Mam dostep do zaimportowanych dokumentow kampanii na Google Drive / Google Docs oraz do ich indeksu wyszukiwania."
+        )
+    else:
+        lines.append(
+            "- Informacje o tej kampanii biorę z zaimportowanych dokumentów kampanii na Google Drive / Google Docs oraz z ich indeksu wyszukiwania."
+        )
+
+    if docs:
+        top_titles = ", ".join(doc.title for doc in docs[:6])
+        lines.append(f"- Najwazniejsze zrodla kanonu dla tej kampanii to: {top_titles}.")
+
+    if has_title("przewodnik po shackles") or has_title("places"):
+        lines.append(
+            "- Dla realiow Shackles i Port Peril podstawowe zrodla to `Przewodnik po Shackles` oraz `Places`."
+        )
+    if has_title("rozdzial 1") or has_title("dossier morna"):
+        lines.append(
+            "- Dla Rozdzialu 1 i sprawy Morna / Black Eel podstawowe zrodla to `Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril` oraz `Dossier Morna - sprawa Black Eel`."
+        )
+    if has_title("campaign bible") or has_title("thread tracker"):
+        lines.append(
+            "- `Campaign Bible` i `Thread Tracker` daja mi ogolny szkielet kampanii, stawki, watki oraz miejsce tych wydarzen w szerszym planie."
+        )
+
+    lines.append(
+        "- Jesli czegos nie ma w tych notatkach, powinienem powiedziec to wprost zamiast odpowiadac ogolnym pomyslem na kampanie."
+    )
+    return "\n".join(lines)
+
+
 def boosted_doc_titles_for_question(question: str) -> List[str]:
     normalized = normalize_match_text(question)
     titles: List[str] = []
+
+    if is_campaign_source_question(question):
+        titles.extend(PREFERRED_CAMPAIGN_SOURCE_TITLES)
 
     if "krew na gwiazdach" in normalized or "kampania" in normalized:
         titles.extend(
@@ -2978,7 +3115,11 @@ def is_irrelevant_campaign_doc(hit: Dict[str, Any]) -> bool:
     folder = normalize_match_text(hit.get("folder") or "")
     if folder.startswith("00 admin"):
         return True
+    if folder.startswith("08 outputs"):
+        return True
     if title == "index - docs ids":
+        return True
+    if title == "agent inbox":
         return True
     return False
 
@@ -3245,20 +3386,65 @@ ODPOWIEDZ:
 
 
 def build_campaign_text_prompt(question: str, context: str) -> str:
+    if is_morn_campaign_question(question):
+        return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Na podstawie notatek odpowiedz po polsku.
+
+ZASADY:
+1) Uzywaj tylko faktow z KONTEKSTU.
+2) Zwracaj wylacznie 5 bulletow. Kazdy bullet musi zaczynac sie od "- " i miec 1-3 zdania.
+3) Zrealizuj te punkty osobno i w tej kolejnosci:
+   - na czym polega przekret Morna / Black Eel,
+   - kto jest zaangazowany,
+   - jakie dokumenty, pieczecie albo ladunek sa kluczowe,
+   - jak sprawa laczy sie z Shackles, Port Peril i Rozdzialem 1,
+   - dlaczego jest politycznie wazna dla kampanii.
+4) Nie dawaj wstepu, naglowkow ani numeracji.
+5) Nie urywaj odpowiedzi i nie lacz wszystkiego w jeden bullet.
+6) Jesli dla ktoregos punktu brakuje danych, napisz to wprost, ale nadal dodaj osobny bullet.
+7) Bez dopowiadania faktow spoza KONTEKSTU.
+
+KONTEKST:
+{context}
+
+PYTANIE:
+{question}
+
+ODPOWIEDZ:
+""".strip()
+
+    if is_first_part_campaign_question(question):
+        return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Na podstawie notatek odpowiedz po polsku.
+
+ZASADY:
+1) Uzywaj tylko faktow z KONTEKSTU.
+2) Zwracaj wylacznie 6 bulletow. Kazdy bullet musi zaczynac sie od "- " i miec 1-3 zdania.
+3) Zrealizuj te punkty osobno:
+   - gdzie i od czego zaczyna sie Rozdzial 1,
+   - jaka jest glowna sprawa startowa,
+   - jakie sa najwazniejsze postacie,
+   - jakie sa najwazniejsze lokacje,
+   - jakie sa najwazniejsze napiecia polityczne,
+   - co to zmienia dla dalszej kampanii.
+4) Nie dawaj wstepu, naglowkow ani numeracji.
+5) Nie urywaj odpowiedzi i nie lacz wszystkiego w jeden bullet.
+6) Jesli dla ktoregos punktu brakuje danych, napisz to wprost, ale nadal dodaj osobny bullet.
+7) Bez dopowiadania faktow spoza KONTEKSTU.
+
+KONTEKST:
+{context}
+
+PYTANIE:
+{question}
+
+ODPOWIEDZ:
+""".strip()
+
     if is_campaign_overview_question(question):
         focus_rule = (
             "4) Dla pytania ogolnego pokryj w odpowiedzi: realia Shackles i Port Peril, pierwszy rozdzial, sprawe Morna, "
             "kluczowe sily polityczne lub frakcyjne oraz stawki kampanii."
-        )
-    elif is_morn_campaign_question(question):
-        focus_rule = (
-            "4) Dla pytan o sprawe Morna opisz: na czym polega przekret, kto jest zaangazowany, jakie dokumenty lub ladunek "
-            "sa kluczowe oraz dlaczego sprawa jest politycznie wazna dla kampanii."
-        )
-    elif is_first_part_campaign_question(question):
-        focus_rule = (
-            "4) Dla pytan o pierwsza czesc kampanii opisz kolejnosc zdarzen, glowna sprawe startowa, najwazniejsze postacie "
-            "i co to zmienia dla dalszej kampanii."
         )
     else:
         focus_rule = "4) Najpierw podaj fakty praktyczne i kampanijne, dopiero potem motywy ogolne."
@@ -3740,15 +3926,22 @@ def ask(req: AskRequest):
     try:
         raw_question = normalize_text_artifacts(req.question or "").strip()
         q = extract_latest_user_message(raw_question) or raw_question
+        source_question = is_campaign_source_question(q)
         hits: List[Dict[str, Any]] = []
         analysis_mode = False
+
+        if source_question and req.mode != "general":
+            docs = list_preferred_campaign_source_docs(limit=8)
+            answer = build_campaign_source_answer(q, docs)
+            sources = source_records_from_docs(docs) if req.include_sources else []
+            return AskResponse(answer=answer, sources=sources)
 
         if req.mode in ("campaign", "scene"):
             campaign_mode = True
         elif req.mode == "general":
             campaign_mode = False
         else:
-            campaign_mode = is_campaign_question(q)
+            campaign_mode = source_question or is_campaign_question(q)
             if not campaign_mode:
                 hits = vector_search(q, req.top_k)
                 campaign_mode = has_likely_campaign_hits(hits)
@@ -3770,19 +3963,19 @@ def ask(req: AskRequest):
             prompt_builder = build_campaign_prompt
         prompt = prompt_builder(q, context)
 
-        raw = gemini_generate(
-            prompt,
-            response_mime_type="application/json",
-            temperature=0.2,
-            max_output_tokens=2000,
-        ).strip()
-
         parsed: Optional[CampaignOut] = None
-        try:
-            obj = json.loads(extract_json_object(raw))
-            parsed = CampaignOut.model_validate(obj)
-        except Exception:
-            fix = f"""
+        if not is_morn_campaign_question(q):
+            raw = gemini_generate(
+                prompt,
+                response_mime_type="application/json",
+                temperature=0.2,
+                max_output_tokens=2000,
+            ).strip()
+            try:
+                obj = json.loads(extract_json_object(raw))
+                parsed = CampaignOut.model_validate(obj)
+            except Exception:
+                fix = f"""
 Napraw output. Masz zwrócić wyłącznie JSON zgodny z tym schematem i nic więcej.
 Jeśli brak danych: format="bullets", bullets=["brak w notatkach"].
 
@@ -3791,17 +3984,17 @@ ZŁY OUTPUT:
 
 POPRAWNY OUTPUT (tylko JSON):
 """.strip()
-            try:
-                raw2 = gemini_generate(
-                    fix,
-                    response_mime_type="application/json",
-                    temperature=0.0,
-                    max_output_tokens=1500,
-                ).strip()
-                obj2 = json.loads(extract_json_object(raw2))
-                parsed = CampaignOut.model_validate(obj2)
-            except Exception:
-                parsed = None
+                try:
+                    raw2 = gemini_generate(
+                        fix,
+                        response_mime_type="application/json",
+                        temperature=0.0,
+                        max_output_tokens=1500,
+                    ).strip()
+                    obj2 = json.loads(extract_json_object(raw2))
+                    parsed = CampaignOut.model_validate(obj2)
+                except Exception:
+                    parsed = None
 
         answer: Optional[str] = render_campaign_out(parsed) if parsed is not None else None
         if answer is None:

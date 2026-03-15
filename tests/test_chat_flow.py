@@ -48,6 +48,39 @@ class ChatFlowTest(unittest.TestCase):
     def test_is_campaign_question_recognizes_port_peril(self):
         self.assertTrue(main.is_campaign_question("Co to jest Port Peril?"))
 
+    def test_ask_source_question_returns_docs_based_answer_without_model_call(self):
+        original_drive_store = getattr(main, "drive_store_v2", None)
+        original_gemini_generate = main.gemini_generate
+
+        class FakeDriveStore:
+            def list_world_docs(self):
+                return [
+                    main.WorldDocInfo(folder="01 Bible", title="Campaign Bible", doc_id="doc-bible", path_hint="01 Bible/Campaign Bible", entity_type=main.WorldEntityType.bible),
+                    main.WorldDocInfo(folder="01 Bible", title="Przewodnik po Shackles", doc_id="doc-shackles", path_hint="01 Bible/Przewodnik po Shackles", entity_type=main.WorldEntityType.other),
+                    main.WorldDocInfo(folder="02 Sessions", title="Dossier Morna - sprawa Black Eel", doc_id="doc-morn", path_hint="02 Sessions/Dossier Morna - sprawa Black Eel", entity_type=main.WorldEntityType.session),
+                    main.WorldDocInfo(folder="08 Outputs", title="Agent Inbox", doc_id="doc-output", path_hint="08 Outputs/Agent Inbox", entity_type=main.WorldEntityType.output),
+                ]
+
+        def fail_gemini_generate(prompt, **kwargs):
+            raise AssertionError("gemini_generate should not be called for source questions")
+
+        try:
+            main.drive_store_v2 = FakeDriveStore()
+            main.gemini_generate = fail_gemini_generate
+            response = main.ask(
+                main.AskRequest(
+                    question="Skąd bierzesz informacje o tej kampanii?",
+                    include_sources=True,
+                )
+            )
+        finally:
+            main.drive_store_v2 = original_drive_store
+            main.gemini_generate = original_gemini_generate
+
+        self.assertIn("Google Drive / Google Docs", response.answer)
+        self.assertIn("Campaign Bible", response.answer)
+        self.assertTrue(all(source["title"] != "Agent Inbox" for source in response.sources))
+
     def test_render_campaign_out_uses_human_fallback_and_bullets(self):
         missing = main.render_campaign_out(
             main.CampaignOut(format="bullets", bullets=["brak w notatkach"])
@@ -582,6 +615,87 @@ class ChatFlowTest(unittest.TestCase):
 
         self.assertTrue(all(hit["title"] != "Index - Docs IDs" for hit in hits))
         self.assertEqual(hits[0]["title"], "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
+
+    def test_shape_campaign_hits_filters_output_docs(self):
+        hits = main.shape_campaign_hits(
+            "Co to kampania Krew Na Gwiazdach?",
+            [
+                {
+                    "chunk_id": "output-1",
+                    "doc_id": "doc-output",
+                    "doc_type": "gdoc",
+                    "chunk_text": "Roboczy output.",
+                    "distance": 0.02,
+                    "title": "Agent Inbox",
+                    "folder": "08 Outputs",
+                    "path_hint": "08 Outputs / Agent Inbox",
+                },
+                {
+                    "chunk_id": "bible-1",
+                    "doc_id": "doc-bible",
+                    "doc_type": "gdoc",
+                    "chunk_text": "Ogolny opis kampanii.",
+                    "distance": 0.22,
+                    "title": "Campaign Bible",
+                    "folder": "01 Bible",
+                    "path_hint": "01 Bible / Campaign Bible",
+                },
+            ],
+            6,
+        )
+
+        self.assertTrue(all(hit["title"] != "Agent Inbox" for hit in hits))
+
+    def test_ask_morn_question_skips_json_stage_and_uses_text_prompt(self):
+        original_vector_search = main.vector_search
+        original_gemini_generate = main.gemini_generate
+        original_augment_campaign_hits = main.augment_campaign_hits
+        seen = {"calls": []}
+
+        hits = [
+            {
+                "chunk_id": 1,
+                "doc_id": "doc-morn",
+                "doc_type": "gdoc",
+                "chunk_text": "Sprawa Morna dotyczy Black Eel i falszywych pieczeci przewozowych.",
+                "distance": 0.18,
+                "title": "Dossier Morna - sprawa Black Eel",
+                "folder": "02 Sessions",
+                "path_hint": "02 Sessions / Dossier Morna - sprawa Black Eel",
+            }
+        ]
+
+        def fake_vector_search(question, top_k):
+            return hits
+
+        def fake_gemini_generate(prompt, **kwargs):
+            seen["calls"].append((prompt, kwargs))
+            return (
+                "- Przekret Morna polegal na papierowym rabunku Black Eel.\n"
+                "- Zaangazowani byli Tavin Morn i Ressa Vane.\n"
+                "- Kluczowe byly falszywe pieczecie i dokumenty przewozowe.\n"
+                "- Sprawa laczy sie z Shackles i Rozdzialem 1 przez Port Peril.\n"
+                "- Politycznie pokazuje, jak dlugi i dokumenty sluza jako narzedzie przemocy."
+            )
+
+        try:
+            main.vector_search = fake_vector_search
+            main.augment_campaign_hits = lambda question, current_hits, top_k: current_hits
+            main.gemini_generate = fake_gemini_generate
+            response = main.ask(
+                main.AskRequest(
+                    question="Coś o sprawie Morna w Shackles?",
+                    include_sources=False,
+                )
+            )
+        finally:
+            main.vector_search = original_vector_search
+            main.augment_campaign_hits = original_augment_campaign_hits
+            main.gemini_generate = original_gemini_generate
+
+        self.assertEqual(len(seen["calls"]), 3)
+        self.assertTrue(all(call[1].get("response_mime_type") != "application/json" for call in seen["calls"]))
+        self.assertIn("Black Eel", response.answer)
 
     def test_chat_answer_returns_human_text_with_sources(self):
         original_ask = main.ask
