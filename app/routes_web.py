@@ -293,10 +293,8 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
     renderMsgs();
   }
   async function selectConv(id) { s.cid = id; await loadMsgs(id); }
-  async function startGoogleFlow() {
-    const response = await request("/auth/google-drive/start", { method: "POST" });
-    const payload = await response.json();
-    window.location.href = payload.authorization_url;
+  function startGoogleFlow() {
+    window.location.assign(`${cfg.apiBase}/auth/google-drive/start`);
   }
   async function disconnectDriveFlow() { await request("/auth/google-drive/disconnect", { method: "POST" }); await loadDrive(); }
   async function logoutFlow() {

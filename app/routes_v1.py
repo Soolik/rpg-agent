@@ -4,7 +4,7 @@ import uuid
 from typing import Callable, Optional, Type
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from .api_models import (
     AssistantActionRequest,
@@ -228,6 +228,27 @@ def build_v1_router(
             redirect_uri=started.redirect_uri,
             scopes=started.scopes,
         )
+
+    @router.get("/auth/google-drive/start", include_in_schema=False)
+    def v1_google_drive_auth_start_redirect():
+        trace = _new_trace()
+        if not oauth_service:
+            raise _api_error(
+                503,
+                request_trace=trace,
+                code="google_drive_oauth_unavailable",
+                message="Google Drive OAuth is not configured for this deployment.",
+            )
+        try:
+            started = oauth_service.start_authorization()
+        except GoogleDriveOAuthError as exc:
+            raise _api_error(
+                503,
+                request_trace=trace,
+                code="google_drive_oauth_unavailable",
+                message=str(exc),
+            )
+        return RedirectResponse(url=started.authorization_url, status_code=307)
 
     @router.get("/auth/google-drive/callback", response_class=HTMLResponse)
     def v1_google_drive_auth_callback(code: str, state: str):

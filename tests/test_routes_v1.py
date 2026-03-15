@@ -520,6 +520,16 @@ class RoutesV1Test(unittest.TestCase):
         self.assertTrue(oauth_service.start_called)
         self.assertIn("accounts.google.com", body["authorization_url"])
 
+    def test_v1_google_drive_auth_start_redirects_browser_flow(self):
+        oauth_service = FakeGoogleDriveOAuthService()
+        router = self.build_router(oauth_service=oauth_service)
+
+        response = self.route_endpoint(router, "/v1/auth/google-drive/start", "GET")()
+
+        self.assertTrue(oauth_service.start_called)
+        self.assertEqual(response.status_code, 307)
+        self.assertIn("accounts.google.com", response.headers["location"])
+
     def test_v1_google_drive_auth_disconnect_returns_status(self):
         oauth_service = FakeGoogleDriveOAuthService(connected=True, subject_email="soolik1990@gmail.com")
         router = self.build_router(oauth_service=oauth_service)

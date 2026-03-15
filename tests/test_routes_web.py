@@ -34,6 +34,7 @@ class RoutesWebTest(unittest.TestCase):
         self.assertIn('e.message.addEventListener("keydown"', body)
         self.assertIn('if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing) return;', body)
         self.assertIn('include_sources: true', body)
+        self.assertIn('window.location.assign(`${cfg.apiBase}/auth/google-drive/start`);', body)
         self.assertIn("/v1", body)
 
 
