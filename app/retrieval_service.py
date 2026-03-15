@@ -24,7 +24,7 @@ class HybridRetrievalService:
     lexical_search_fn: Callable[[str, int], list[dict]]
     lexical_search_in_docs_fn: Callable[[str, list[str], int], list[dict]]
     list_docs_fn: Callable[[], list[WorldDocInfo]]
-    structured_search_fn: Optional[Callable[[str, int], list[WorldModelSearchItem]]] = None
+    structured_search_fn: Optional[Callable[..., list[WorldModelSearchItem]]] = None
 
     def retrieve(self, question: str, *, top_k: int = 6) -> list[dict]:
         if not question.strip():
@@ -76,7 +76,7 @@ class HybridRetrievalService:
             if doc.doc_id and doc.title
         }
         doc_ids: list[str] = []
-        for item in self.structured_search_fn(question, limit):
+        for item in self.structured_search_fn(question, limit=limit):
             doc_id = doc_by_title.get(normalize_key(item.title))
             if doc_id:
                 doc_ids.append(doc_id)
