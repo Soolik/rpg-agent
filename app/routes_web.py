@@ -213,7 +213,7 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
     const text = e.message.value.trim();
     const extraText = e.candidate.value.trim();
     if (!text) return;
-    const req = { message: text, mode: "auto", stream: true, save_output: e.saveOutput.checked, output_title: e.outputTitle.value.trim() || null };
+    const req = { message: text, mode: "auto", stream: true, include_sources: true, save_output: e.saveOutput.checked, output_title: e.outputTitle.value.trim() || null };
     if (extraText) req.candidate_text = extraText;
     const endpoint = s.cid ? `/conversations/${s.cid}/messages` : "/chat";
     s.msgs.push({ role: "user", kind: "input", title: "", content: text, actions: [], warnings: [], citations: [], continuity: null, output: null, stream: null });

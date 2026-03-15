@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional, Type
 
@@ -130,7 +131,22 @@ def derive_conversation_title(message: str, explicit_title: Optional[str]) -> st
     return _compact_title(_first_nonempty_line(message), fallback="Nowa rozmowa")
 
 
-def _derive_response_title(response: ChatResponse) -> str:
+def _normalize_title_hint(value: str) -> str:
+    compact = " ".join((value or "").strip().lower().split())
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", compact) if not unicodedata.combining(ch)
+    )
+
+
+def _derive_response_title(response: ChatResponse, message: str = "") -> str:
+    normalized_message = _normalize_title_hint(message)
+    if "krew na gwiazdach" in normalized_message:
+        if any(hint in normalized_message for hint in ("co to kampania", "o czym jest kampania", "opis kampanii", "powiedz mi o kampanii")):
+            return "Krew Na Gwiazdach: opis kampanii"
+        if any(hint in normalized_message for hint in ("pierwsza czesc", "pierwszy rozdzial", "rozdzial 1", "akt 1", "shackles", "port peril")):
+            return "Krew Na Gwiazdach: Rozdzial 1"
+    if any(hint in normalized_message for hint in ("morn", "black eel", "dossier")):
+        return "Sprawa Morna / Black Eel"
     if response.artifact_text:
         return _compact_title(_first_nonempty_line(response.artifact_text), fallback="Odpowiedz")
     if response.artifact_type:
@@ -610,7 +626,7 @@ class ChatService:
             mode=mode,
             reply=response.reply,
             reply_markdown=reply_markdown,
-            title=_derive_response_title(response),
+            title=_derive_response_title(response, message),
             conversation_id=conversation_id,
             conversation_title=conversation_title,
             artifact_type=response.artifact_type,

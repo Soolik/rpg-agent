@@ -867,6 +867,62 @@ def vector_search_in_docs(question: str, doc_ids: List[str], top_k: int) -> List
         for (cid, d, t, c, dist, title, folder, path_hint) in rows
     ]
 
+
+def leading_chunks_for_docs(doc_ids: List[str], limit_per_doc: int = 1, total_limit: int = 12) -> List[Dict[str, Any]]:
+    if not doc_ids:
+        return []
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                with ranked as (
+                    select
+                        c.id,
+                        c.doc_id,
+                        c.doc_type,
+                        c.chunk_text,
+                        coalesce(wd.title, c.metadata->>'title', '') as title,
+                        coalesce(wd.folder, c.metadata->>'folder', '') as folder,
+                        coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', '') as path_hint,
+                        row_number() over (partition by c.doc_id order by c.chunk_index asc, c.id asc) as rn
+                    from chunks c
+                    left join world_docs wd
+                        on wd.campaign_id = c.campaign_id
+                       and wd.doc_id = c.doc_id
+                    where c.campaign_id = %s
+                      and c.doc_id = any(%s)
+                )
+                select
+                    id,
+                    doc_id,
+                    doc_type,
+                    chunk_text,
+                    title,
+                    folder,
+                    path_hint
+                from ranked
+                where rn <= %s
+                order by title, rn
+                limit %s
+                """,
+                (CAMPAIGN_ID, doc_ids, limit_per_doc, total_limit),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "chunk_id": cid,
+            "doc_id": d,
+            "doc_type": t,
+            "chunk_text": c,
+            "distance": 0.0,
+            "title": title,
+            "folder": folder,
+            "path_hint": path_hint,
+        }
+        for (cid, d, t, c, title, folder, path_hint) in rows
+    ]
+
+
 def normalize_match_text(text: str) -> str:
     compact = " ".join((text or "").strip().lower().split())
     return "".join(
@@ -2763,6 +2819,33 @@ def has_likely_campaign_hits(hits: List[Dict[str, Any]], threshold: float = 0.88
 CAMPAIGN_NOT_FOUND_MESSAGE = "W notatkach kampanii nie znalazlem bezposredniej odpowiedzi na to pytanie."
 
 
+def is_campaign_overview_question(text: str) -> bool:
+    normalized = normalize_match_text(text)
+    patterns = (
+        "co to kampania",
+        "o czym jest kampania",
+        "o co chodzi w kampanii",
+        "powiedz mi o kampanii",
+        "opisz kampanie",
+        "opis kampanii",
+        "wiesz o co chodzi w kampanii",
+    )
+    return any(pattern in normalized for pattern in patterns) or (
+        "krew na gwiazdach" in normalized and any(word in normalized for word in ("co to", "czym jest", "opis", "opowiedz"))
+    )
+
+
+def is_first_part_campaign_question(text: str) -> bool:
+    normalized = normalize_match_text(text)
+    hints = ("pierwsza czesc", "pierwsza część", "pierwszy rozdzial", "rozdzial 1", "akt 1", "port peril", "shackles")
+    return any(hint in normalized for hint in hints)
+
+
+def is_morn_campaign_question(text: str) -> bool:
+    normalized = normalize_match_text(text)
+    return any(hint in normalized for hint in ("morn", "black eel", "dossier"))
+
+
 def boosted_doc_titles_for_question(question: str) -> List[str]:
     normalized = normalize_match_text(question)
     titles: List[str] = []
@@ -2864,13 +2947,95 @@ def merge_ranked_hits(primary: List[Dict[str, Any]], secondary: List[Dict[str, A
     return merged
 
 
+def is_irrelevant_campaign_doc(hit: Dict[str, Any]) -> bool:
+    title = normalize_match_text(hit.get("title") or "")
+    folder = normalize_match_text(hit.get("folder") or "")
+    if folder.startswith("00 admin"):
+        return True
+    if title == "index - docs ids":
+        return True
+    return False
+
+
+def campaign_doc_priority(question: str, hit: Dict[str, Any]) -> int:
+    normalized_title = normalize_match_text(hit.get("title") or "")
+    overview = is_campaign_overview_question(question)
+    first_part = is_first_part_campaign_question(question)
+    morn_case = is_morn_campaign_question(question)
+    score = 0
+
+    if is_irrelevant_campaign_doc(hit):
+        return -1000
+    if "krew na gwiazdach - rozdzial 1" in normalized_title:
+        score += 180 if overview or first_part else 90
+    if "przewodnik po shackles" in normalized_title:
+        score += 170 if overview or first_part else 80
+    if normalized_title == "places":
+        score += 150 if overview or first_part else 60
+    if normalized_title == "npcs":
+        score += 130 if overview or first_part or morn_case else 50
+    if normalized_title == "dossier morna - sprawa black eel":
+        score += 220 if morn_case or first_part else 70
+    if normalized_title == "secrets":
+        score += 160 if morn_case else 40
+    if normalized_title == "campaign bible":
+        score += 120 if overview else 60
+    if normalized_title == "events":
+        score += 90 if overview or first_part else 30
+    if normalized_title == "glossary":
+        score -= 30
+    if normalized_title == "thread tracker":
+        score -= 50 if overview else 10
+
+    distance = float(hit.get("distance") or 0.0)
+    score += max(0, int((1.2 - min(distance, 1.2)) * 100))
+    return score
+
+
+def shape_campaign_hits(question: str, hits: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    filtered = [hit for hit in hits if not is_irrelevant_campaign_doc(hit)]
+    if not filtered:
+        filtered = hits
+    ordered = sorted(
+        filtered,
+        key=lambda hit: (
+            -campaign_doc_priority(question, hit),
+            float(hit.get("distance") or 999.0),
+            normalize_match_text(hit.get("title") or ""),
+            normalize_match_text(hit.get("path_hint") or ""),
+        ),
+    )
+    per_doc_limit = 1 if is_campaign_overview_question(question) else 2
+    result_limit = max(top_k + 2, 8 if is_campaign_overview_question(question) else 6)
+    selected: List[Dict[str, Any]] = []
+    per_doc_counts: Dict[str, int] = {}
+    for hit in ordered:
+        doc_id = str(hit.get("doc_id") or "")
+        current = per_doc_counts.get(doc_id, 0)
+        if doc_id and current >= per_doc_limit:
+            continue
+        selected.append(hit)
+        if doc_id:
+            per_doc_counts[doc_id] = current + 1
+        if len(selected) >= result_limit:
+            break
+    return selected
+
+
 def augment_campaign_hits(question: str, hits: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
     boosted_titles = boosted_doc_titles_for_question(question)
     boosted_doc_ids = _lookup_doc_ids_by_title(boosted_titles)
     if not boosted_doc_ids:
-        return hits
+        return shape_campaign_hits(question, hits, top_k)
+    seeded_hits = leading_chunks_for_docs(
+        boosted_doc_ids,
+        limit_per_doc=1 if is_campaign_overview_question(question) else 2,
+        total_limit=min(max(top_k + 4, 8), 16),
+    )
     boosted_hits = vector_search_in_docs(question, boosted_doc_ids, min(max(top_k, 6), 12))
-    return merge_ranked_hits(boosted_hits, hits, limit=max(top_k + 4, 8))
+    merged = merge_ranked_hits(seeded_hits, boosted_hits, limit=max(top_k + 6, 10))
+    merged = merge_ranked_hits(merged, hits, limit=max(top_k + 8, 12))
+    return shape_campaign_hits(question, merged, top_k)
 
 
 def render_campaign_out(out: CampaignOut) -> str:
@@ -2917,6 +3082,39 @@ Dozwolony JSON:
   "format": "bullets" | "table",
   "bullets": ["..."],
   "table": {{"columns": ["..."], "rows": [["..."]]}},
+  "used_context": [1,2,3]
+}}
+
+KONTEKST (kazdy blok zawiera title, folder, doc_type i tresc chunku):
+{context}
+
+PYTANIE:
+{question}
+
+ODPOWIEDZ (tylko JSON):
+""".strip()
+
+
+def build_campaign_overview_prompt(question: str, context: str) -> str:
+    return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Odpowiadasz po polsku.
+
+ZASADY:
+1) Uzywaj wylacznie faktow z KONTEKSTU.
+2) Przy pytaniu ogolnym o kampanie zacznij od konkretu: gdzie zaczyna sie kampania, jaka jest pierwsza sprawa i na czym stoi Rozdzial 1.
+3) Jesli w KONTEKST sa materiały o Shackles, Port Peril albo Rozdziale 1, musisz je uwzglednic w pierwszych bulletach odpowiedzi.
+4) Motywy, ton i szeroka premisa maja byc dopiero po realiach startu kampanii.
+5) Ignoruj materialy administracyjne i techniczne listy dokumentow; nie traktuj ich jako tresci kampanii.
+6) Odpowiadaj konkretnie i pelnymi zdaniami, ale bez dopowiadania faktow spoza kontekstu.
+7) Jesli czegos nie ma w kontekscie, zwroc JSON z format="bullets" i bullets=["brak w notatkach"].
+8) W used_context podaj numery blokow, z ktorych skorzystales.
+9) Zwracaj wylacznie JSON. Bez markdown i bez tekstu dookola.
+
+Dozwolony JSON:
+{{
+  "format": "bullets" | "table",
+  "bullets": ["..."],
+  "table": {{"columns": ["..."], "rows": [["..."]]}} ,
   "used_context": [1,2,3]
 }}
 
@@ -3408,7 +3606,12 @@ def ask(req: AskRequest):
         hits = augment_campaign_hits(q, hits, req.top_k)
         context = build_campaign_context(hits)
         analysis_mode = is_campaign_analysis_question(q)
-        prompt_builder = build_campaign_analysis_prompt if analysis_mode else build_campaign_prompt
+        if analysis_mode:
+            prompt_builder = build_campaign_analysis_prompt
+        elif is_campaign_overview_question(q):
+            prompt_builder = build_campaign_overview_prompt
+        else:
+            prompt_builder = build_campaign_prompt
         prompt = prompt_builder(q, context)
 
         raw = gemini_generate(

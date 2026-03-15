@@ -300,6 +300,29 @@ class ChatServiceTest(unittest.TestCase):
         self.assertEqual(response.reply_markdown, "To wyglada na analize kampanii.")
         self.assertIn("Sprawdź mi zgodność logiczną kampanii Krew Na Gwiazdach.", seen["message"])
 
+    def test_run_derives_campaign_title_from_question(self):
+        def fake_chat(_req):
+            return ChatResponse(kind="answer", reply="Opis kampanii oparty o notatki.", references=[])
+
+        service = self.build_service(fake_chat, FakeConversationStore())
+        response = service.run(
+            trace=RequestTrace(request_id="req-7", trace_id="req-7"),
+            message="Co to kampania Krew Na Gwiazdach?",
+            assistant_mode=AssistantMode.create,
+            intent="answer",
+            artifact_type=None,
+            source_title=None,
+            candidate_text=None,
+            include_sources=False,
+            include_telemetry=False,
+            save_output=False,
+            output_title=None,
+            conversation_id=None,
+            conversation_title=None,
+        )
+
+        self.assertEqual(response.title, "Krew Na Gwiazdach: opis kampanii")
+
 
 if __name__ == "__main__":
     unittest.main()

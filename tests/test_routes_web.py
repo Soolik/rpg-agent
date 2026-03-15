@@ -33,6 +33,7 @@ class RoutesWebTest(unittest.TestCase):
         self.assertNotIn("&quot;apiBase&quot;", body)
         self.assertIn('e.message.addEventListener("keydown"', body)
         self.assertIn('if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing) return;', body)
+        self.assertIn('include_sources: true', body)
         self.assertIn("/v1", body)
 
 

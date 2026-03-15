@@ -207,6 +207,7 @@ class ChatFlowTest(unittest.TestCase):
     def test_augment_campaign_hits_adds_shackles_documents_for_broad_campaign_questions(self):
         original_drive_store = getattr(main, "drive_store_v2", None)
         original_vector_search_in_docs = main.vector_search_in_docs
+        original_leading_chunks_for_docs = main.leading_chunks_for_docs
 
         class FakeDriveStore:
             def list_world_docs(self):
@@ -232,9 +233,25 @@ class ChatFlowTest(unittest.TestCase):
                 }
             ]
 
+        def fake_leading_chunks_for_docs(doc_ids, limit_per_doc=1, total_limit=12):
+            seen["seed_doc_ids"] = doc_ids
+            return [
+                {
+                    "chunk_id": "seed-1",
+                    "doc_id": "doc-r1",
+                    "doc_type": "gdoc",
+                    "chunk_text": "Rozdzial 1 zaczyna sie w Port Peril.",
+                    "distance": 0.0,
+                    "title": "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+                    "folder": "02 Sessions",
+                    "path_hint": "02 Sessions / Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+                }
+            ]
+
         try:
             main.drive_store_v2 = FakeDriveStore()
             main.vector_search_in_docs = fake_vector_search_in_docs
+            main.leading_chunks_for_docs = fake_leading_chunks_for_docs
             merged = main.augment_campaign_hits(
                 "Co to kampania Krew Na Gwiazdach?",
                 [
@@ -254,9 +271,52 @@ class ChatFlowTest(unittest.TestCase):
         finally:
             main.drive_store_v2 = original_drive_store
             main.vector_search_in_docs = original_vector_search_in_docs
+            main.leading_chunks_for_docs = original_leading_chunks_for_docs
 
         self.assertIn("doc-shackles", seen["doc_ids"])
-        self.assertEqual(merged[0]["title"], "Przewodnik po Shackles")
+        self.assertIn("doc-r1", seen["seed_doc_ids"])
+        self.assertEqual(merged[0]["title"], "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
+
+    def test_shape_campaign_hits_filters_admin_docs_and_prioritizes_chapter_one(self):
+        hits = main.shape_campaign_hits(
+            "Co to kampania Krew Na Gwiazdach?",
+            [
+                {
+                    "chunk_id": "admin-1",
+                    "doc_id": "admin-doc",
+                    "doc_type": "gdoc",
+                    "chunk_text": "Lista identyfikatorow dokumentow.",
+                    "distance": 0.01,
+                    "title": "Index - Docs IDs",
+                    "folder": "00 Admin",
+                    "path_hint": "00 Admin / Index - Docs IDs",
+                },
+                {
+                    "chunk_id": "bible-1",
+                    "doc_id": "doc-bible",
+                    "doc_type": "gdoc",
+                    "chunk_text": "Ogólny opis kampanii.",
+                    "distance": 0.22,
+                    "title": "Campaign Bible",
+                    "folder": "01 Bible",
+                    "path_hint": "01 Bible / Campaign Bible",
+                },
+                {
+                    "chunk_id": "chapter-1",
+                    "doc_id": "doc-r1",
+                    "doc_type": "gdoc",
+                    "chunk_text": "Rozdzial 1 zaczyna sie w Port Peril.",
+                    "distance": 0.45,
+                    "title": "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+                    "folder": "02 Sessions",
+                    "path_hint": "02 Sessions / Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+                },
+            ],
+            6,
+        )
+
+        self.assertTrue(all(hit["title"] != "Index - Docs IDs" for hit in hits))
+        self.assertEqual(hits[0]["title"], "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
 
     def test_chat_answer_returns_human_text_with_sources(self):
         original_ask = main.ask
