@@ -200,6 +200,26 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
     return out.join("") || `<p>${renderInline(text || "")}</p>`;
   }
   const chip = (n, t, x) => { n.className = `chip ${t}`; n.textContent = x; };
+  function syncComposer() {
+    const busy = s.pending >= 0;
+    e.send.disabled = !s.authenticated || busy;
+    e.send.textContent = busy ? "Trwa..." : "Wyslij";
+  }
+  function buildPendingCopy(req) {
+    const lines = ["Analizuje kontekst kampanii i przygotowuje odpowiedz."];
+    if (req.candidate_text) lines.push("Sprawdzam tez dodatkowy tekst wzgledem kanonu i logiki swiata.");
+    if (req.save_output) {
+      lines.push(`Po wygenerowaniu zapisze wynik do Google Drive${req.output_title ? ` jako \"${req.output_title}\"` : ""}.`);
+    } else {
+      lines.push("Odpowiedz pojawi sie tutaj, gdy tylko agent skonczy skladac calosc.");
+    }
+    return lines.join("\\n\\n");
+  }
+  function buildPendingStatus(req) {
+    if (req.save_output) return req.output_title ? `Generuje odpowiedz i zapisze do Drive: ${req.output_title}` : "Generuje odpowiedz i zapisze do Drive";
+    if (req.candidate_text) return "Analizuje kanon i przygotowuje odpowiedz";
+    return "Analizuje kontekst i przygotowuje odpowiedz";
+  }
   async function request(path, opt = {}) {
     const headers = new Headers(opt.headers || {});
     if (opt.json !== undefined) headers.set("Content-Type", "application/json; charset=utf-8");
@@ -235,7 +255,7 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
     e.connectDrive.disabled = !s.authenticated;
     e.newConv.disabled = !s.authenticated;
     e.refreshConv.disabled = !s.authenticated;
-    e.send.disabled = !s.authenticated;
+    syncComposer();
   }
   function renderDriveDisconnected() {
     chip(e.drive, "warn", "Drive niepolaczony");
@@ -273,6 +293,7 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
       if (m.continuity?.issues?.length) meta.push(`<div class="meta"><h4>Continuity</h4><ul>${m.continuity.issues.map(x => `<li>[${esc(x.severity)}] ${esc(x.message)}</li>`).join("")}</ul></div>`);
       if (m.output?.doc_id) meta.push(`<div class="meta"><h4>Output</h4><a target="_blank" rel="noopener noreferrer" href="https://docs.google.com/document/d/${encodeURIComponent(m.output.doc_id)}/edit">${esc(m.output.title || "Otworz dokument")}</a></div>`);
       if (m.stream) meta.push(`<div class="meta"><h4>Streaming</h4><div>${esc(m.stream.selected_mode || "")} / ${esc(m.stream.reason || "")}</div></div>`);
+      if (m.pending && m.statusLabel) meta.push(`<div class="meta"><h4>Status</h4><div>${esc(m.statusLabel)}</div></div>`);
       const actions = (m.actions || []).map(a => `<button class="secondary" type="button" data-action="${esc(a.type)}" data-payload="${encodeURIComponent(JSON.stringify(a.payload || {}))}" data-index="${i}">${esc(a.label)}</button>`).join("");
       return `<article class="msg ${esc(m.role)} ${m.pending ? "pending" : ""}"><div class="head"><span>${esc(m.role === "user" ? "MG" : "Agent")}</span><span>${esc(m.kind || "")}</span></div>${m.title ? `<h3>${esc(m.title)}</h3>` : ""}<div class="body">${renderMarkdown(m.content || "")}</div>${meta.join("")}<div class="row" style="margin-top:12px">${actions}</div></article>`;
     }).join("");
@@ -326,21 +347,27 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
     const req = { message: text, mode: "auto", stream: true, include_sources: true, save_output: e.saveOutput.checked, output_title: e.outputTitle.value.trim() || null };
     if (extraText) req.candidate_text = extraText;
     const endpoint = s.cid ? `/conversations/${s.cid}/messages` : "/chat";
+    const pendingStatus = buildPendingStatus(req);
     s.msgs.push({ role: "user", kind: "input", title: "", content: text, actions: [], warnings: [], citations: [], continuity: null, output: null, stream: null });
     s.pending = s.msgs.length;
-    s.msgs.push({ role: "assistant", kind: "stream", title: "Agent pisze", content: "", actions: [], warnings: [], citations: [], continuity: null, output: null, stream: null, pending: true });
+    s.msgs.push({ role: "assistant", kind: "stream", title: "Agent pracuje", content: buildPendingCopy(req), actions: [], warnings: [], citations: [], continuity: null, output: null, stream: null, pending: true, placeholder: true, statusLabel: pendingStatus });
     renderMsgs();
+    syncComposer();
     e.message.value = "";
-    chip(e.stream, "ok", "Streaming odpowiedzi...");
+    chip(e.stream, "warn", pendingStatus);
     try {
       const response = await request(endpoint, { method: "POST", json: req });
       await consume(response);
       await loadSession();
-      chip(e.stream, "ok", "Streaming gotowy");
+      const lastMessage = s.msgs[s.msgs.length - 1] || null;
+      chip(e.stream, "ok", lastMessage?.output?.doc_id ? "Odpowiedz gotowa, zapisano do Drive" : "Odpowiedz gotowa");
+      syncComposer();
     } catch (err) {
       s.msgs[s.pending] = { role: "assistant", kind: "error", title: "Blad", content: err.message, actions: [], warnings: [], citations: [], continuity: null, output: null, stream: null };
+      s.pending = -1;
       renderMsgs();
       chip(e.stream, "bad", "Blad streamingu");
+      syncComposer();
     }
   }
   async function consume(response) {
@@ -370,12 +397,23 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
     const payload = data.length ? JSON.parse(data.join("\\n")) : {};
     if (type === "start") {
       if (payload.conversation_id) s.cid = payload.conversation_id;
-      if (s.pending >= 0) s.msgs[s.pending].stream = payload.stream_debug || null;
+      if (s.pending >= 0) {
+        s.msgs[s.pending].stream = payload.stream_debug || null;
+        s.msgs[s.pending].statusLabel = payload.stream_debug?.selected_mode === "buffered" ? "Agent sklada pelna odpowiedz..." : "Agent streamuje odpowiedz...";
+      }
+      chip(e.stream, payload.stream_debug?.selected_mode === "buffered" ? "warn" : "ok", payload.stream_debug?.selected_mode === "buffered" ? "Agent sklada pelna odpowiedz..." : "Agent streamuje odpowiedz...");
       renderMsgs();
       return;
     }
     if (type === "delta") {
-      if (s.pending >= 0) s.msgs[s.pending].content += payload.text || "";
+      if (s.pending >= 0) {
+        if (s.msgs[s.pending].placeholder) {
+          s.msgs[s.pending].content = payload.text || "";
+          s.msgs[s.pending].placeholder = false;
+        } else {
+          s.msgs[s.pending].content += payload.text || "";
+        }
+      }
       renderMsgs();
       return;
     }
@@ -385,6 +423,8 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
       s.cid = payload.conversation_id || s.cid;
       s.title = payload.conversation_title || s.title;
       if (s.title) e.heroTitle.textContent = s.title;
+      chip(e.stream, "ok", payload.output?.doc_id ? "Odpowiedz gotowa, zapisano do Drive" : "Odpowiedz gotowa");
+      syncComposer();
       renderMsgs();
     }
   }

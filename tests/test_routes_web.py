@@ -41,6 +41,10 @@ class RoutesWebTest(unittest.TestCase):
         self.assertIn("window.location.assign('/v1/auth/google-drive/start'); return false;", body)
         self.assertIn('window.addEventListener("focus"', body)
         self.assertIn('window.addEventListener("pageshow"', body)
+        self.assertIn('Analizuje kontekst kampanii i przygotowuje odpowiedz.', body)
+        self.assertIn('Generuje odpowiedz i zapisze do Drive', body)
+        self.assertIn('e.send.textContent = busy ? "Trwa..." : "Wyslij";', body)
+        self.assertIn('if (s.msgs[s.pending].placeholder)', body)
         self.assertIn("/v1", body)
 
     def test_gm_page_renders_authenticated_session_from_cookie(self):

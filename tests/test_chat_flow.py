@@ -1098,6 +1098,57 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("Jak uzyc tej postaci na sesji:\n* Moze zlecic BG", artifact_text)
         self.assertNotIn("Do doprecyzowania.", artifact_text)
 
+    def test_generate_creative_artifact_npc_brief_retries_existing_identity_for_original_request(self):
+        original_generate = main.gemini_generate
+        original_build_world_model_context = main.build_world_model_context
+        original_build_recent_sessions_context = main.build_recent_sessions_context
+        original_build_context_for_planner = main.build_context_for_planner
+        original_vector_search = main.vector_search
+        original_render_source_labels = main.render_source_labels
+        outputs = iter(
+            [
+                "Ressa Vane",
+                "Mara Flint",
+                "Portowa kwatermistrzyni, ktora utrzymuje zaloge przy zyciu dzieki dlugom, przyslugom i szemranym dostawom.",
+                "Zawsze pachnie sola, rumem i smola, a jej spokoj jest bardziej niepokojacy niz krzyk.",
+                "Chce zbudowac wlasna, niezalezna siec dostaw w Port Peril, zanim silniejsi gracze odetna jej droge ucieczki.",
+                "Ukrywa, ze czesc jej zapasow pochodzi z celowo opoznianych rozladunkow i sabotowanych manifestow.",
+                "* Port Peril: zna glodne brzuchy, zachlannych dokmistrzow i najlepsze miejsca na nieoficjalny handel.\n* Shackles: traktuje archipelag jak rynek, ktory mozna przezyc tylko dzieki szybkim dlugom i jeszcze szybszym przyslugom.\n* BG: sprawdza, czy nadaja sie do pracy, zanim sprzeda im chocby wiadro wody.",
+                "* Moze wynajac BG do odzyskania ladunku, ktorego oficjalnie nigdy nie bylo.\n* Moze byc laczniczka miedzy biedniejszymi zalogami a szemranym handlem w porcie.\n* Moze sprzedac BG prawde o cudzym dlugu, ale tylko jesli uzna ich za bardziej uzytecznych niz niebezpiecznych.",
+            ]
+        )
+
+        prompts = []
+
+        def fake_generate(prompt, **kwargs):
+            prompts.append(prompt)
+            return next(outputs)
+
+        try:
+            main.gemini_generate = fake_generate
+            main.build_world_model_context = lambda limit=30: "KNOWN ENTITIES:\n- npc: Ressa Vane\n- location: Port Peril\nKNOWN THREADS:\n- T01 | Red Blade"
+            main.build_recent_sessions_context = lambda limit=5: "RECENT SESSIONS:\n- session_id=1 | source=Session 05 | summary=Ressa Vane zniknela z dokow Port Peril."
+            main.build_context_for_planner = lambda drive_store: "Campaign context about Port Peril."
+            main.vector_search = lambda message, top_k: []
+            main.render_source_labels = lambda hits: []
+
+            artifact_text, references = main.generate_creative_artifact(
+                message="Wymyśl postać piracką pasującą do Shackles i Portu Peril.",
+                artifact_type="npc_brief",
+            )
+        finally:
+            main.gemini_generate = original_generate
+            main.build_world_model_context = original_build_world_model_context
+            main.build_recent_sessions_context = original_build_recent_sessions_context
+            main.build_context_for_planner = original_build_context_for_planner
+            main.vector_search = original_vector_search
+            main.render_source_labels = original_render_source_labels
+
+        self.assertEqual(references, [])
+        self.assertIn("Imie: Mara Flint", artifact_text)
+        self.assertNotIn("Imie: Ressa Vane", artifact_text)
+        self.assertTrue(any("nowa, oryginalna postac" in prompt.lower() for prompt in prompts))
+
     def test_ensure_artifact_shape_appends_missing_sections(self):
         original_generate = main.gemini_generate
         try:

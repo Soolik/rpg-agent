@@ -1453,6 +1453,105 @@ PROPER_NOUN_IGNORE_KEYS = {
     "tytul",
 }
 
+NPC_FRESH_ANGLES = [
+    "pilot raf i bocznych torow wodnych, ktory zna sekrety podejsc do Port Peril lepiej niz oficjalne mapy",
+    "kwatermistrzyni od dlugow, brakow i szemranych dostaw, trzymajaca zaloge w garsci rachunkami i przyslugami",
+    "nurek wrakowy i lowca ladunkow z dna, przyzwyczajony do ciszy, cisnienia i obcych rzeczy wyciaganych z wrakow",
+    "chirurzka pokladowa po przejsciach, ktora leczy piratow, ale handluje tez sekretami uslyszanymi przy stole operacyjnym",
+    "szkutnik i sabotarz, ktory potrafi ocenic statek po jednym skrzypnieciu i zniszczyc go bez jednego wystrzalu",
+    "portowa brokerka plotek i kontrabandowych kontraktow, zawsze o krok od katastrofy finansowej albo naglego awansu",
+    "harpunnik z reputacja przesadnego szczesciarza, ktorego ludzie boja sie bardziej niz lubia",
+    "kaplanka sztormu na uslugach kapitanow, rozdzierana miedzy omenami morza a brutalna praktyka Shackles",
+]
+
+
+def normalize_creative_request_text(value: str) -> str:
+    compact = " ".join(normalize_text_artifacts(value or "").strip().lower().split())
+    return "".join(ch for ch in unicodedata.normalize("NFKD", compact) if not unicodedata.combining(ch))
+
+
+def message_requests_original_character(message: str) -> bool:
+    latest = extract_latest_user_message(message) or message
+    normalized = normalize_creative_request_text(latest)
+    if not normalized:
+        return False
+    if "npc brief" in normalized and any(token in normalized for token in ("nowy", "nowego", "inna", "inna postac", "wymysl", "stworz")):
+        return True
+    return any(verb in normalized for verb in ("wymysl", "pomysl", "zaproponuj", "stworz")) and any(
+        noun in normalized for noun in ("postac", "bohatera", "bohaterke", "pirata", "piratke", "kapitana", "kapitanke", "npc")
+    )
+
+
+def extract_recent_generated_character_names(message: str, limit: int = 8) -> List[str]:
+    normalized = normalize_text_artifacts(message or "")
+    seen = set()
+    names: List[str] = []
+    for match in re.findall(r"(?im)^Imie:\s*(.+)$", normalized):
+        cleaned = re.sub(r"\s+", " ", match).strip().strip(" -*:;,.!?()[]{}\"'")
+        key = normalize_world_model_key(cleaned)
+        if not cleaned or not key or key in seen:
+            continue
+        seen.add(key)
+        names.append(cleaned)
+        if len(names) >= limit:
+            break
+    return names
+
+
+def pick_npc_fresh_angle(message: str) -> str:
+    normalized = normalize_creative_request_text(message)
+    if not normalized:
+        return NPC_FRESH_ANGLES[0]
+    digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+    return NPC_FRESH_ANGLES[digest[0] % len(NPC_FRESH_ANGLES)]
+
+
+def candidate_reuses_existing_character_identity(candidate: str, disallowed_names: List[str]) -> bool:
+    candidate_key = normalize_world_model_key(candidate)
+    if not candidate_key:
+        return False
+
+    candidate_parts = [part for part in re.split(r"\s+", candidate_key) if part]
+    for existing in disallowed_names:
+        existing_key = normalize_world_model_key(existing)
+        if not existing_key:
+            continue
+        if candidate_key == existing_key or candidate_key in existing_key or existing_key in candidate_key:
+            return True
+        existing_parts = [part for part in re.split(r"\s+", existing_key) if part]
+        if len(candidate_parts) >= 2 and len(existing_parts) >= 2 and candidate_parts[-1] == existing_parts[-1]:
+            return True
+    return False
+
+
+def build_original_character_guidance(
+    *,
+    marker: str,
+    message: str,
+    disallowed_names: List[str],
+) -> str:
+    angle = pick_npc_fresh_angle(message)
+    if marker == "Imie:":
+        blocked = "\n".join(f"- {name}" for name in disallowed_names[:8]) if disallowed_names else "- [brak]"
+        return "\n".join(
+            [
+                "To ma byc nowa, oryginalna postac, a nie istniejaca postac z kanonu ani jej reskin.",
+                f"Jesli prosba jest szeroka, nadaj postaci swiezy kierunek: {angle}.",
+                "Wymysl nowe imie albo imie i nazwisko brzmiace wiarygodnie dla Shackles i Port Peril.",
+                "Nie uzywaj zadnego z tych istniejacych imion ani nazwisk:",
+                blocked,
+            ]
+        )
+    return "\n".join(
+        [
+            "To ma byc nowa, oryginalna postac, a nie ukryta tozsamosc ani przerobka istniejacej postaci z kanonu.",
+            f"Jesli prosba jest szeroka, oprzyj postac o swiezy kierunek: {angle}.",
+            "Uzywaj istniejacego lore jako tla, nacisku lub punktu zaczepienia, ale nie buduj calej postaci wokol jednego glownego watku z kontekstu, jesli uzytkownik tego nie zazadal.",
+            "Unikaj domyslnego schematu: powracajacy swiadek, dawna zdrada, zemsta za Black Eel, ukryty krewny glownej postaci.",
+            "Kazda sekcja ma pokazywac inny wymiar tej postaci: fach, styl bycia, presje dnia codziennego, przewage, slabosc i realna uzytecznosc na sesji.",
+        ]
+    )
+
 
 def section_disallows_new_proper_nouns(artifact_type: ArtifactType, marker: str) -> bool:
     return not (artifact_type == "npc_brief" and marker == "Imie:")
@@ -2095,6 +2194,8 @@ def generate_section_candidate(
     canonical_names: List[str],
     prior_sections_text: str,
     require_canonical_name: bool,
+    original_character_request: bool = False,
+    disallowed_character_names: Optional[List[str]] = None,
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
     allowed_proper_nouns = collect_section_allowed_proper_nouns(
@@ -2109,6 +2210,15 @@ def generate_section_candidate(
         artifact_type,
         marker,
         allowed_proper_nouns,
+    )
+    original_character_rule = (
+        build_original_character_guidance(
+            marker=marker,
+            message=message,
+            disallowed_names=disallowed_character_names or [],
+        )
+        if artifact_type == "npc_brief" and original_character_request
+        else ""
     )
     markers = artifact_required_markers(artifact_type)
     is_last_marker = marker == markers[-1]
@@ -2135,6 +2245,9 @@ ZASADY:
 
 OGRANICZENIA DLA NAZW WLASNYCH:
 {proper_noun_rule or 'Brak dodatkowych ograniczen.'}
+
+ORYGINALNOSC POSTACI:
+{original_character_rule or 'Brak dodatkowych regul oryginalnosci.'}
 
 AKTUALNY MODEL SWIATA:
 {structured_context}
@@ -2195,13 +2308,21 @@ ZWROC TYLKO TRESC SEKCJI:
         if section_disallows_new_proper_nouns(artifact_type, marker)
         else []
     )
+    reused_character_identity = (
+        artifact_type == "npc_brief"
+        and original_character_request
+        and marker == "Imie:"
+        and candidate_reuses_existing_character_identity(candidate, disallowed_character_names or [])
+    )
     missing_name = require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)
-    if needs_retry or missing_name or unknown_proper_nouns:
+    if needs_retry or missing_name or unknown_proper_nouns or reused_character_identity:
         retry_rule = section_retry_rule(artifact_type, marker)
         if require_canonical_name and canonical_names:
             retry_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
         if unknown_proper_nouns:
             retry_rule += " Usun nowe nazwy wlasne spoza dozwolonej listy, zwlaszcza: " + ", ".join(unknown_proper_nouns) + "."
+        if reused_character_identity:
+            retry_rule += " Imie musi nalezec do nowej, oryginalnej postaci. Nie powtarzaj zadnego istniejacego imienia ani nazwiska z kontekstu."
         try:
             retry_candidate = run_prompt(retry_rule, temperature=0.35)
             if retry_candidate:
@@ -2226,7 +2347,12 @@ ZWROC TYLKO TRESC SEKCJI:
         marker=marker,
         content=candidate,
         is_last_marker=is_last_marker,
-    ) or (require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)) or unknown_proper_nouns:
+    ) or (require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)) or unknown_proper_nouns or (
+        artifact_type == "npc_brief"
+        and original_character_request
+        and marker == "Imie:"
+        and candidate_reuses_existing_character_identity(candidate, disallowed_character_names or [])
+    ):
         candidate = repair_creative_section(
             artifact_type=artifact_type,
             marker=marker,
@@ -2239,6 +2365,8 @@ ZWROC TYLKO TRESC SEKCJI:
             prior_sections_text=prior_sections_text,
             broken_content=candidate,
             require_canonical_name=require_canonical_name,
+            original_character_request=original_character_request,
+            disallowed_character_names=disallowed_character_names,
         )
         attempts.append(
             {
@@ -2253,10 +2381,17 @@ ZWROC TYLKO TRESC SEKCJI:
         marker=marker,
         content=candidate,
         is_last_marker=is_last_marker,
+    ) or (
+        artifact_type == "npc_brief"
+        and original_character_request
+        and marker == "Imie:"
+        and candidate_reuses_existing_character_identity(candidate, disallowed_character_names or [])
     ):
         compact_rule = compact_retry_rule(artifact_type, marker)
         if require_canonical_name and canonical_names:
             compact_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
+        if artifact_type == "npc_brief" and original_character_request and marker == "Imie:":
+            compact_rule += " Wygeneruj nowe imie lub imie i nazwisko, inne niz jakakolwiek znana postac z kontekstu."
         try:
             compact_candidate = run_prompt(compact_rule, temperature=0.25)
             if compact_candidate:
@@ -2277,6 +2412,21 @@ ZWROC TYLKO TRESC SEKCJI:
         if section_disallows_new_proper_nouns(artifact_type, marker)
         else []
     )
+    if (
+        artifact_type == "npc_brief"
+        and original_character_request
+        and marker == "Imie:"
+        and candidate_reuses_existing_character_identity(final_candidate, disallowed_character_names or [])
+    ):
+        try:
+            forced_candidate = run_prompt(
+                "Zwroc calkiem nowe imie albo imie i nazwisko dla oryginalnej postaci pirackiej. Nie powtarzaj zadnej istniejacej postaci ani nazwiska z kontekstu.",
+                temperature=0.6,
+            )
+            if forced_candidate and not candidate_reuses_existing_character_identity(forced_candidate, disallowed_character_names or []):
+                final_candidate = forced_candidate
+        except Exception:
+            pass
     record_telemetry(
         "sections",
         {
@@ -2315,6 +2465,8 @@ def generate_bullet_item(
     existing_items: List[str],
     require_canonical_name: bool,
     target_index: int,
+    original_character_request: bool = False,
+    disallowed_character_names: Optional[List[str]] = None,
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
     allowed_proper_nouns = collect_section_allowed_proper_nouns(
@@ -2330,6 +2482,15 @@ def generate_bullet_item(
         artifact_type,
         marker,
         allowed_proper_nouns,
+    )
+    original_character_rule = (
+        build_original_character_guidance(
+            marker=marker,
+            message=message,
+            disallowed_names=disallowed_character_names or [],
+        )
+        if artifact_type == "npc_brief" and original_character_request
+        else ""
     )
     existing_items_text = "\n".join(f"* {item}" for item in existing_items) or "[brak]"
     prompt = f"""
@@ -2359,6 +2520,9 @@ ZASADY:
 
 OGRANICZENIA DLA NAZW WLASNYCH:
 {proper_noun_rule or 'Brak dodatkowych ograniczen.'}
+
+ORYGINALNOSC POSTACI:
+{original_character_rule or 'Brak dodatkowych regul oryginalnosci.'}
 
 AKTUALNY MODEL SWIATA:
 {structured_context}
@@ -2437,6 +2601,8 @@ def repair_creative_section(
     prior_sections_text: str,
     broken_content: str,
     require_canonical_name: bool,
+    original_character_request: bool = False,
+    disallowed_character_names: Optional[List[str]] = None,
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
     allowed_proper_nouns = collect_section_allowed_proper_nouns(
@@ -2452,6 +2618,15 @@ def repair_creative_section(
         artifact_type,
         marker,
         allowed_proper_nouns,
+    )
+    original_character_rule = (
+        build_original_character_guidance(
+            marker=marker,
+            message=message,
+            disallowed_names=disallowed_character_names or [],
+        )
+        if artifact_type == "npc_brief" and original_character_request
+        else ""
     )
     prompt = f"""
 Jestes wspolautorem kampanii RPG "Krew Na Gwiazdach". Pisz po polsku.
@@ -2477,6 +2652,9 @@ ZASADY:
 OGRANICZENIA DLA NAZW WLASNYCH:
 {proper_noun_rule or 'Brak dodatkowych ograniczen.'}
 
+ORYGINALNOSC POSTACI:
+{original_character_rule or 'Brak dodatkowych regul oryginalnosci.'}
+
 AKTUALNY MODEL SWIATA:
 {structured_context}
 
@@ -2498,6 +2676,7 @@ WADLIWA WERSJA TEJ SEKCJI:
 DODATKOWA REGULA:
 {section_retry_rule(artifact_type, marker)}
 {" Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "." if require_canonical_name and canonical_names else ""}
+{" Imie musi nalezec do nowej, oryginalnej postaci, a nie do istniejacej osoby z kontekstu." if artifact_type == "npc_brief" and original_character_request and marker == "Imie:" else ""}
 
 ZWROC TYLKO POPRAWIONA TRESC SEKCJI:
 """.strip()
@@ -2518,6 +2697,13 @@ ZWROC TYLKO POPRAWIONA TRESC SEKCJI:
             unknown_proper_nouns = find_unknown_proper_nouns(repaired, allowed_proper_nouns)
             if unknown_proper_nouns:
                 return ""
+        if (
+            artifact_type == "npc_brief"
+            and original_character_request
+            and marker == "Imie:"
+            and candidate_reuses_existing_character_identity(repaired, disallowed_character_names or [])
+        ):
+            return ""
         return repaired
     except Exception:
         return sanitize_generated_section(marker, broken_content)
@@ -2535,6 +2721,8 @@ def generate_creative_section(
     canonical_names: List[str],
     prior_sections_text: str,
     require_canonical_name: bool,
+    original_character_request: bool = False,
+    disallowed_character_names: Optional[List[str]] = None,
 ) -> str:
     if is_bullet_section_marker(artifact_type, marker):
         candidate = generate_section_candidate(
@@ -2548,6 +2736,8 @@ def generate_creative_section(
             canonical_names=canonical_names,
             prior_sections_text=prior_sections_text,
             require_canonical_name=require_canonical_name,
+            original_character_request=original_character_request,
+            disallowed_character_names=disallowed_character_names,
         )
         items = complete_bullet_items(candidate)
         initial_item_count = len(items)
@@ -2567,6 +2757,8 @@ def generate_creative_section(
                 existing_items=items,
                 require_canonical_name=require_canonical_name,
                 target_index=len(items) + 1,
+                original_character_request=original_character_request,
+                disallowed_character_names=disallowed_character_names,
             )
             if not next_item:
                 break
@@ -2586,6 +2778,8 @@ def generate_creative_section(
                 existing_items=items[1:] if len(items) > 1 else [],
                 require_canonical_name=True,
                 target_index=1,
+                original_character_request=original_character_request,
+                disallowed_character_names=disallowed_character_names,
             )
             if replacement:
                 if items:
@@ -2626,6 +2820,8 @@ def generate_creative_section(
         canonical_names=canonical_names,
         prior_sections_text=prior_sections_text,
         require_canonical_name=require_canonical_name,
+        original_character_request=original_character_request,
+        disallowed_character_names=disallowed_character_names,
     )
 
 
@@ -2641,6 +2837,23 @@ def generate_structured_creative_artifact(
     section_values: Dict[str, str] = {}
     if artifact_type == "pre_session_brief":
         section_values["# Pre-Session Brief"] = ""
+    original_character_request = artifact_type == "npc_brief" and message_requests_original_character(message)
+    disallowed_character_names = (
+        collect_allowed_proper_nouns(
+            message,
+            world_context,
+            structured_context,
+            recent_sessions_context,
+            canonical_names=canonical_names,
+        )
+        if original_character_request
+        else []
+    )
+    if original_character_request:
+        for prior_name in extract_recent_generated_character_names(message):
+            key = normalize_world_model_key(prior_name)
+            if key and all(normalize_world_model_key(existing) != key for existing in disallowed_character_names):
+                disallowed_character_names.append(prior_name)
     specs = creative_section_specs(artifact_type)
     for spec in specs:
         body = generate_creative_section(
@@ -2654,6 +2867,8 @@ def generate_structured_creative_artifact(
             canonical_names=canonical_names,
             prior_sections_text=render_partial_artifact_sections(section_values, artifact_type),
             require_canonical_name=bool(spec.get("require_canonical_name")),
+            original_character_request=original_character_request,
+            disallowed_character_names=disallowed_character_names,
         )
         section_values[spec["marker"]] = body
     artifact_text = render_partial_artifact_sections(section_values, artifact_type)
