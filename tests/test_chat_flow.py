@@ -261,6 +261,60 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("Port Peril", response.answer)
         self.assertIn("sprawy Morna", response.answer)
 
+    def test_ask_campaign_answer_falls_back_to_text_when_json_says_brak_w_notatkach(self):
+        original_vector_search = main.vector_search
+        original_gemini_generate = main.gemini_generate
+        original_augment_campaign_hits = main.augment_campaign_hits
+        seen = {"calls": []}
+
+        hits = [
+            {
+                "chunk_id": 1,
+                "doc_id": "doc-morn",
+                "doc_type": "gdoc",
+                "chunk_text": "Sprawa Morna dotyczy Black Eel i falszywych dokumentow przewozowych.",
+                "distance": 0.18,
+                "title": "Dossier Morna - sprawa Black Eel",
+                "folder": "02 Sessions",
+                "path_hint": "02 Sessions / Dossier Morna - sprawa Black Eel",
+            }
+        ]
+
+        def fake_vector_search(question, top_k):
+            return hits
+
+        def fake_gemini_generate(prompt, **kwargs):
+            seen["calls"].append(prompt)
+            if kwargs.get("response_mime_type") == "application/json":
+                return main.json.dumps(
+                    {
+                        "format": "bullets",
+                        "bullets": ["brak w notatkach"],
+                        "used_context": [1],
+                    },
+                    ensure_ascii=False,
+                )
+            return "- Sprawa Morna dotyczy Black Eel i falszywych dokumentow przewozowych."
+
+        try:
+            main.vector_search = fake_vector_search
+            main.augment_campaign_hits = lambda question, current_hits, top_k: current_hits
+            main.gemini_generate = fake_gemini_generate
+            response = main.ask(
+                main.AskRequest(
+                    question="Coś o sprawie Morna w Shackles?",
+                    include_sources=False,
+                )
+            )
+        finally:
+            main.vector_search = original_vector_search
+            main.augment_campaign_hits = original_augment_campaign_hits
+            main.gemini_generate = original_gemini_generate
+
+        self.assertEqual(len(seen["calls"]), 2)
+        self.assertIn("Sprawa Morna", response.answer)
+        self.assertIn("Black Eel", response.answer)
+
     def test_augment_campaign_hits_adds_shackles_documents_for_broad_campaign_questions(self):
         original_drive_store = getattr(main, "drive_store_v2", None)
         original_vector_search_in_docs = main.vector_search_in_docs

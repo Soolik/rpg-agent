@@ -3679,16 +3679,17 @@ POPRAWNY OUTPUT (tylko JSON):
             answer = gemini_generate(
                 build_campaign_text_prompt(q, context),
                 temperature=0.2,
-                max_output_tokens=1800,
+                max_output_tokens=2200,
             ).strip()
-        if analysis_mode and answer == CAMPAIGN_NOT_FOUND_MESSAGE:
-            analysis_answer = gemini_generate(
-                build_campaign_analysis_text_prompt(q, context),
+        if answer == CAMPAIGN_NOT_FOUND_MESSAGE:
+            fallback_prompt = build_campaign_analysis_text_prompt(q, context) if analysis_mode else build_campaign_text_prompt(q, context)
+            fallback_answer = gemini_generate(
+                fallback_prompt,
                 temperature=0.2,
-                max_output_tokens=1400,
+                max_output_tokens=1800 if analysis_mode else 2200,
             ).strip()
-            if analysis_answer:
-                answer = analysis_answer
+            if fallback_answer:
+                answer = fallback_answer
 
         sources: List[Dict[str, Any]] = []
         if req.include_sources:
