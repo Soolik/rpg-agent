@@ -2873,6 +2873,8 @@ def is_morn_campaign_question(text: str) -> bool:
 
 def is_campaign_source_question(text: str) -> bool:
     normalized = normalize_match_text(text)
+    if "google docs" in normalized or "google drive" in normalized:
+        return True
     hints = (
         "skad bierzesz informacje",
         "skad masz informacje",
@@ -2970,7 +2972,7 @@ def build_campaign_source_answer(question: str, docs: List[WorldDocInfo]) -> str
 
     access_question = any(
         hint in normalized
-        for hint in ("czy masz dostep", "czy korzystasz z google docs", "czy widzisz google docs")
+        for hint in ("czy masz", "masz dost", "czy korzystasz z google docs", "czy widzisz google docs")
     )
     lines: List[str] = []
     if access_question:
@@ -3386,6 +3388,34 @@ ODPOWIEDZ:
 
 
 def build_campaign_text_prompt(question: str, context: str) -> str:
+    if is_campaign_overview_question(question):
+        return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Na podstawie notatek odpowiedz po polsku.
+
+ZASADY:
+1) Uzywaj tylko faktow z KONTEKSTU.
+2) Zwracaj wylacznie 6 bulletow. Kazdy bullet musi zaczynac sie od "- " i miec 1-3 zdania.
+3) Zrealizuj te punkty osobno i w tej kolejnosci:
+   - realia Shackles i Port Peril,
+   - punkt startowy Rozdzialu 1,
+   - sprawe Morna / Black Eel,
+   - glowne sily polityczne albo frakcyjne,
+   - stawki kampanii,
+   - co to oznacza dla bohaterow na starcie.
+4) Nie dawaj wstepu, naglowkow ani numeracji.
+5) Nie urywaj odpowiedzi i nie lacz wszystkiego w jeden bullet.
+6) Jesli dla ktoregos punktu brakuje danych, napisz to wprost, ale nadal dodaj osobny bullet.
+7) Bez dopowiadania faktow spoza KONTEKSTU.
+
+KONTEKST:
+{context}
+
+PYTANIE:
+{question}
+
+ODPOWIEDZ:
+""".strip()
+
     if is_morn_campaign_question(question):
         return f"""
 Jestes asystentem MG kampanii "Krew Na Gwiazdach". Na podstawie notatek odpowiedz po polsku.
@@ -3441,11 +3471,8 @@ PYTANIE:
 ODPOWIEDZ:
 """.strip()
 
-    if is_campaign_overview_question(question):
-        focus_rule = (
-            "4) Dla pytania ogolnego pokryj w odpowiedzi: realia Shackles i Port Peril, pierwszy rozdzial, sprawe Morna, "
-            "kluczowe sily polityczne lub frakcyjne oraz stawki kampanii."
-        )
+    if not is_campaign_overview_question(question):
+        focus_rule = "4) Najpierw podaj fakty praktyczne i kampanijne, dopiero potem motywy ogolne."
     else:
         focus_rule = "4) Najpierw podaj fakty praktyczne i kampanijne, dopiero potem motywy ogolne."
 
@@ -4015,8 +4042,8 @@ POPRAWNY OUTPUT (tylko JSON):
         if answer == CAMPAIGN_NOT_FOUND_MESSAGE or is_campaign_answer_too_thin(q, answer):
             completion_answer = gemini_generate(
                 build_campaign_completion_prompt(q, context, answer),
-                temperature=0.2,
-                max_output_tokens=2200,
+                temperature=0.0,
+                max_output_tokens=2600,
             ).strip()
             if completion_answer:
                 answer = completion_answer
