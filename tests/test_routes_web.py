@@ -27,6 +27,8 @@ class RoutesWebTest(unittest.TestCase):
         self.assertIn("AI Czat MG", body)
         self.assertIn("Polacz konto Google", body)
         self.assertIn("/auth/session/status", body)
+        self.assertIn('const byId = (id) => document.getElementById(id);', body)
+        self.assertIn('loginBtn: byId("loginBtn")', body)
         self.assertIn("/v1", body)
 
 

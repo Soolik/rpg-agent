@@ -63,7 +63,30 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
 (() => {
   const cfg = JSON.parse(document.getElementById("cfg").textContent);
   const s = { authenticated: false, email: "", convs: [], cid: null, title: "", msgs: [], pending: -1 };
-  const e = { auth: auth, authNote: authNote, loginBtn: loginBtn, signOut: signOut, connectDrive: connectDrive, disconnectDrive: disconnectDrive, drive: drive, driveEmail: driveEmail, convList: convList, newConv: newConv, refreshConv: refreshConv, heroTitle: heroTitle, heroSub: heroSub, messages: messages, candidate: candidate, message: message, outputTitle: outputTitle, saveOutput: saveOutput, send: send, clear: clear, stream: stream };
+  const byId = (id) => document.getElementById(id);
+  const e = {
+    auth: byId("auth"),
+    authNote: byId("authNote"),
+    loginBtn: byId("loginBtn"),
+    signOut: byId("signOut"),
+    connectDrive: byId("connectDrive"),
+    disconnectDrive: byId("disconnectDrive"),
+    drive: byId("drive"),
+    driveEmail: byId("driveEmail"),
+    convList: byId("convList"),
+    newConv: byId("newConv"),
+    refreshConv: byId("refreshConv"),
+    heroTitle: byId("heroTitle"),
+    heroSub: byId("heroSub"),
+    messages: byId("messages"),
+    candidate: byId("candidate"),
+    message: byId("message"),
+    outputTitle: byId("outputTitle"),
+    saveOutput: byId("saveOutput"),
+    send: byId("send"),
+    clear: byId("clear"),
+    stream: byId("stream"),
+  };
   const esc = (v) => String(v || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   const chip = (n, t, x) => { n.className = `chip ${t}`; n.textContent = x; };
   async function request(path, opt = {}) {
