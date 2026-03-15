@@ -81,6 +81,7 @@ from app.models_v2 import (
     WorldEntityType,
 )
 from app.planner import PlannerService
+from app.request_auth import GCLOUD_CLIENT_ID, GoogleRequestAuth, RequestAuthMiddleware
 from app.routed_drive_store import RoutedDriveStore
 from app.routes_v1 import build_v1_router
 from app.routes_v2 import build_context_for_planner, build_v2_router
@@ -113,6 +114,25 @@ GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
 GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
 GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET")
 GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY = os.getenv("GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY")
+AUTH_ALLOWED_EMAILS = [item.strip() for item in os.getenv("AUTH_ALLOWED_EMAILS", "soolik1990@gmail.com").split(",") if item.strip()]
+AUTH_ALLOWED_GOOGLE_AUDIENCES = [
+    item.strip()
+    for item in os.getenv("AUTH_ALLOWED_GOOGLE_AUDIENCES", GCLOUD_CLIENT_ID).split(",")
+    if item.strip()
+]
+
+app.add_middleware(
+    RequestAuthMiddleware,
+    auth=GoogleRequestAuth(
+        allowed_emails=AUTH_ALLOWED_EMAILS,
+        allowed_audiences=AUTH_ALLOWED_GOOGLE_AUDIENCES,
+    ),
+    public_paths=(
+        "/health",
+        "/v1/health",
+        "/v1/auth/google-drive/callback",
+    ),
+)
 
 # Models
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")
