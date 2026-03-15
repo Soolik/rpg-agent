@@ -225,12 +225,22 @@ class GoogleDriveOAuthService:
         return response.json()
 
     def _encrypt_refresh_token(self, refresh_token: str) -> str:
-        config = self._require_config()
-        return Fernet(config.token_encryption_key.encode("utf-8")).encrypt(refresh_token.encode("utf-8")).decode("utf-8")
+        return self._fernet().encrypt(refresh_token.encode("utf-8")).decode("utf-8")
 
     def _decrypt_refresh_token(self, encrypted_token: str) -> str:
+        try:
+            return self._fernet().decrypt(encrypted_token.encode("utf-8")).decode("utf-8")
+        except GoogleDriveOAuthError:
+            raise
+        except Exception as exc:
+            raise GoogleDriveOAuthError("Stored Google Drive OAuth credentials could not be decrypted.") from exc
+
+    def _fernet(self) -> Fernet:
         config = self._require_config()
-        return Fernet(config.token_encryption_key.encode("utf-8")).decrypt(encrypted_token.encode("utf-8")).decode("utf-8")
+        try:
+            return Fernet(config.token_encryption_key.encode("utf-8"))
+        except Exception as exc:
+            raise GoogleDriveOAuthError("Google Drive OAuth token encryption key is invalid for this deployment.") from exc
 
     def _require_config(self) -> GoogleDriveOAuthConfig:
         if self.config is None:

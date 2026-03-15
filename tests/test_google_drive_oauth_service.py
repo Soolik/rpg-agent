@@ -129,6 +129,23 @@ class GoogleDriveOAuthServiceTest(unittest.TestCase):
         self.assertFalse(status.connected)
         self.assertTrue(store.cleared)
 
+    def test_invalid_fernet_key_raises_google_oauth_error(self):
+        service = GoogleDriveOAuthService(
+            store=FakeStore(),
+            config=GoogleDriveOAuthConfig(
+                client_id="client-id",
+                client_secret="client-secret",
+                redirect_uri="https://example.com/v1/auth/google-drive/callback",
+                state_secret="state-secret-that-is-definitely-long-enough",
+                token_encryption_key="not-a-valid-fernet-key",
+            ),
+            http_post=lambda *args, **kwargs: FakeResponse(payload={}),
+            http_get=lambda *args, **kwargs: FakeResponse(payload={}),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "token encryption key is invalid"):
+            service._encrypt_refresh_token("refresh-token")
+
 
 if __name__ == "__main__":
     unittest.main()
