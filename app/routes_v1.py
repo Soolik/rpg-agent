@@ -47,6 +47,7 @@ from .chat_service import ChatService, StreamPlan
 from .chat_models import ChatRequest, ChatResponse
 from .conversation_store import ConversationStore, NullConversationStore
 from .google_drive_oauth_service import GoogleDriveOAuthError, GoogleDriveOAuthService
+from .routed_drive_store import DriveWriteAccessError
 from .world_model_service import WorldModelService
 from .world_model_store import NullWorldModelStore, WorldModelStore
 from .workflow_store import NullWorkflowStore, WorkflowStore
@@ -620,6 +621,13 @@ def build_v1_router(
                 code="drive_access_denied",
                 message=str(exc),
             )
+        except DriveWriteAccessError as exc:
+            raise _api_error(
+                409,
+                request_trace=trace,
+                code="google_drive_user_oauth_required",
+                message=str(exc),
+            )
 
         return CanonicalImportResponse(
             request_id=trace.request_id,
@@ -659,11 +667,19 @@ def build_v1_router(
         actor: Optional[str],
         reindex_after_apply: bool,
     ) -> WorldModelChangeApplyResponse:
-        accepted = workflow_service.accept_change(
-            proposal_id=proposal_id,
-            actor=actor,
-            reindex_after_apply=reindex_after_apply,
-        )
+        try:
+            accepted = workflow_service.accept_change(
+                proposal_id=proposal_id,
+                actor=actor,
+                reindex_after_apply=reindex_after_apply,
+            )
+        except DriveWriteAccessError as exc:
+            raise _api_error(
+                409,
+                request_trace=trace,
+                code="google_drive_user_oauth_required",
+                message=str(exc),
+            )
         if not accepted:
             raise _api_error(
                 404,

@@ -98,7 +98,7 @@ class FakeGoogleDriveOAuthService:
             subject_email=self.subject_email,
             scopes=["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/documents"] if self.configured else [],
             redirect_uri="https://example.com/v1/auth/google-drive/callback" if self.configured else None,
-            write_mode="user_oauth" if self.connected else "service_account",
+            write_mode="user_oauth" if self.configured else "service_account",
         )
 
     def start_authorization(self):

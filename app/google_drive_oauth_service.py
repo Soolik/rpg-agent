@@ -82,7 +82,7 @@ class GoogleDriveOAuthService:
             subject_email=connection.subject_email if connection else None,
             scopes=connection.scopes if connection else (list(self.config.scopes) if self.config else []),
             redirect_uri=self.config.redirect_uri if self.config else None,
-            write_mode="user_oauth" if connection else "service_account",
+            write_mode="user_oauth" if self.is_configured() else "service_account",
         )
 
     def start_authorization(self) -> GoogleDriveOAuthStart:

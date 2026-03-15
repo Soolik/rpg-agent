@@ -6,16 +6,27 @@ from typing import Callable, Optional
 from .drive_store import DriveStore
 
 
+class DriveWriteAccessError(RuntimeError):
+    pass
+
+
 @dataclass
 class RoutedDriveStore:
     read_store: DriveStore
     write_store_factory: Optional[Callable[[], Optional[DriveStore]]] = None
+    require_write_store: bool = False
 
     def _write_store(self) -> DriveStore:
         if self.write_store_factory is None:
+            if self.require_write_store:
+                raise DriveWriteAccessError("Google Drive user write access is required for this operation.")
             return self.read_store
         candidate = self.write_store_factory()
-        return candidate or self.read_store
+        if candidate is not None:
+            return candidate
+        if self.require_write_store:
+            raise DriveWriteAccessError("Google Drive user write access is required for this operation.")
+        return self.read_store
 
     def list_world_docs(self):
         return self.read_store.list_world_docs()

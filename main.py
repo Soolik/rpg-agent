@@ -2697,14 +2697,17 @@ def build_routed_drive_store(
     base_store: DriveStore,
     oauth_service: Optional[GoogleDriveOAuthService],
 ):
-    if not oauth_service:
-        return base_store
     return RoutedDriveStore(
         read_store=base_store,
-        write_store_factory=lambda: oauth_service.build_user_drive_store(
-            folder_map=base_store.folder_map,
-            core_doc_map=base_store.core_doc_map,
+        write_store_factory=(
+            (lambda: oauth_service.build_user_drive_store(
+                folder_map=base_store.folder_map,
+                core_doc_map=base_store.core_doc_map,
+            ))
+            if oauth_service
+            else None
         ),
+        require_write_store=True,
     )
 
 

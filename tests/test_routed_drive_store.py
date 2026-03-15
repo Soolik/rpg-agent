@@ -1,6 +1,6 @@
 import unittest
 
-from app.routed_drive_store import RoutedDriveStore
+from app.routed_drive_store import DriveWriteAccessError, RoutedDriveStore
 
 
 class RoutedDriveStoreTest(unittest.TestCase):
@@ -27,7 +27,7 @@ class RoutedDriveStoreTest(unittest.TestCase):
         self.assertEqual(len(user_store.calls), 1)
         self.assertEqual(store.list_world_docs(), ["read"])
 
-    def test_writes_fall_back_to_read_store_when_user_store_missing(self):
+    def test_writes_require_user_store_when_missing(self):
         class FakeStore:
             def __init__(self):
                 self.calls = []
@@ -37,12 +37,11 @@ class RoutedDriveStoreTest(unittest.TestCase):
                 return "read"
 
         read_store = FakeStore()
-        store = RoutedDriveStore(read_store=read_store, write_store_factory=lambda: None)
+        store = RoutedDriveStore(read_store=read_store, write_store_factory=lambda: None, require_write_store=True)
 
-        created = store.create_doc(folder="03 NPC", title="Captain Mira", content="...", entity_type="npc")
-
-        self.assertEqual(created, "read")
-        self.assertEqual(len(read_store.calls), 1)
+        with self.assertRaises(DriveWriteAccessError):
+            store.create_doc(folder="03 NPC", title="Captain Mira", content="...", entity_type="npc")
+        self.assertEqual(len(read_store.calls), 0)
 
 
 if __name__ == "__main__":
