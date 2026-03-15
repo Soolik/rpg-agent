@@ -755,7 +755,7 @@ def upsert_chunks(doc: WorldDocInfo, doc_type: str, chunks: List[str], embedding
                 "delete from chunks where campaign_id = %s and doc_id = %s",
                 (CAMPAIGN_ID, doc.doc_id),
             )
-            for t, emb in zip(chunks, embeddings):
+            for chunk_ordinal, (t, emb) in enumerate(zip(chunks, embeddings), start=1):
                 cid = str(uuid.uuid4())
                 cur.execute(
                     """
@@ -775,6 +775,7 @@ def upsert_chunks(doc: WorldDocInfo, doc_type: str, chunks: List[str], embedding
                                 "title": doc.title,
                                 "folder": doc.folder,
                                 "path_hint": doc.path_hint,
+                                "chunk_ordinal": chunk_ordinal,
                             }
                         ),
                         now,
@@ -884,7 +885,10 @@ def leading_chunks_for_docs(doc_ids: List[str], limit_per_doc: int = 1, total_li
                         coalesce(wd.title, c.metadata->>'title', '') as title,
                         coalesce(wd.folder, c.metadata->>'folder', '') as folder,
                         coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', '') as path_hint,
-                        row_number() over (partition by c.doc_id order by c.chunk_index asc, c.id asc) as rn
+                        row_number() over (
+                            partition by c.doc_id
+                            order by coalesce(nullif(c.metadata->>'chunk_ordinal', '')::int, 2147483647) asc, c.id asc
+                        ) as rn
                     from chunks c
                     left join world_docs wd
                         on wd.campaign_id = c.campaign_id
