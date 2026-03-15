@@ -204,6 +204,60 @@ class ChatFlowTest(unittest.TestCase):
         self.assertEqual(len(seen["calls"]), 2)
         self.assertIn("## Co dziala", response.answer)
 
+    def test_augment_campaign_hits_adds_shackles_documents_for_broad_campaign_questions(self):
+        original_drive_store = getattr(main, "drive_store_v2", None)
+        original_vector_search_in_docs = main.vector_search_in_docs
+
+        class FakeDriveStore:
+            def list_world_docs(self):
+                return [
+                    main.WorldDocInfo(folder="01 Bible", title="Przewodnik po Shackles", doc_id="doc-shackles", path_hint="", entity_type="other"),
+                    main.WorldDocInfo(folder="02 Sessions", title="Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril", doc_id="doc-r1", path_hint="", entity_type="session"),
+                ]
+
+        seen = {}
+
+        def fake_vector_search_in_docs(question, doc_ids, top_k):
+            seen["doc_ids"] = doc_ids
+            return [
+                {
+                    "chunk_id": "boost-1",
+                    "doc_id": "doc-shackles",
+                    "doc_type": "gdoc",
+                    "chunk_text": "Port Peril to stolica Shackles.",
+                    "distance": 0.79,
+                    "title": "Przewodnik po Shackles",
+                    "folder": "01 Bible",
+                    "path_hint": "01 Bible / Przewodnik po Shackles",
+                }
+            ]
+
+        try:
+            main.drive_store_v2 = FakeDriveStore()
+            main.vector_search_in_docs = fake_vector_search_in_docs
+            merged = main.augment_campaign_hits(
+                "Co to kampania Krew Na Gwiazdach?",
+                [
+                    {
+                        "chunk_id": "base-1",
+                        "doc_id": "doc-bible",
+                        "doc_type": "gdoc",
+                        "chunk_text": "Ogólny opis kampanii.",
+                        "distance": 0.75,
+                        "title": "Campaign Bible",
+                        "folder": "01 Bible",
+                        "path_hint": "01 Bible / Campaign Bible",
+                    }
+                ],
+                6,
+            )
+        finally:
+            main.drive_store_v2 = original_drive_store
+            main.vector_search_in_docs = original_vector_search_in_docs
+
+        self.assertIn("doc-shackles", seen["doc_ids"])
+        self.assertEqual(merged[0]["title"], "Przewodnik po Shackles")
+
     def test_chat_answer_returns_human_text_with_sources(self):
         original_ask = main.ask
         try:

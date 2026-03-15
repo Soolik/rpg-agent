@@ -272,6 +272,19 @@ class CanonicalImportResponse(RequestTrace):
     results: List[CanonicalImportFileView] = Field(default_factory=list)
 
 
+class CampaignResetRequest(BaseModel):
+    clear_index: bool = True
+    clear_world_model: bool = True
+    clear_workflows: bool = True
+    clear_conversations: bool = True
+    clear_snapshots: bool = True
+
+
+class CampaignResetResponse(RequestTrace):
+    campaign_id: str
+    deleted: Dict[str, int] = Field(default_factory=dict)
+
+
 class WorldModelChangeProposalRequest(BaseModel):
     instruction: str = Field(..., min_length=1)
     mode: Literal["auto", "create", "update", "session", "consistency", "player_output"] = "auto"

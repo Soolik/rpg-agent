@@ -11,6 +11,8 @@ from .api_models import (
     AssistantActionResponse,
     AssistantActionType,
     AssistantMode,
+    CampaignResetRequest,
+    CampaignResetResponse,
     CanonicalImportFileView,
     CanonicalImportRequest,
     CanonicalImportResponse,
@@ -86,6 +88,7 @@ def build_v1_router(
     conversation_store: Optional[ConversationStore | NullConversationStore] = None,
     applier: Optional[ProposalApplier] = None,
     reindex_fn: Optional[Callable[[list], dict]] = None,
+    campaign_reset_fn: Optional[Callable[..., dict]] = None,
     google_drive_oauth_service: Optional[GoogleDriveOAuthService] = None,
     session_auth: Optional[SignedSessionAuth] = None,
 ) -> APIRouter:
@@ -125,6 +128,30 @@ def build_v1_router(
             ok=bool(payload.get("ok")),
             campaign_id=payload.get("campaign_id") or "",
             revision=payload.get("revision") or "unknown",
+        )
+
+    @router.post("/admin/reset-campaign-data", response_model=CampaignResetResponse)
+    def v1_reset_campaign_data(request: CampaignResetRequest):
+        trace = _new_trace()
+        if not campaign_reset_fn:
+            raise _api_error(
+                503,
+                request_trace=trace,
+                code="campaign_reset_unavailable",
+                message="Campaign reset is not configured for this deployment.",
+            )
+        result = campaign_reset_fn(
+            clear_index=request.clear_index,
+            clear_world_model=request.clear_world_model,
+            clear_workflows=request.clear_workflows,
+            clear_conversations=request.clear_conversations,
+            clear_snapshots=request.clear_snapshots,
+        )
+        return CampaignResetResponse(
+            request_id=trace.request_id,
+            trace_id=trace.trace_id,
+            campaign_id=result.get("campaign_id") or "",
+            deleted=result.get("deleted") or {},
         )
 
     @router.get("/auth/google-drive/status", response_model=GoogleDriveOAuthStatusResponse)

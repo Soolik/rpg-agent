@@ -10,6 +10,7 @@ from app.api_models import (
     AssistantActionRequest,
     AssistantActionType,
     AssistantMode,
+    CampaignResetRequest,
     CanonicalImportRequest,
     ConversationCreateRequest,
     ConversationMessageCreateRequest,
@@ -377,7 +378,7 @@ class FakeConversationStore:
 
 
 class RoutesV1Test(unittest.TestCase):
-    def build_router(self, chat_fn=None, chat_stream_fn=None, workflow_store=None, conversation_store=None, drive_store=None, reindex_fn=None, oauth_service=None):
+    def build_router(self, chat_fn=None, chat_stream_fn=None, workflow_store=None, conversation_store=None, drive_store=None, reindex_fn=None, oauth_service=None, campaign_reset_fn=None):
         return build_v1_router(
             chat_request_cls=ChatRequest,
             chat_fn=chat_fn or (lambda req: ChatResponse(kind="answer", reply="OK", references=[])),
@@ -390,6 +391,7 @@ class RoutesV1Test(unittest.TestCase):
             conversation_store=conversation_store or FakeConversationStore(),
             applier=FakeApplier(),
             reindex_fn=reindex_fn,
+            campaign_reset_fn=campaign_reset_fn,
             google_drive_oauth_service=oauth_service,
             session_auth=SignedSessionAuth(secret="session-secret-that-is-definitely-long-enough"),
         )
@@ -414,6 +416,21 @@ class RoutesV1Test(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertTrue(body["request_id"])
         self.assertEqual(body["request_id"], body["trace_id"])
+
+    def test_v1_campaign_reset_returns_deleted_counts(self):
+        router = self.build_router(
+            campaign_reset_fn=lambda **kwargs: {
+                "campaign_id": "kng",
+                "deleted": {"chunks": 39, "world_entities": 2, "conversations": 5},
+            }
+        )
+
+        body = self.route_endpoint(router, "/v1/admin/reset-campaign-data", "POST")(
+            request=CampaignResetRequest()
+        ).model_dump(mode="json")
+
+        self.assertEqual(body["campaign_id"], "kng")
+        self.assertEqual(body["deleted"]["chunks"], 39)
 
     def test_v1_google_drive_auth_status_reports_connection(self):
         router = self.build_router(oauth_service=FakeGoogleDriveOAuthService(connected=True, subject_email="soolik1990@gmail.com"))

@@ -590,6 +590,77 @@ def delete_all_chunks_for_campaign():
         conn.commit()
 
 
+def reset_campaign_data(
+    *,
+    clear_index: bool = True,
+    clear_world_model: bool = True,
+    clear_workflows: bool = True,
+    clear_conversations: bool = True,
+    clear_snapshots: bool = True,
+) -> Dict[str, Any]:
+    deleted = {
+        "chunks": 0,
+        "world_docs": 0,
+        "doc_snapshots": 0,
+        "world_entities": 0,
+        "world_threads": 0,
+        "world_sessions": 0,
+        "conversation_messages": 0,
+        "conversations": 0,
+        "apply_runs": 0,
+        "proposals": 0,
+    }
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            if clear_conversations:
+                cur.execute("select count(*) from conversation_messages where campaign_id = %s", (CAMPAIGN_ID,))
+                deleted["conversation_messages"] = int(cur.fetchone()[0])
+                cur.execute("delete from conversation_messages where campaign_id = %s", (CAMPAIGN_ID,))
+                cur.execute("select count(*) from conversations where campaign_id = %s", (CAMPAIGN_ID,))
+                deleted["conversations"] = int(cur.fetchone()[0])
+                cur.execute("delete from conversations where campaign_id = %s", (CAMPAIGN_ID,))
+
+            if clear_workflows:
+                cur.execute("select count(*) from apply_runs where campaign_id = %s", (CAMPAIGN_ID,))
+                deleted["apply_runs"] = int(cur.fetchone()[0])
+                cur.execute("delete from apply_runs where campaign_id = %s", (CAMPAIGN_ID,))
+                cur.execute("select count(*) from proposals where campaign_id = %s", (CAMPAIGN_ID,))
+                deleted["proposals"] = int(cur.fetchone()[0])
+                cur.execute("delete from proposals where campaign_id = %s", (CAMPAIGN_ID,))
+
+            if clear_world_model:
+                cur.execute("select count(*) from world_entities where campaign_id = %s", (CAMPAIGN_ID,))
+                deleted["world_entities"] = int(cur.fetchone()[0])
+                cur.execute("delete from world_entities where campaign_id = %s", (CAMPAIGN_ID,))
+                cur.execute("select count(*) from world_threads where campaign_id = %s", (CAMPAIGN_ID,))
+                deleted["world_threads"] = int(cur.fetchone()[0])
+                cur.execute("delete from world_threads where campaign_id = %s", (CAMPAIGN_ID,))
+                cur.execute("select count(*) from world_sessions where campaign_id = %s", (CAMPAIGN_ID,))
+                deleted["world_sessions"] = int(cur.fetchone()[0])
+                cur.execute("delete from world_sessions where campaign_id = %s", (CAMPAIGN_ID,))
+
+            if clear_snapshots:
+                cur.execute("select count(*) from doc_snapshots where campaign_id = %s", (CAMPAIGN_ID,))
+                deleted["doc_snapshots"] = int(cur.fetchone()[0])
+                cur.execute("delete from doc_snapshots where campaign_id = %s", (CAMPAIGN_ID,))
+
+            if clear_index:
+                cur.execute("select count(*) from chunks where campaign_id = %s", (CAMPAIGN_ID,))
+                deleted["chunks"] = int(cur.fetchone()[0])
+                cur.execute("delete from chunks where campaign_id = %s", (CAMPAIGN_ID,))
+                cur.execute("select count(*) from world_docs where campaign_id = %s", (CAMPAIGN_ID,))
+                deleted["world_docs"] = int(cur.fetchone()[0])
+                cur.execute("delete from world_docs where campaign_id = %s", (CAMPAIGN_ID,))
+
+        conn.commit()
+
+    return {
+        "campaign_id": CAMPAIGN_ID,
+        "deleted": deleted,
+    }
+
+
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -736,6 +807,50 @@ def vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
                 limit %s
                 """,
                 (q_emb, CAMPAIGN_ID, q_emb, top_k),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "chunk_id": cid,
+            "doc_id": d,
+            "doc_type": t,
+            "chunk_text": c,
+            "distance": float(dist),
+            "title": title,
+            "folder": folder,
+            "path_hint": path_hint,
+        }
+        for (cid, d, t, c, dist, title, folder, path_hint) in rows
+    ]
+
+
+def vector_search_in_docs(question: str, doc_ids: List[str], top_k: int) -> List[Dict[str, Any]]:
+    if not doc_ids:
+        return []
+    q_emb = gemini_embed([question])[0]
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                    c.id,
+                    c.doc_id,
+                    c.doc_type,
+                    c.chunk_text,
+                    (c.embedding <-> %s::vector) as distance,
+                    coalesce(wd.title, c.metadata->>'title', '') as title,
+                    coalesce(wd.folder, c.metadata->>'folder', '') as folder,
+                    coalesce(wd.metadata->>'path_hint', c.metadata->>'path_hint', '') as path_hint
+                from chunks c
+                left join world_docs wd
+                    on wd.campaign_id = c.campaign_id
+                   and wd.doc_id = c.doc_id
+                where c.campaign_id = %s
+                  and c.doc_id = any(%s)
+                order by c.embedding <-> %s::vector
+                limit %s
+                """,
+                (q_emb, CAMPAIGN_ID, doc_ids, q_emb, top_k),
             )
             rows = cur.fetchall()
     return [
@@ -2648,6 +2763,116 @@ def has_likely_campaign_hits(hits: List[Dict[str, Any]], threshold: float = 0.88
 CAMPAIGN_NOT_FOUND_MESSAGE = "W notatkach kampanii nie znalazlem bezposredniej odpowiedzi na to pytanie."
 
 
+def boosted_doc_titles_for_question(question: str) -> List[str]:
+    normalized = normalize_match_text(question)
+    titles: List[str] = []
+
+    if "krew na gwiazdach" in normalized or "kampania" in normalized:
+        titles.extend(
+            [
+                "Campaign Bible",
+                "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+                "Przewodnik po Shackles",
+                "Places",
+                "NPCs",
+                "Events",
+            ]
+        )
+
+    if any(
+        hint in normalized
+        for hint in ("pierwsza czesc", "pierwsza część", "pierwszy rozdzial", "rozdzial 1", "akt 1", "shackles", "port peril")
+    ):
+        titles.extend(
+            [
+                "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+                "Przewodnik po Shackles",
+                "Places",
+                "NPCs",
+                "Dossier Morna - sprawa Black Eel",
+            ]
+        )
+
+    if any(hint in normalized for hint in ("morn", "black eel", "tavin", "dossier")):
+        titles.extend(
+            [
+                "Dossier Morna - sprawa Black Eel",
+                "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+                "Secrets",
+                "NPCs",
+                "Places",
+            ]
+        )
+
+    if any(hint in normalized for hint in ("shackles", "port peril")):
+        titles.extend(
+            [
+                "Przewodnik po Shackles",
+                "Places",
+                "NPCs",
+                "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+            ]
+        )
+
+    deduped: List[str] = []
+    seen = set()
+    for title in titles:
+        if title in seen:
+            continue
+        seen.add(title)
+        deduped.append(title)
+    return deduped
+
+
+def _lookup_doc_ids_by_title(titles: List[str]) -> List[str]:
+    if not titles:
+        return []
+    drive_store = globals().get("drive_store_v2")
+    if drive_store is None:
+        return []
+    found_ids: List[str] = []
+    for title in titles:
+        doc = None
+        try:
+            if hasattr(drive_store, "find_doc"):
+                doc = drive_store.find_doc(title=title)
+        except TypeError:
+            doc = None
+        except AttributeError:
+            doc = None
+        if doc is None:
+            for candidate in drive_store.list_world_docs():
+                if candidate.title == title:
+                    doc = candidate
+                    break
+        if doc and getattr(doc, "doc_id", None):
+            found_ids.append(doc.doc_id)
+    return found_ids
+
+
+def merge_ranked_hits(primary: List[Dict[str, Any]], secondary: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    seen: set[tuple[Any, Any, Any]] = set()
+    for hit in primary + secondary:
+        key = (hit.get("chunk_id"), hit.get("doc_id"), hit.get("chunk_text"))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(hit)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def augment_campaign_hits(question: str, hits: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    boosted_titles = boosted_doc_titles_for_question(question)
+    boosted_doc_ids = _lookup_doc_ids_by_title(boosted_titles)
+    if not boosted_doc_ids:
+        return hits
+    boosted_hits = vector_search_in_docs(question, boosted_doc_ids, min(max(top_k, 6), 12))
+    return merge_ranked_hits(boosted_hits, hits, limit=max(top_k + 4, 8))
+
+
 def render_campaign_out(out: CampaignOut) -> str:
     if out.format == "table" and out.table:
         cols = out.table.get("columns") or []
@@ -3088,6 +3313,7 @@ app.include_router(
         conversation_store=conversation_store_v1,
         applier=proposal_applier_v2,
         reindex_fn=reindex_after_apply_default,
+        campaign_reset_fn=reset_campaign_data,
         google_drive_oauth_service=google_drive_oauth_service_v1,
         session_auth=WEB_SESSION_AUTH,
     )
@@ -3179,6 +3405,7 @@ def ask(req: AskRequest):
 
         if not hits:
             hits = vector_search(q, req.top_k)
+        hits = augment_campaign_hits(q, hits, req.top_k)
         context = build_campaign_context(hits)
         analysis_mode = is_campaign_analysis_question(q)
         prompt_builder = build_campaign_analysis_prompt if analysis_mode else build_campaign_prompt
