@@ -3286,6 +3286,68 @@ ODPOWIEDZ:
 """.strip()
 
 
+def build_campaign_completion_prompt(question: str, context: str, previous_answer: str) -> str:
+    if is_campaign_overview_question(question):
+        bullet_targets = [
+            "Shackles i Port Peril",
+            "punkt startowy Rozdzialu 1",
+            "sprawe Morna / Black Eel",
+            "glowne sily polityczne albo frakcyjne",
+            "stawki kampanii",
+            "co to oznacza dla bohaterow na starcie",
+        ]
+    elif is_morn_campaign_question(question):
+        bullet_targets = [
+            "na czym polega przekret",
+            "kto jest zaangazowany",
+            "jakie dokumenty, pieczecie albo ladunek sa kluczowe",
+            "zwiazek sprawy z Shackles i Port Peril",
+            "dlaczego to wazne politycznie dla kampanii",
+        ]
+    elif is_first_part_campaign_question(question):
+        bullet_targets = [
+            "gdzie zaczyna sie pierwszy rozdzial",
+            "glowna sprawa startowa",
+            "najwazniejsze postacie",
+            "najwazniejsze lokacje",
+            "najwazniejsze napiecia polityczne",
+            "co to zmienia dla dalszej kampanii",
+        ]
+    else:
+        bullet_targets = [
+            "najwazniejsze fakty z pytania",
+            "zaangazowane postacie, frakcje albo lokacje",
+            "stawki i konsekwencje",
+            "co pozostaje niejasne albo wymaga doprecyzowania",
+        ]
+
+    targets = "\n".join(f"- {item}" for item in bullet_targets)
+    return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Popraw niepelna odpowiedz na podstawie notatek.
+
+ZASADY:
+1) Uzywaj tylko faktow z KONTEKSTU.
+2) Zwracaj wylacznie liste bulletow i nic poza nia.
+3) Kazdy bullet musi zaczynac sie od "- " i miec 1-3 zdania.
+4) Zrealizuj osobno kazdy z tych punktow:
+{targets}
+5) Jesli dla ktoregos punktu brakuje danych w KONTEKSCIE, napisz to wprost, ale nadal dodaj bullet.
+6) Nie urywaj odpowiedzi. Nie dawaj wstepu ani sekcji "Zrodla".
+7) Nie dopowiadaj faktow spoza KONTEKSTU.
+
+KONTEKST:
+{context}
+
+PYTANIE:
+{question}
+
+NIEPELNA POPRZEDNIA ODPOWIEDZ:
+{previous_answer}
+
+ODPOWIEDZ:
+""".strip()
+
+
 GITHUB_API = "https://api.github.com"
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "Soolik")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "rpg-agent")
@@ -3757,6 +3819,14 @@ POPRAWNY OUTPUT (tylko JSON):
             ).strip()
             if fallback_answer:
                 answer = fallback_answer
+        if answer == CAMPAIGN_NOT_FOUND_MESSAGE or is_campaign_answer_too_thin(q, answer):
+            completion_answer = gemini_generate(
+                build_campaign_completion_prompt(q, context, answer),
+                temperature=0.2,
+                max_output_tokens=2200,
+            ).strip()
+            if completion_answer:
+                answer = completion_answer
 
         sources: List[Dict[str, Any]] = []
         if req.include_sources:

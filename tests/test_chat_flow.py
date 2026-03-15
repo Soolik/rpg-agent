@@ -338,7 +338,7 @@ class ChatFlowTest(unittest.TestCase):
             main.augment_campaign_hits = original_augment_campaign_hits
             main.gemini_generate = original_gemini_generate
 
-        self.assertEqual(len(seen["calls"]), 4)
+        self.assertEqual(len(seen["calls"]), 5)
         self.assertIn("Port Peril", response.answer)
         self.assertIn("sprawy Morna", response.answer)
 
@@ -411,7 +411,7 @@ class ChatFlowTest(unittest.TestCase):
             main.augment_campaign_hits = original_augment_campaign_hits
             main.gemini_generate = original_gemini_generate
 
-        self.assertEqual(len(seen["calls"]), 2)
+        self.assertEqual(len(seen["calls"]), 3)
         self.assertIn("Shackles", response.answer)
         self.assertIn("sprawy Morna", response.answer)
 
@@ -465,7 +465,7 @@ class ChatFlowTest(unittest.TestCase):
             main.augment_campaign_hits = original_augment_campaign_hits
             main.gemini_generate = original_gemini_generate
 
-        self.assertEqual(len(seen["calls"]), 2)
+        self.assertEqual(len(seen["calls"]), 3)
         self.assertIn("Sprawa Morna", response.answer)
         self.assertIn("Black Eel", response.answer)
 
