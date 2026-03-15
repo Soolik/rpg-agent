@@ -81,7 +81,7 @@ from app.models_v2 import (
     WorldEntityType,
 )
 from app.planner import PlannerService
-from app.request_auth import GCLOUD_CLIENT_ID, GoogleRequestAuth, RequestAuthMiddleware
+from app.request_auth import GCLOUD_CLIENT_ID, GoogleRequestAuth, RequestAuthMiddleware, SignedSessionAuth
 from app.routed_drive_store import RoutedDriveStore
 from app.routes_web import build_web_router
 from app.routes_v1 import build_v1_router
@@ -115,6 +115,7 @@ GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
 GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
 GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET")
 GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY = os.getenv("GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY")
+WEB_SESSION_SECRET = os.getenv("WEB_SESSION_SECRET") or GOOGLE_OAUTH_STATE_SECRET or GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY
 AUTH_ALLOWED_EMAILS = [item.strip() for item in os.getenv("AUTH_ALLOWED_EMAILS", "soolik1990@gmail.com").split(",") if item.strip()]
 _DEFAULT_AUTH_AUDIENCES = ",".join(
     [item for item in [GCLOUD_CLIENT_ID, GOOGLE_OAUTH_CLIENT_ID or ""] if item]
@@ -124,6 +125,7 @@ AUTH_ALLOWED_GOOGLE_AUDIENCES = [
     for item in os.getenv("AUTH_ALLOWED_GOOGLE_AUDIENCES", _DEFAULT_AUTH_AUDIENCES).split(",")
     if item.strip()
 ]
+WEB_SESSION_AUTH = SignedSessionAuth(secret=WEB_SESSION_SECRET) if WEB_SESSION_SECRET else None
 
 app.add_middleware(
     RequestAuthMiddleware,
@@ -131,12 +133,16 @@ app.add_middleware(
         allowed_emails=AUTH_ALLOWED_EMAILS,
         allowed_audiences=AUTH_ALLOWED_GOOGLE_AUDIENCES,
     ),
+    session_auth=WEB_SESSION_AUTH,
     public_paths=(
         "/",
         "/gm",
         "/health",
         "/v1/health",
+        "/v1/auth/google-drive/start",
         "/v1/auth/google-drive/callback",
+        "/v1/auth/session/status",
+        "/v1/auth/session/logout",
     ),
 )
 
@@ -2687,7 +2693,7 @@ def build_google_drive_oauth_service() -> Optional[GoogleDriveOAuthService]:
             GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY,
         ]
     ):
-        return GoogleDriveOAuthService(store=store, config=None)
+        return GoogleDriveOAuthService(store=store, config=None, allowed_emails=AUTH_ALLOWED_EMAILS)
     config = GoogleDriveOAuthConfig(
         client_id=GOOGLE_OAUTH_CLIENT_ID or "",
         client_secret=GOOGLE_OAUTH_CLIENT_SECRET or "",
@@ -2695,7 +2701,7 @@ def build_google_drive_oauth_service() -> Optional[GoogleDriveOAuthService]:
         state_secret=GOOGLE_OAUTH_STATE_SECRET or GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY or "",
         token_encryption_key=GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY or "",
     )
-    return GoogleDriveOAuthService(store=store, config=config)
+    return GoogleDriveOAuthService(store=store, config=config, allowed_emails=AUTH_ALLOWED_EMAILS)
 
 
 def build_routed_drive_store(
@@ -2897,6 +2903,7 @@ app.include_router(
         applier=proposal_applier_v2,
         reindex_fn=reindex_after_apply_default,
         google_drive_oauth_service=google_drive_oauth_service_v1,
+        session_auth=WEB_SESSION_AUTH,
     )
 )
 

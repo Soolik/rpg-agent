@@ -23,12 +23,14 @@ class ProposalType(str, Enum):
 
 
 class AssistantMode(str, Enum):
+    auto = "auto"
     create = "create"
     guard = "guard"
     editor = "editor"
 
 
 class AssistantActionType(str, Enum):
+    confirm_inferred_action = "confirm_inferred_action"
     accept_world_change = "accept_world_change"
     reject_world_change = "reject_world_change"
     revise = "revise"
@@ -60,6 +62,7 @@ class ChatStreamDebug(BaseModel):
 class NextAction(BaseModel):
     type: Literal[
         "continue_conversation",
+        "confirm_inferred_action",
         "revise",
         "accept_world_change",
         "reject_world_change",
@@ -226,6 +229,11 @@ class GoogleDriveOAuthStartResponse(RequestTrace):
     authorization_url: str
     redirect_uri: str
     scopes: List[str] = Field(default_factory=list)
+
+
+class WebSessionStatusResponse(RequestTrace):
+    authenticated: bool = False
+    email: Optional[str] = None
 
 
 class CanonicalImportRequest(BaseModel):

@@ -7,6 +7,7 @@ from typing import Callable, Iterable, Optional, Type
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
+from .assistant_decision import infer_assistant_decision
 from .api_models import (
     AssistantMode,
     ChatArtifact,
@@ -203,6 +204,23 @@ def _next_actions_for_response(
         seen.add(key)
         deduped.append(action)
     return deduped
+
+
+def _confirmation_reply(*, title: str, body: str, mode: AssistantMode, artifact_type: Optional[str], save_output: bool, output_title: Optional[str]) -> str:
+    lines = [
+        f"# {title}",
+        "",
+        body.strip(),
+        "",
+        "Nic jeszcze nie zostalo zapisane ani edytowane.",
+    ]
+    if mode == AssistantMode.editor:
+        lines.append("Po potwierdzeniu przygotuje propozycje zmiany kanonu do review.")
+    if save_output:
+        lines.append(f"Po potwierdzeniu zapisze wynik do Google Docs jako: {output_title or 'automatyczny tytul'}.")
+    if artifact_type:
+        lines.append(f"Wstepnie rozpoznany typ materialu: {artifact_type}.")
+    return "\n".join(lines).strip()
 
 
 def _guard_context_instruction(message: str, candidate_text: str) -> str:
@@ -667,6 +685,69 @@ class ChatService:
             continuity=continuity,
         )
 
+    def _build_confirmation_response(
+        self,
+        *,
+        trace: RequestTrace,
+        message: str,
+        mode: AssistantMode,
+        artifact_type: Optional[str],
+        candidate_text: Optional[str],
+        save_output: bool,
+        output_title: Optional[str],
+        conversation_id: Optional[str],
+        conversation_title: Optional[str],
+        title: str,
+        body: str,
+    ) -> V1ChatResponse:
+        reply_markdown = _confirmation_reply(
+            title=title,
+            body=body,
+            mode=mode,
+            artifact_type=artifact_type,
+            save_output=save_output,
+            output_title=output_title,
+        )
+        return V1ChatResponse(
+            request_id=trace.request_id,
+            trace_id=trace.trace_id,
+            kind="answer",
+            mode=AssistantMode.auto,
+            reply=reply_markdown,
+            reply_markdown=reply_markdown,
+            title=title,
+            conversation_id=conversation_id,
+            conversation_title=conversation_title,
+            citations=[],
+            warnings=[],
+            next_actions=[
+                NextAction(
+                    type="confirm_inferred_action",
+                    label="Potwierdz",
+                    payload={
+                        "message": message,
+                        "mode": mode.value,
+                        "artifact_type": artifact_type,
+                        "candidate_text": candidate_text,
+                        "save_output": save_output,
+                        "output_title": output_title,
+                        "conversation_id": conversation_id,
+                    },
+                ),
+                NextAction(
+                    type="revise",
+                    label="Popraw prompt",
+                    payload={
+                        "artifact_type": artifact_type,
+                    },
+                ),
+            ],
+            output=None,
+            stream_debug=None,
+            telemetry=None,
+            continuity=None,
+        )
+
     def run(
         self,
         *,
@@ -683,7 +764,21 @@ class ChatService:
         output_title: Optional[str],
         conversation_id: Optional[str],
         conversation_title: Optional[str],
+        confirmed: bool = False,
     ) -> V1ChatResponse:
+        decision = infer_assistant_decision(
+            message=message,
+            requested_mode=assistant_mode,
+            requested_artifact_type=artifact_type,
+            requested_save_output=save_output,
+            requested_output_title=output_title,
+            candidate_text=candidate_text,
+        )
+        effective_mode = decision.mode
+        effective_artifact_type = decision.artifact_type
+        effective_save_output = decision.save_output
+        effective_output_title = decision.output_title
+
         conversation, composed_message = self._prepare_conversation_context(
             trace=trace,
             message=message,
@@ -693,13 +788,31 @@ class ChatService:
         self._append_user_message(
             conversation,
             message=message,
-            artifact_type=artifact_type,
+            artifact_type=effective_artifact_type,
             source_title=source_title,
-            assistant_mode=assistant_mode,
+            assistant_mode=effective_mode,
             candidate_text=candidate_text,
         )
 
-        if assistant_mode == AssistantMode.guard:
+        if decision.requires_confirmation and not confirmed:
+            rendered = self._build_confirmation_response(
+                trace=trace,
+                message=message,
+                mode=effective_mode,
+                artifact_type=effective_artifact_type,
+                candidate_text=candidate_text,
+                save_output=effective_save_output,
+                output_title=effective_output_title,
+                conversation_id=conversation.conversation_id if conversation else None,
+                conversation_title=conversation.title if conversation else None,
+                title=decision.confirmation_title or "Potwierdz dzialanie",
+                body=decision.confirmation_body or "Potwierdz, zanim agent wykona trwala operacje.",
+            )
+            self._append_assistant_message(conversation, response=rendered)
+            self._refresh_conversation_summary(conversation)
+            return rendered
+
+        if effective_mode == AssistantMode.guard:
             checked_text = (candidate_text or message).strip()
             planner_notes = None
             if self.consistency_planner and hasattr(self.consistency_planner, "consistency_check"):
@@ -716,26 +829,26 @@ class ChatService:
                 conversation_title=conversation.title if conversation else None,
             )
         else:
-            effective_intent = "proposal" if assistant_mode == AssistantMode.editor else intent
+            effective_intent = "proposal" if effective_mode == AssistantMode.editor else intent
             response = self.chat_fn(
                 self.chat_request_cls(
                     message=composed_message,
                     intent=effective_intent,
-                    artifact_type=artifact_type,
+                    artifact_type=effective_artifact_type,
                     source_title=source_title,
                     conversation_id=conversation.conversation_id if conversation else None,
                     conversation_title=conversation.title if conversation else conversation_title,
                     include_sources=include_sources,
                     include_telemetry=include_telemetry,
-                    save_output=save_output,
-                    output_title=output_title,
+                    save_output=effective_save_output,
+                    output_title=effective_output_title,
                 )
             )
             rendered = self._response_from_chat(
                 trace=trace,
                 message=message,
                 response=response,
-                mode=assistant_mode,
+                mode=effective_mode,
                 conversation_id=conversation.conversation_id if conversation else None,
                 conversation_title=conversation.title if conversation else None,
             )
@@ -760,35 +873,22 @@ class ChatService:
         output_title: Optional[str],
         conversation_id: Optional[str],
         conversation_title: Optional[str],
+        confirmed: bool = False,
     ) -> StreamingResponse:
-        conversation, composed_message = self._prepare_conversation_context(
-            trace=trace,
+        decision = infer_assistant_decision(
             message=message,
-            conversation_id=conversation_id,
-            conversation_title=conversation_title,
+            requested_mode=assistant_mode,
+            requested_artifact_type=artifact_type,
+            requested_save_output=save_output,
+            requested_output_title=output_title,
+            candidate_text=candidate_text,
         )
+        effective_mode = decision.mode
+        effective_artifact_type = decision.artifact_type
+        effective_save_output = decision.save_output
+        effective_output_title = decision.output_title
 
-        stream_plan = StreamPlan(selected_mode="buffered", reason="stream_backend_unavailable")
-        if assistant_mode != AssistantMode.create:
-            stream_plan = StreamPlan(selected_mode="buffered", reason="assistant_mode_requires_buffered_stream")
-        elif self.chat_stream_fn:
-            stream_plan = self.chat_stream_fn(
-                self.chat_request_cls(
-                    message=composed_message,
-                    intent=intent,
-                    artifact_type=artifact_type,
-                    source_title=source_title,
-                    conversation_id=conversation.conversation_id if conversation else None,
-                    conversation_title=conversation.title if conversation else conversation_title,
-                    include_sources=include_sources,
-                    include_telemetry=include_telemetry,
-                    save_output=save_output,
-                    output_title=output_title,
-                )
-            )
-        handle = stream_plan.handle
-
-        if not handle:
+        if decision.requires_confirmation and not confirmed:
             response = self.run(
                 trace=trace,
                 message=message,
@@ -803,6 +903,58 @@ class ChatService:
                 output_title=output_title,
                 conversation_id=conversation_id,
                 conversation_title=conversation_title,
+                confirmed=False,
+            )
+            response.stream_debug = ChatStreamDebug(
+                requested=True,
+                selected_mode="buffered",
+                reason="confirmation_required_before_mutation",
+            )
+            return self.stream(response)
+
+        conversation, composed_message = self._prepare_conversation_context(
+            trace=trace,
+            message=message,
+            conversation_id=conversation_id,
+            conversation_title=conversation_title,
+        )
+
+        stream_plan = StreamPlan(selected_mode="buffered", reason="stream_backend_unavailable")
+        if effective_mode != AssistantMode.create:
+            stream_plan = StreamPlan(selected_mode="buffered", reason="assistant_mode_requires_buffered_stream")
+        elif self.chat_stream_fn:
+            stream_plan = self.chat_stream_fn(
+                self.chat_request_cls(
+                    message=composed_message,
+                    intent=intent,
+                    artifact_type=effective_artifact_type,
+                    source_title=source_title,
+                    conversation_id=conversation.conversation_id if conversation else None,
+                    conversation_title=conversation.title if conversation else conversation_title,
+                    include_sources=include_sources,
+                    include_telemetry=include_telemetry,
+                    save_output=effective_save_output,
+                    output_title=effective_output_title,
+                )
+            )
+        handle = stream_plan.handle
+
+        if not handle:
+            response = self.run(
+                trace=trace,
+                message=message,
+                assistant_mode=effective_mode,
+                intent=intent,
+                artifact_type=effective_artifact_type,
+                source_title=source_title,
+                candidate_text=candidate_text,
+                include_sources=include_sources,
+                include_telemetry=include_telemetry,
+                save_output=effective_save_output,
+                output_title=effective_output_title,
+                conversation_id=conversation_id,
+                conversation_title=conversation_title,
+                confirmed=True,
             )
             response.stream_debug = ChatStreamDebug(
                 requested=True,
@@ -814,9 +966,9 @@ class ChatService:
         self._append_user_message(
             conversation,
             message=message,
-            artifact_type=artifact_type,
+            artifact_type=effective_artifact_type,
             source_title=source_title,
-            assistant_mode=assistant_mode,
+            assistant_mode=effective_mode,
             candidate_text=candidate_text,
         )
 
@@ -856,7 +1008,7 @@ class ChatService:
                         references=handle.references,
                         warnings=handle.warnings,
                     ),
-                    mode=assistant_mode,
+                    mode=effective_mode,
                     conversation_id=conversation.conversation_id if conversation else None,
                     conversation_title=conversation.title if conversation else None,
                 )

@@ -2,6 +2,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import HTTPException
 
@@ -36,6 +37,7 @@ from app.models_v2 import (
 from app.routes_v1 import build_v1_router
 from app.chat_service import DirectChatStream, StreamPlan
 from app.drive_store import DriveFileInfo
+from app.request_auth import SignedSessionAuth
 
 
 class FakeDriveStore:
@@ -120,6 +122,8 @@ class FakeGoogleDriveOAuthService:
         return SimpleNamespace(
             status=self.get_status(),
             html_body="<html><body>connected</body></html>",
+            subject_email="soolik1990@gmail.com",
+            subject_id="user-123",
         )
 
     def disconnect(self):
@@ -387,6 +391,7 @@ class RoutesV1Test(unittest.TestCase):
             applier=FakeApplier(),
             reindex_fn=reindex_fn,
             google_drive_oauth_service=oauth_service,
+            session_auth=SignedSessionAuth(secret="session-secret-that-is-definitely-long-enough"),
         )
 
     def route_endpoint(self, router, path, method):
@@ -437,6 +442,24 @@ class RoutesV1Test(unittest.TestCase):
 
         self.assertTrue(oauth_service.disconnect_called)
         self.assertFalse(body["connected"])
+
+    def test_v1_session_status_reports_cookie_authentication(self):
+        router = self.build_router()
+        session_auth = SignedSessionAuth(secret="session-secret-that-is-definitely-long-enough")
+        request = SimpleNamespace(cookies={session_auth.cookie_name: session_auth.issue(email="soolik1990@gmail.com", subject="user-123")})
+
+        body = self.route_endpoint(router, "/v1/auth/session/status", "GET")(request=request).model_dump(mode="json")
+
+        self.assertTrue(body["authenticated"])
+        self.assertEqual(body["email"], "soolik1990@gmail.com")
+
+    def test_v1_session_logout_clears_cookie(self):
+        router = self.build_router()
+
+        response = self.route_endpoint(router, "/v1/auth/session/logout", "POST")()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("gm_session=", response.headers.get("set-cookie", ""))
 
     def test_v1_chat_auto_creates_conversation_and_persists_messages(self):
         seen = {}
@@ -663,6 +686,26 @@ class RoutesV1Test(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertEqual(body["chat"]["kind"], "creative")
         self.assertEqual(body["chat"]["artifact_type"], "scene_seed")
+
+    def test_v1_assistant_action_confirm_executes_inferred_request(self):
+        router = self.build_router(
+            chat_fn=lambda req: ChatResponse(kind="creative", reply="Hooki gotowe.", references=[], artifact_type="session_hooks", artifact_text="Hook 1\nHook 2")
+        )
+
+        body = self.route_endpoint(router, "/v1/assistant/actions", "POST")(
+            request=AssistantActionRequest(
+                action_type=AssistantActionType.confirm_inferred_action,
+                message="Przygotuj hooki i zapisz je.",
+                mode=AssistantMode.create,
+                artifact_type="session_hooks",
+                save_output=True,
+                output_title="Hooki 01",
+            )
+        ).model_dump(mode="json")
+
+        self.assertEqual(body["action_type"], AssistantActionType.confirm_inferred_action.value)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["chat"]["kind"], "creative")
 
     def test_v1_artifact_generate_returns_continuity_report(self):
         def fake_chat(req):

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
+import jwt
 from fastapi.responses import JSONResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token
@@ -22,6 +24,43 @@ class VerifiedRequestIdentity:
 
 class RequestAuthError(RuntimeError):
     pass
+
+
+@dataclass
+class SignedSessionAuth:
+    secret: str
+    cookie_name: str = "gm_session"
+    ttl_seconds: int = 60 * 60 * 24 * 14
+
+    def issue(self, *, email: str, subject: Optional[str] = None) -> str:
+        now = int(time.time())
+        payload = {
+            "iat": now,
+            "exp": now + self.ttl_seconds,
+            "purpose": "web_session",
+            "email": email,
+            "sub": subject,
+        }
+        return jwt.encode(payload, self.secret, algorithm="HS256")
+
+    def verify_cookie(self, cookie_value: Optional[str]) -> VerifiedRequestIdentity:
+        if not cookie_value:
+            raise RequestAuthError("Missing web session.")
+        try:
+            payload = jwt.decode(cookie_value, self.secret, algorithms=["HS256"])
+        except Exception as exc:
+            raise RequestAuthError("Web session is invalid or expired.") from exc
+        if payload.get("purpose") != "web_session":
+            raise RequestAuthError("Unexpected web session purpose.")
+        email = payload.get("email")
+        if not email:
+            raise RequestAuthError("Web session is missing email.")
+        return VerifiedRequestIdentity(
+            email=email,
+            subject=payload.get("sub"),
+            audience="web_session",
+            issuer="local_session",
+        )
 
 
 @dataclass
@@ -65,17 +104,25 @@ class GoogleRequestAuth:
 
 
 class RequestAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, *, auth: GoogleRequestAuth, public_paths: Sequence[str]):
+    def __init__(self, app, *, auth: GoogleRequestAuth, public_paths: Sequence[str], session_auth: Optional[SignedSessionAuth] = None):
         super().__init__(app)
         self.auth = auth
         self.public_paths = tuple(public_paths)
+        self.session_auth = session_auth
 
     async def dispatch(self, request, call_next):
         path = request.url.path
         if path in self.public_paths:
             return await call_next(request)
         try:
-            identity = self.auth.verify_bearer(request.headers.get("Authorization"))
+            identity = None
+            authorization_header = request.headers.get("Authorization")
+            if authorization_header:
+                identity = self.auth.verify_bearer(authorization_header)
+            elif self.session_auth:
+                identity = self.session_auth.verify_cookie(request.cookies.get(self.session_auth.cookie_name))
+            else:
+                raise RequestAuthError("Missing bearer token.")
         except RequestAuthError as exc:
             return JSONResponse(
                 status_code=401,

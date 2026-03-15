@@ -72,6 +72,7 @@ class GoogleDriveOAuthServiceTest(unittest.TestCase):
             ),
             http_post=http_post or (lambda *args, **kwargs: FakeResponse(payload={})),
             http_get=http_get or (lambda *args, **kwargs: FakeResponse(payload={})),
+            allowed_emails=["soolik1990@gmail.com"],
         )
 
     def test_start_authorization_returns_google_url(self):
@@ -109,9 +110,29 @@ class GoogleDriveOAuthServiceTest(unittest.TestCase):
 
         self.assertTrue(result.status.connected)
         self.assertEqual(result.status.subject_email, "soolik1990@gmail.com")
+        self.assertEqual(result.subject_email, "soolik1990@gmail.com")
         self.assertIsNotNone(store.secret)
         self.assertEqual(token_calls[0][1]["code"], "auth-code")
         self.assertEqual(user_calls[0][1]["Authorization"], "Bearer access-token")
+
+    def test_handle_callback_rejects_disallowed_email(self):
+        def fake_post(url, data=None, timeout=None):
+            return FakeResponse(
+                payload={
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "scope": "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/documents",
+                }
+            )
+
+        def fake_get(url, headers=None, timeout=None):
+            return FakeResponse(payload={"email": "other@example.com"})
+
+        service = self.build_service(store=FakeStore(), http_post=fake_post, http_get=fake_get)
+        state = service.start_authorization().authorization_url.split("state=", 1)[1].split("&", 1)[0]
+
+        with self.assertRaisesRegex(RuntimeError, "not allowed"):
+            service.handle_callback(code="auth-code", state=state)
 
     def test_disconnect_clears_stored_credentials(self):
         store = FakeStore()

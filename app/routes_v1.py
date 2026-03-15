@@ -3,8 +3,8 @@ from __future__ import annotations
 import uuid
 from typing import Callable, Optional, Type
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from .api_models import (
     AssistantActionRequest,
@@ -29,6 +29,7 @@ from .api_models import (
     V1ChatResponse,
     V1HealthResponse,
     V1SessionPrepRequest,
+    WebSessionStatusResponse,
     WorldModelChangeApplyResponse,
     WorldModelChangeDecisionRequest,
     WorldModelChangeListResponse,
@@ -47,6 +48,7 @@ from .chat_service import ChatService, StreamPlan
 from .chat_models import ChatRequest, ChatResponse
 from .conversation_store import ConversationStore, NullConversationStore
 from .google_drive_oauth_service import GoogleDriveOAuthError, GoogleDriveOAuthService
+from .request_auth import RequestAuthError, SignedSessionAuth
 from .routed_drive_store import DriveWriteAccessError
 from .world_model_service import WorldModelService
 from .world_model_store import NullWorldModelStore, WorldModelStore
@@ -85,6 +87,7 @@ def build_v1_router(
     applier: Optional[ProposalApplier] = None,
     reindex_fn: Optional[Callable[[list], dict]] = None,
     google_drive_oauth_service: Optional[GoogleDriveOAuthService] = None,
+    session_auth: Optional[SignedSessionAuth] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/v1", tags=["v1"])
     store = workflow_store or NullWorkflowStore()
@@ -139,6 +142,22 @@ def build_v1_router(
             write_mode=status.write_mode if status else "service_account",
         )
 
+    @router.get("/auth/session/status", response_model=WebSessionStatusResponse)
+    def v1_session_status(request: Request):
+        trace = _new_trace()
+        identity = None
+        if session_auth:
+            try:
+                identity = session_auth.verify_cookie(request.cookies.get(session_auth.cookie_name))
+            except RequestAuthError:
+                identity = None
+        return WebSessionStatusResponse(
+            request_id=trace.request_id,
+            trace_id=trace.trace_id,
+            authenticated=identity is not None,
+            email=identity.email if identity else None,
+        )
+
     @router.post("/auth/google-drive/start", response_model=GoogleDriveOAuthStartResponse)
     def v1_google_drive_auth_start():
         trace = _new_trace()
@@ -185,7 +204,32 @@ def build_v1_router(
                 code="google_drive_oauth_callback_failed",
                 message=str(exc),
             )
-        return HTMLResponse(content=result.html_body)
+        response = HTMLResponse(content=result.html_body)
+        if session_auth and result.subject_email:
+            response.set_cookie(
+                session_auth.cookie_name,
+                session_auth.issue(email=result.subject_email, subject=result.subject_id),
+                httponly=True,
+                secure=True,
+                samesite="lax",
+                max_age=session_auth.ttl_seconds,
+                path="/",
+            )
+        return response
+
+    @router.post("/auth/session/logout", response_model=WebSessionStatusResponse)
+    def v1_session_logout():
+        trace = _new_trace()
+        response = WebSessionStatusResponse(
+            request_id=trace.request_id,
+            trace_id=trace.trace_id,
+            authenticated=False,
+            email=None,
+        )
+        transport = JSONResponse(response.model_dump(mode="json"))
+        if session_auth:
+            transport.delete_cookie(session_auth.cookie_name, path="/")
+        return transport
 
     @router.post("/auth/google-drive/disconnect", response_model=GoogleDriveOAuthStatusResponse)
     def v1_google_drive_auth_disconnect():
@@ -523,6 +567,39 @@ def build_v1_router(
                 action_type=request.action_type,
                 ok=True,
                 summary="Revision response generated.",
+                chat=chat_response,
+            )
+
+        if request.action_type == AssistantActionType.confirm_inferred_action:
+            if not request.message:
+                raise _api_error(
+                    400,
+                    request_trace=trace,
+                    code="missing_message",
+                    message="message is required for confirm_inferred_action.",
+                )
+            chat_response = chat_service.run(
+                trace=trace,
+                message=request.message,
+                assistant_mode=request.mode,
+                intent="auto",
+                artifact_type=request.artifact_type,
+                source_title=request.source_title,
+                candidate_text=request.candidate_text,
+                include_sources=request.include_sources,
+                include_telemetry=request.include_telemetry,
+                save_output=request.save_output,
+                output_title=request.output_title,
+                conversation_id=request.conversation_id,
+                conversation_title=None,
+                confirmed=True,
+            )
+            return AssistantActionResponse(
+                request_id=trace.request_id,
+                trace_id=trace.trace_id,
+                action_type=request.action_type,
+                ok=True,
+                summary="Confirmed action executed.",
                 chat=chat_response,
             )
 

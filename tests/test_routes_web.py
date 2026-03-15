@@ -18,14 +18,15 @@ class RoutesWebTest(unittest.TestCase):
         self.assertEqual(response.status_code, 307)
         self.assertEqual(response.headers["location"], "/gm")
 
-    def test_gm_page_contains_web_client_id_and_title(self):
+    def test_gm_page_contains_title_and_session_ui(self):
         router = build_web_router(google_client_id="client-id.apps.googleusercontent.com")
 
         response = self.route_endpoint(router, "/gm", "GET")()
         body = response.body.decode("utf-8")
 
         self.assertIn("AI Czat MG", body)
-        self.assertIn("client-id.apps.googleusercontent.com", body)
+        self.assertIn("Polacz konto Google", body)
+        self.assertIn("/auth/session/status", body)
         self.assertIn("/v1", body)
 
 

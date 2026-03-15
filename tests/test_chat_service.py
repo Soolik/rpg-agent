@@ -7,7 +7,8 @@ from app.conversation_store import ConversationMessageRecord, ConversationRecord
 
 
 class FakeDriveStore:
-    pass
+    def list_world_docs(self):
+        return []
 
 
 class FakePlanner:
@@ -214,6 +215,61 @@ class ChatServiceTest(unittest.TestCase):
 
         summary_updates = [item for item in store.metadata_updates if "summary_text" in item["metadata_patch"]]
         self.assertEqual(summary_updates, [])
+
+    def test_run_auto_requires_confirmation_before_save_output(self):
+        seen = {"called": False}
+
+        def fake_chat(_req):
+            seen["called"] = True
+            return ChatResponse(kind="creative", reply="Nigdy nie powinno sie wykonac od razu.", references=[])
+
+        store = FakeConversationStore()
+        service = self.build_service(fake_chat, store)
+        response = service.run(
+            trace=RequestTrace(request_id="req-4", trace_id="req-4"),
+            message="Przygotuj 3 hooki i zapisz je do Google Docs.",
+            assistant_mode=AssistantMode.auto,
+            intent="auto",
+            artifact_type=None,
+            source_title=None,
+            candidate_text=None,
+            include_sources=False,
+            include_telemetry=False,
+            save_output=False,
+            output_title=None,
+            conversation_id=None,
+            conversation_title=None,
+        )
+
+        self.assertFalse(seen["called"])
+        self.assertEqual(response.title, "Potwierdz zapis")
+        self.assertEqual(response.next_actions[0].type, "confirm_inferred_action")
+        self.assertIn("Nic jeszcze nie zostalo zapisane", response.reply_markdown)
+
+    def test_run_auto_infers_guard_from_candidate_text(self):
+        def fake_chat(_req):
+            raise AssertionError("guard path should not call creative chat fn")
+
+        store = FakeConversationStore()
+        service = self.build_service(fake_chat, store)
+        response = service.run(
+            trace=RequestTrace(request_id="req-5", trace_id="req-5"),
+            message="Sprawdz to z kanonem.",
+            assistant_mode=AssistantMode.auto,
+            intent="auto",
+            artifact_type=None,
+            source_title=None,
+            candidate_text="Captain Mira zdradzila Red Blade.",
+            include_sources=False,
+            include_telemetry=False,
+            save_output=False,
+            output_title=None,
+            conversation_id=None,
+            conversation_title=None,
+        )
+
+        self.assertEqual(response.mode, AssistantMode.guard)
+        self.assertIn("Guard Report", response.title)
 
 
 if __name__ == "__main__":

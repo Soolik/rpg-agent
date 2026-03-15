@@ -58,6 +58,8 @@ class GoogleDriveOAuthStart:
 class GoogleDriveOAuthCallbackResult:
     status: GoogleDriveOAuthStatus
     html_body: str
+    subject_email: Optional[str] = None
+    subject_id: Optional[str] = None
 
 
 class GoogleDriveOAuthError(RuntimeError):
@@ -70,6 +72,7 @@ class GoogleDriveOAuthService:
     config: Optional[GoogleDriveOAuthConfig] = None
     http_post: Callable[..., requests.Response] = requests.post
     http_get: Callable[..., requests.Response] = requests.get
+    allowed_emails: Sequence[str] = field(default_factory=list)
 
     def is_configured(self) -> bool:
         return self.config is not None
@@ -121,6 +124,8 @@ class GoogleDriveOAuthService:
 
         userinfo = self._fetch_userinfo(access_token)
         subject_email = userinfo.get("email")
+        if self.allowed_emails and (subject_email or "").lower() not in {item.lower() for item in self.allowed_emails}:
+            raise GoogleDriveOAuthError("This Google account is not allowed for this deployment.")
         scopes = str(token_payload.get("scope") or " ".join(config.scopes)).split()
 
         encrypted_refresh = self._encrypt_refresh_token(refresh_token)
@@ -140,7 +145,12 @@ class GoogleDriveOAuthService:
             "<p>You can close this tab.</p>"
             "</body></html>"
         )
-        return GoogleDriveOAuthCallbackResult(status=status, html_body=body)
+        return GoogleDriveOAuthCallbackResult(
+            status=status,
+            html_body=body,
+            subject_email=subject_email,
+            subject_id=userinfo.get("sub"),
+        )
 
     def disconnect(self) -> GoogleDriveOAuthStatus:
         if not self.is_configured():

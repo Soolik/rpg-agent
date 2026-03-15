@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from starlette.responses import JSONResponse
 
-from app.request_auth import GoogleRequestAuth, RequestAuthError, RequestAuthMiddleware
+from app.request_auth import GoogleRequestAuth, RequestAuthError, RequestAuthMiddleware, SignedSessionAuth
 
 
 class GoogleRequestAuthTest(unittest.TestCase):
@@ -60,6 +60,7 @@ class RequestAuthMiddlewareTest(unittest.TestCase):
                 },
                 request_factory=lambda: object(),
             ),
+            session_auth=SignedSessionAuth(secret="session-secret-that-is-definitely-long-enough"),
             public_paths=("/health", "/v1/health", "/v1/auth/google-drive/callback"),
         )
 
@@ -79,13 +80,14 @@ class RequestAuthMiddlewareTest(unittest.TestCase):
             }
         )
 
-    def build_request(self, path, authorization=None):
+    def build_request(self, path, authorization=None, cookies=None):
         headers = {}
         if authorization:
             headers["Authorization"] = authorization
         return SimpleNamespace(
             url=SimpleNamespace(path=path),
             headers=headers,
+            cookies=cookies or {},
             state=SimpleNamespace(),
         )
 
@@ -108,6 +110,16 @@ class RequestAuthMiddlewareTest(unittest.TestCase):
     def test_protected_path_accepts_valid_google_token(self):
         middleware = self.build_middleware()
         request = self.build_request("/protected", authorization="Bearer token-value")
+        response = self._run(self.call_dispatch(middleware, request))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body, b'{"email":"soolik1990@gmail.com","subject":"user-123"}')
+
+    def test_protected_path_accepts_valid_session_cookie(self):
+        middleware = self.build_middleware()
+        session_auth = middleware.session_auth
+        cookie_value = session_auth.issue(email="soolik1990@gmail.com", subject="user-123")
+        request = self.build_request("/protected", cookies={session_auth.cookie_name: cookie_value})
         response = self._run(self.call_dispatch(middleware, request))
 
         self.assertEqual(response.status_code, 200)
