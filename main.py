@@ -1387,7 +1387,7 @@ def collect_canonical_names(message: str, hits: List[Dict[str, Any]], limit: int
     def add_name(value: Optional[str]) -> None:
         cleaned = normalize_text_artifacts(value or "").strip()
         key = normalize_world_model_key(cleaned)
-        if not cleaned or not key or key in seen:
+        if not cleaned or not key or key in seen or key in PROPER_NOUN_IGNORE_KEYS:
             return
         seen.add(key)
         names.append(cleaned)
@@ -1449,8 +1449,13 @@ PROPER_NOUN_IGNORE_KEYS = {
     "rola w kampanii",
     "scene opportunities",
     "sekret",
+    "stworz",
     "stawki",
     "tytul",
+    "wymy",
+    "wymysl",
+    "pomysl",
+    "zaproponuj",
 }
 
 NPC_FRESH_ANGLES = [
@@ -1462,6 +1467,29 @@ NPC_FRESH_ANGLES = [
     "portowa brokerka plotek i kontrabandowych kontraktow, zawsze o krok od katastrofy finansowej albo naglego awansu",
     "harpunnik z reputacja przesadnego szczesciarza, ktorego ludzie boja sie bardziej niz lubia",
     "kaplanka sztormu na uslugach kapitanow, rozdzierana miedzy omenami morza a brutalna praktyka Shackles",
+]
+
+NPC_BROAD_SETTING_ANCHORS = {
+    "port peril",
+    "portu peril",
+    "shackles",
+}
+
+NPC_BLOCKED_STORY_ANCHORS = [
+    "Black Eel",
+    "Tavin Morn",
+    "Ressa Vane",
+    "Iven Vane",
+    "Captain Mira",
+    "Red Blade",
+]
+
+CREATIVE_NPC_SETTING_DOC_TITLES = [
+    "Przewodnik po Shackles",
+    "Places",
+    "NPCs",
+    "Factions",
+    "Campaign Bible",
 ]
 
 
@@ -1506,6 +1534,74 @@ def pick_npc_fresh_angle(message: str) -> str:
     return NPC_FRESH_ANGLES[digest[0] % len(NPC_FRESH_ANGLES)]
 
 
+def canonical_name_looks_like_broad_setting_anchor(name: str) -> bool:
+    normalized = normalize_creative_request_text(name)
+    return normalized in NPC_BROAD_SETTING_ANCHORS
+
+
+def should_use_setting_only_creative_context(message: str, canonical_names: List[str]) -> bool:
+    if not message_requests_original_character(message):
+        return False
+    meaningful_names = []
+    for name in canonical_names:
+        normalized = normalize_creative_request_text(name)
+        if not normalized or normalized.startswith("wymy"):
+            continue
+        meaningful_names.append(normalized)
+    if not meaningful_names:
+        return True
+    return all(name in NPC_BROAD_SETTING_ANCHORS for name in meaningful_names)
+
+
+def collect_disallowed_character_names(message: str, canonical_names: List[str]) -> List[str]:
+    names: List[str] = []
+    seen = set()
+
+    def add_name(value: Optional[str]) -> None:
+        cleaned = re.sub(r"\s+", " ", normalize_text_artifacts(value or "").strip()).strip(" -*:;,.!?()[]{}\"'")
+        key = normalize_world_model_key(cleaned)
+        if not cleaned or not key or key in seen:
+            return
+        seen.add(key)
+        names.append(cleaned)
+
+    for prior_name in extract_recent_generated_character_names(message):
+        add_name(prior_name)
+    for name in canonical_names:
+        if not canonical_name_looks_like_broad_setting_anchor(name):
+            add_name(name)
+
+    if world_model_store_v2:
+        try:
+            for entity in world_model_store_v2.list_entities(limit=250):
+                kind = normalize_match_text(getattr(entity, "entity_kind", "") or "")
+                if kind not in {"npc", "character", "person"}:
+                    continue
+                add_name(getattr(entity, "name", ""))
+        except Exception:
+            pass
+
+    base_names = list(names)
+    for name in base_names:
+        parts = [part for part in re.split(r"\s+", name) if part]
+        if len(parts) >= 2 and len(parts[-1]) >= 4:
+            add_name(parts[-1])
+    return names
+
+
+def find_unrequested_story_anchors(text: str, message: str, blocked_story_anchors: List[str]) -> List[str]:
+    content = normalize_creative_request_text(text)
+    request = normalize_creative_request_text(extract_latest_user_message(message) or message)
+    found: List[str] = []
+    for anchor in blocked_story_anchors:
+        anchor_key = normalize_creative_request_text(anchor)
+        if not anchor_key or anchor_key in request:
+            continue
+        if anchor_key in content:
+            found.append(anchor)
+    return found
+
+
 def candidate_reuses_existing_character_identity(candidate: str, disallowed_names: List[str]) -> bool:
     candidate_key = normalize_world_model_key(candidate)
     if not candidate_key:
@@ -1529,6 +1625,8 @@ def build_original_character_guidance(
     marker: str,
     message: str,
     disallowed_names: List[str],
+    setting_only_request: bool = False,
+    blocked_story_anchors: Optional[List[str]] = None,
 ) -> str:
     angle = pick_npc_fresh_angle(message)
     if marker == "Imie:":
@@ -1542,12 +1640,21 @@ def build_original_character_guidance(
                 blocked,
             ]
         )
+    blocked_cast = ", ".join(disallowed_names[:6]) if disallowed_names else "[brak]"
+    blocked_plots = ", ".join((blocked_story_anchors or [])[:6]) if blocked_story_anchors else "[brak]"
     return "\n".join(
         [
             "To ma byc nowa, oryginalna postac, a nie ukryta tozsamosc ani przerobka istniejacej postaci z kanonu.",
             f"Jesli prosba jest szeroka, oprzyj postac o swiezy kierunek: {angle}.",
             "Uzywaj istniejacego lore jako tla, nacisku lub punktu zaczepienia, ale nie buduj calej postaci wokol jednego glownego watku z kontekstu, jesli uzytkownik tego nie zazadal.",
             "Unikaj domyslnego schematu: powracajacy swiadek, dawna zdrada, zemsta za Black Eel, ukryty krewny glownej postaci.",
+            f"Nie opieraj tej postaci na istniejacych osobach ani ich rodzinach: {blocked_cast}.",
+            (
+                f"W tej prosbie postac ma przede wszystkim pasowac do settingu, nie do glownego plotu. "
+                f"Nie kotwicz jej wokol tych aktywnych nazw i watkow: {blocked_plots}."
+                if setting_only_request
+                else "Jesli chcesz nawiazac do biezacej kampanii, zrob to lekko i funkcjonalnie, bez przejmowania cudzego watku."
+            ),
             "Kazda sekcja ma pokazywac inny wymiar tej postaci: fach, styl bycia, presje dnia codziennego, przewage, slabosc i realna uzytecznosc na sesji.",
         ]
     )
@@ -2196,6 +2303,8 @@ def generate_section_candidate(
     require_canonical_name: bool,
     original_character_request: bool = False,
     disallowed_character_names: Optional[List[str]] = None,
+    setting_only_request: bool = False,
+    blocked_story_anchors: Optional[List[str]] = None,
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
     allowed_proper_nouns = collect_section_allowed_proper_nouns(
@@ -2216,6 +2325,8 @@ def generate_section_candidate(
             marker=marker,
             message=message,
             disallowed_names=disallowed_character_names or [],
+            setting_only_request=setting_only_request,
+            blocked_story_anchors=blocked_story_anchors,
         )
         if artifact_type == "npc_brief" and original_character_request
         else ""
@@ -2314,8 +2425,13 @@ ZWROC TYLKO TRESC SEKCJI:
         and marker == "Imie:"
         and candidate_reuses_existing_character_identity(candidate, disallowed_character_names or [])
     )
+    blocked_story_anchor_hits = (
+        find_unrequested_story_anchors(candidate, message, blocked_story_anchors or [])
+        if artifact_type == "npc_brief" and original_character_request and setting_only_request and marker != "Imie:"
+        else []
+    )
     missing_name = require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)
-    if needs_retry or missing_name or unknown_proper_nouns or reused_character_identity:
+    if needs_retry or missing_name or unknown_proper_nouns or reused_character_identity or blocked_story_anchor_hits:
         retry_rule = section_retry_rule(artifact_type, marker)
         if require_canonical_name and canonical_names:
             retry_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
@@ -2323,6 +2439,8 @@ ZWROC TYLKO TRESC SEKCJI:
             retry_rule += " Usun nowe nazwy wlasne spoza dozwolonej listy, zwlaszcza: " + ", ".join(unknown_proper_nouns) + "."
         if reused_character_identity:
             retry_rule += " Imie musi nalezec do nowej, oryginalnej postaci. Nie powtarzaj zadnego istniejacego imienia ani nazwiska z kontekstu."
+        if blocked_story_anchor_hits:
+            retry_rule += " Nie buduj tej sekcji wokol glownych aktywnych watkow kampanii ani tych nazw: " + ", ".join(blocked_story_anchor_hits) + "."
         try:
             retry_candidate = run_prompt(retry_rule, temperature=0.35)
             if retry_candidate:
@@ -2352,6 +2470,12 @@ ZWROC TYLKO TRESC SEKCJI:
         and original_character_request
         and marker == "Imie:"
         and candidate_reuses_existing_character_identity(candidate, disallowed_character_names or [])
+    ) or (
+        artifact_type == "npc_brief"
+        and original_character_request
+        and setting_only_request
+        and marker != "Imie:"
+        and find_unrequested_story_anchors(candidate, message, blocked_story_anchors or [])
     ):
         candidate = repair_creative_section(
             artifact_type=artifact_type,
@@ -2367,6 +2491,8 @@ ZWROC TYLKO TRESC SEKCJI:
             require_canonical_name=require_canonical_name,
             original_character_request=original_character_request,
             disallowed_character_names=disallowed_character_names,
+            setting_only_request=setting_only_request,
+            blocked_story_anchors=blocked_story_anchors,
         )
         attempts.append(
             {
@@ -2386,12 +2512,20 @@ ZWROC TYLKO TRESC SEKCJI:
         and original_character_request
         and marker == "Imie:"
         and candidate_reuses_existing_character_identity(candidate, disallowed_character_names or [])
+    ) or (
+        artifact_type == "npc_brief"
+        and original_character_request
+        and setting_only_request
+        and marker != "Imie:"
+        and find_unrequested_story_anchors(candidate, message, blocked_story_anchors or [])
     ):
         compact_rule = compact_retry_rule(artifact_type, marker)
         if require_canonical_name and canonical_names:
             compact_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
         if artifact_type == "npc_brief" and original_character_request and marker == "Imie:":
             compact_rule += " Wygeneruj nowe imie lub imie i nazwisko, inne niz jakakolwiek znana postac z kontekstu."
+        if artifact_type == "npc_brief" and original_character_request and setting_only_request and marker != "Imie:":
+            compact_rule += " Nie wracaj do aktywnego glownego plotu kampanii. Daj bardziej swiezy, lokalny i settingowy pomysl."
         try:
             compact_candidate = run_prompt(compact_rule, temperature=0.25)
             if compact_candidate:
@@ -2427,6 +2561,11 @@ ZWROC TYLKO TRESC SEKCJI:
                 final_candidate = forced_candidate
         except Exception:
             pass
+    final_blocked_story_anchors = (
+        find_unrequested_story_anchors(final_candidate, message, blocked_story_anchors or [])
+        if artifact_type == "npc_brief" and original_character_request and setting_only_request and marker != "Imie:"
+        else []
+    )
     record_telemetry(
         "sections",
         {
@@ -2445,6 +2584,7 @@ ZWROC TYLKO TRESC SEKCJI:
             ),
             "contains_canonical_name": any(name in final_candidate for name in canonical_names) if canonical_names else False,
             "unknown_proper_nouns": final_unknown_proper_nouns,
+            "blocked_story_anchors": final_blocked_story_anchors,
             "final_preview": final_candidate[:180],
         },
     )
@@ -2467,6 +2607,8 @@ def generate_bullet_item(
     target_index: int,
     original_character_request: bool = False,
     disallowed_character_names: Optional[List[str]] = None,
+    setting_only_request: bool = False,
+    blocked_story_anchors: Optional[List[str]] = None,
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
     allowed_proper_nouns = collect_section_allowed_proper_nouns(
@@ -2488,6 +2630,8 @@ def generate_bullet_item(
             marker=marker,
             message=message,
             disallowed_names=disallowed_character_names or [],
+            setting_only_request=setting_only_request,
+            blocked_story_anchors=blocked_story_anchors,
         )
         if artifact_type == "npc_brief" and original_character_request
         else ""
@@ -2560,6 +2704,8 @@ ZWROC TYLKO NOWY BULLET:
             extra_rule = "Zwroc bardzo konkretne jedno zdanie, max 18 slow, zakonczone kropka."
         if require_canonical_name and canonical_names and not any(name in " ".join(existing_items) for name in canonical_names):
             extra_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
+        if artifact_type == "npc_brief" and original_character_request and setting_only_request:
+            extra_rule += " Nie wracaj do glownego aktywnego plotu kampanii. Daj bardziej lokalny, settingowy detal."
         effective_prompt = prompt if not extra_rule else f"{prompt}\n\nDODATKOWA REGULA:\n{extra_rule.strip()}"
         try:
             candidate = clean_item(
@@ -2583,6 +2729,12 @@ ZWROC TYLKO NOWY BULLET:
                 not section_disallows_new_proper_nouns(artifact_type, marker)
                 or not find_unknown_proper_nouns(candidate, allowed_proper_nouns)
             )
+            and not (
+                artifact_type == "npc_brief"
+                and original_character_request
+                and setting_only_request
+                and find_unrequested_story_anchors(candidate, message, blocked_story_anchors or [])
+            )
         ):
             return candidate
     return ""
@@ -2603,6 +2755,8 @@ def repair_creative_section(
     require_canonical_name: bool,
     original_character_request: bool = False,
     disallowed_character_names: Optional[List[str]] = None,
+    setting_only_request: bool = False,
+    blocked_story_anchors: Optional[List[str]] = None,
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
     allowed_proper_nouns = collect_section_allowed_proper_nouns(
@@ -2624,6 +2778,8 @@ def repair_creative_section(
             marker=marker,
             message=message,
             disallowed_names=disallowed_character_names or [],
+            setting_only_request=setting_only_request,
+            blocked_story_anchors=blocked_story_anchors,
         )
         if artifact_type == "npc_brief" and original_character_request
         else ""
@@ -2677,6 +2833,7 @@ DODATKOWA REGULA:
 {section_retry_rule(artifact_type, marker)}
 {" Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "." if require_canonical_name and canonical_names else ""}
 {" Imie musi nalezec do nowej, oryginalnej postaci, a nie do istniejacej osoby z kontekstu." if artifact_type == "npc_brief" and original_character_request and marker == "Imie:" else ""}
+{" Nie wracaj do glownych aktywnych nazw i watkow kampanii, jesli uzytkownik o nie nie prosil." if artifact_type == "npc_brief" and original_character_request and setting_only_request and marker != "Imie:" else ""}
 
 ZWROC TYLKO POPRAWIONA TRESC SEKCJI:
 """.strip()
@@ -2704,6 +2861,14 @@ ZWROC TYLKO POPRAWIONA TRESC SEKCJI:
             and candidate_reuses_existing_character_identity(repaired, disallowed_character_names or [])
         ):
             return ""
+        if (
+            artifact_type == "npc_brief"
+            and original_character_request
+            and setting_only_request
+            and marker != "Imie:"
+            and find_unrequested_story_anchors(repaired, message, blocked_story_anchors or [])
+        ):
+            return ""
         return repaired
     except Exception:
         return sanitize_generated_section(marker, broken_content)
@@ -2723,6 +2888,8 @@ def generate_creative_section(
     require_canonical_name: bool,
     original_character_request: bool = False,
     disallowed_character_names: Optional[List[str]] = None,
+    setting_only_request: bool = False,
+    blocked_story_anchors: Optional[List[str]] = None,
 ) -> str:
     if is_bullet_section_marker(artifact_type, marker):
         candidate = generate_section_candidate(
@@ -2738,6 +2905,8 @@ def generate_creative_section(
             require_canonical_name=require_canonical_name,
             original_character_request=original_character_request,
             disallowed_character_names=disallowed_character_names,
+            setting_only_request=setting_only_request,
+            blocked_story_anchors=blocked_story_anchors,
         )
         items = complete_bullet_items(candidate)
         initial_item_count = len(items)
@@ -2759,6 +2928,8 @@ def generate_creative_section(
                 target_index=len(items) + 1,
                 original_character_request=original_character_request,
                 disallowed_character_names=disallowed_character_names,
+                setting_only_request=setting_only_request,
+                blocked_story_anchors=blocked_story_anchors,
             )
             if not next_item:
                 break
@@ -2780,6 +2951,8 @@ def generate_creative_section(
                 target_index=1,
                 original_character_request=original_character_request,
                 disallowed_character_names=disallowed_character_names,
+                setting_only_request=setting_only_request,
+                blocked_story_anchors=blocked_story_anchors,
             )
             if replacement:
                 if items:
@@ -2822,6 +2995,8 @@ def generate_creative_section(
         require_canonical_name=require_canonical_name,
         original_character_request=original_character_request,
         disallowed_character_names=disallowed_character_names,
+        setting_only_request=setting_only_request,
+        blocked_story_anchors=blocked_story_anchors,
     )
 
 
@@ -2838,22 +3013,9 @@ def generate_structured_creative_artifact(
     if artifact_type == "pre_session_brief":
         section_values["# Pre-Session Brief"] = ""
     original_character_request = artifact_type == "npc_brief" and message_requests_original_character(message)
-    disallowed_character_names = (
-        collect_allowed_proper_nouns(
-            message,
-            world_context,
-            structured_context,
-            recent_sessions_context,
-            canonical_names=canonical_names,
-        )
-        if original_character_request
-        else []
-    )
-    if original_character_request:
-        for prior_name in extract_recent_generated_character_names(message):
-            key = normalize_world_model_key(prior_name)
-            if key and all(normalize_world_model_key(existing) != key for existing in disallowed_character_names):
-                disallowed_character_names.append(prior_name)
+    setting_only_request = artifact_type == "npc_brief" and should_use_setting_only_creative_context(message, canonical_names)
+    disallowed_character_names = collect_disallowed_character_names(message, canonical_names) if original_character_request else []
+    blocked_story_anchors = NPC_BLOCKED_STORY_ANCHORS if setting_only_request else []
     specs = creative_section_specs(artifact_type)
     for spec in specs:
         body = generate_creative_section(
@@ -2869,6 +3031,8 @@ def generate_structured_creative_artifact(
             require_canonical_name=bool(spec.get("require_canonical_name")),
             original_character_request=original_character_request,
             disallowed_character_names=disallowed_character_names,
+            setting_only_request=setting_only_request,
+            blocked_story_anchors=blocked_story_anchors,
         )
         section_values[spec["marker"]] = body
     artifact_text = render_partial_artifact_sections(section_values, artifact_type)
@@ -3046,12 +3210,101 @@ ZWROC DOKLADNIE TEN FORMAT:
 """.strip()
 
 
+def is_original_character_story_doc(hit: Dict[str, Any]) -> bool:
+    title = normalize_match_text(hit.get("title") or "")
+    folder = normalize_match_text(hit.get("folder") or "")
+    if folder.startswith("02 sessions") or folder.startswith("08 outputs") or folder.startswith("00 admin"):
+        return True
+    return any(hint in title for hint in ("dossier", "black eel", "morn", "rozdzial", "chapter", "session"))
+
+
+def creative_setting_doc_priority(question: str, hit: Dict[str, Any]) -> int:
+    title = normalize_match_text(hit.get("title") or "")
+    folder = normalize_match_text(hit.get("folder") or "")
+    normalized_question = normalize_match_text(question)
+    score = 0
+    if title == "przewodnik po shackles":
+        score += 140
+    elif title == "places":
+        score += 125
+    elif title == "npcs":
+        score += 115
+    elif title == "factions":
+        score += 105
+    elif title == "campaign bible":
+        score += 95
+
+    if folder.startswith("04 locations"):
+        score += 40
+    elif folder.startswith("03 npc"):
+        score += 35
+    elif folder.startswith("01 bible"):
+        score += 30
+    elif folder.startswith("05 factions"):
+        score += 20
+
+    if "port peril" in normalized_question and ("port peril" in title or folder.startswith("04 locations")):
+        score += 15
+    if "shackles" in normalized_question and ("shackles" in title or folder.startswith("01 bible")):
+        score += 15
+    return score
+
+
+def shape_setting_hits_for_original_character(question: str, hits: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    filtered_hits = [
+        hit
+        for hit in hits
+        if not is_irrelevant_campaign_doc(hit) and not is_original_character_story_doc(hit)
+    ]
+
+    seeded_doc_ids = _lookup_doc_ids_by_title(CREATIVE_NPC_SETTING_DOC_TITLES)
+    seeded_hits = (
+        leading_chunks_for_docs(
+            seeded_doc_ids,
+            limit_per_doc=2,
+            total_limit=max(top_k + 4, 8),
+        )
+        if seeded_doc_ids
+        else []
+    )
+    boosted_hits = (
+        vector_search_in_docs(question, seeded_doc_ids, min(max(top_k + 2, 6), 12))
+        if seeded_doc_ids
+        else []
+    )
+    merged = merge_ranked_hits(seeded_hits, boosted_hits, limit=max(top_k + 6, 10))
+    merged = merge_ranked_hits(merged, filtered_hits, limit=max(top_k + 8, 12))
+    ordered = sorted(
+        merged,
+        key=lambda hit: (
+            -creative_setting_doc_priority(question, hit),
+            float(hit.get("distance") or 999.0),
+            normalize_match_text(hit.get("title") or ""),
+            normalize_match_text(hit.get("path_hint") or ""),
+        ),
+    )
+    selected: List[Dict[str, Any]] = []
+    per_doc_counts: Dict[str, int] = {}
+    for hit in ordered:
+        doc_id = str(hit.get("doc_id") or "")
+        current = per_doc_counts.get(doc_id, 0)
+        if doc_id and current >= 2:
+            continue
+        selected.append(hit)
+        if doc_id:
+            per_doc_counts[doc_id] = current + 1
+        if len(selected) >= max(top_k, 4):
+            break
+    return selected
+
+
 def load_creative_generation_context(
     message: str,
     *,
     structured_limit: int,
     recent_sessions_limit: int,
     vector_top_k: int,
+    artifact_type: Optional[ArtifactType] = None,
 ) -> Dict[str, Any]:
     search_message = extract_latest_user_message(message) or message
     structured_context = build_world_model_context(limit=structured_limit)
@@ -3064,20 +3317,46 @@ def load_creative_generation_context(
     if is_campaign_question(search_message) or has_likely_campaign_hits(hits):
         hits = augment_campaign_hits(search_message, hits, vector_top_k)
 
+    canonical_names = collect_canonical_names(search_message, hits)
+    setting_only_request = artifact_type == "npc_brief" and should_use_setting_only_creative_context(
+        search_message,
+        canonical_names,
+    )
+    if setting_only_request:
+        hits = shape_setting_hits_for_original_character(search_message, hits, vector_top_k)
+
     if hits:
         world_context = build_campaign_context(hits)
     else:
-        try:
-            world_context = build_context_for_planner(drive_store_v2)
-        except Exception:
-            world_context = "Brak dodatkowego kontekstu kampanii."
+        if setting_only_request:
+            seeded_doc_ids = _lookup_doc_ids_by_title(CREATIVE_NPC_SETTING_DOC_TITLES)
+            seeded_hits = (
+                leading_chunks_for_docs(
+                    seeded_doc_ids,
+                    limit_per_doc=2,
+                    total_limit=max(vector_top_k + 4, 8),
+                )
+                if seeded_doc_ids
+                else []
+            )
+            if seeded_hits:
+                hits = shape_setting_hits_for_original_character(search_message, seeded_hits, vector_top_k)
+                world_context = build_campaign_context(hits) if hits else "Brak dodatkowego kontekstu kampanii."
+            else:
+                world_context = "Brak dodatkowego kontekstu kampanii."
+        else:
+            try:
+                world_context = build_context_for_planner(drive_store_v2)
+            except Exception:
+                world_context = "Brak dodatkowego kontekstu kampanii."
 
     return {
         "structured_context": structured_context,
         "recent_sessions_context": recent_sessions_context,
         "hits": hits,
         "world_context": world_context,
-        "canonical_names": collect_canonical_names(search_message, hits),
+        "canonical_names": canonical_names,
+        "setting_only_request": setting_only_request,
     }
 
 
@@ -3091,6 +3370,7 @@ def generate_creative_artifact(
         structured_limit=30,
         recent_sessions_limit=5,
         vector_top_k=6,
+        artifact_type=artifact_type,
     )
     structured_context = creative_context["structured_context"]
     recent_sessions_context = creative_context["recent_sessions_context"]
@@ -3154,6 +3434,7 @@ def generate_pre_session_brief(message: str) -> tuple[str, List[str]]:
         structured_limit=40,
         recent_sessions_limit=6,
         vector_top_k=8,
+        artifact_type="pre_session_brief",
     )
     structured_context = creative_context["structured_context"]
     recent_sessions_context = creative_context["recent_sessions_context"]
