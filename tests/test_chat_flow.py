@@ -204,6 +204,63 @@ class ChatFlowTest(unittest.TestCase):
         self.assertEqual(len(seen["calls"]), 2)
         self.assertIn("## Co dziala", response.answer)
 
+    def test_ask_campaign_overview_falls_back_to_text_when_json_parse_fails(self):
+        original_vector_search = main.vector_search
+        original_gemini_generate = main.gemini_generate
+        original_augment_campaign_hits = main.augment_campaign_hits
+        seen = {"calls": []}
+
+        hits = [
+            {
+                "chunk_id": 1,
+                "doc_id": "doc-r1",
+                "doc_type": "gdoc",
+                "chunk_text": "Rozdzial 1 zaczyna sie w Port Peril i koncentruje na sprawie Morna.",
+                "distance": 0.2,
+                "title": "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+                "folder": "02 Sessions",
+                "path_hint": "02 Sessions / Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril",
+            },
+            {
+                "chunk_id": 2,
+                "doc_id": "doc-shackles",
+                "doc_type": "gdoc",
+                "chunk_text": "Shackles i Port Peril stanowia realia startowe kampanii.",
+                "distance": 0.25,
+                "title": "Przewodnik po Shackles",
+                "folder": "01 Bible",
+                "path_hint": "01 Bible / Przewodnik po Shackles",
+            },
+        ]
+
+        def fake_vector_search(question, top_k):
+            return hits
+
+        def fake_gemini_generate(prompt, **kwargs):
+            seen["calls"].append(prompt)
+            if kwargs.get("response_mime_type") == "application/json":
+                return "nie-json"
+            return "- Kampania zaczyna sie w Shackles, w Port Peril.\n- Rozdzial 1 obraca sie wokol sprawy Morna."
+
+        try:
+            main.vector_search = fake_vector_search
+            main.augment_campaign_hits = lambda question, current_hits, top_k: current_hits
+            main.gemini_generate = fake_gemini_generate
+            response = main.ask(
+                main.AskRequest(
+                    question="Co to kampania Krew Na Gwiazdach?",
+                    include_sources=False,
+                )
+            )
+        finally:
+            main.vector_search = original_vector_search
+            main.augment_campaign_hits = original_augment_campaign_hits
+            main.gemini_generate = original_gemini_generate
+
+        self.assertEqual(len(seen["calls"]), 3)
+        self.assertIn("Port Peril", response.answer)
+        self.assertIn("sprawy Morna", response.answer)
+
     def test_augment_campaign_hits_adds_shackles_documents_for_broad_campaign_questions(self):
         original_drive_store = getattr(main, "drive_store_v2", None)
         original_vector_search_in_docs = main.vector_search_in_docs

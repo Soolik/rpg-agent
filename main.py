@@ -3205,6 +3205,29 @@ ODPOWIEDZ:
 """.strip()
 
 
+def build_campaign_text_prompt(question: str, context: str) -> str:
+    return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Na podstawie notatek odpowiedz po polsku.
+
+ZASADY:
+1) Uzywaj tylko faktow z KONTEKSTU.
+2) Odpowiadaj konkretnie i pelnymi zdaniami, bez dopowiadania faktow spoza KONTEKSTU.
+3) Jesli pytanie jest ogolne, najpierw podaj fakty praktyczne: gdzie zaczyna sie kampania, jaki jest pierwszy rozdzial i jaka sprawa napedza start.
+4) Jesli w KONTEKST sa materiały o Shackles, Port Peril albo Rozdziale 1, uwzglednij je przed motywami ogolnymi.
+5) Unikaj materialow administracyjnych i technicznych list dokumentow.
+6) Jesli danych jest za malo, napisz wprost czego brakuje zamiast przechodzic w ogolniki.
+7) Uzyj listy punktowanej, jesli to pomaga czytelnosci.
+
+KONTEKST:
+{context}
+
+PYTANIE:
+{question}
+
+ODPOWIEDZ:
+""".strip()
+
+
 GITHUB_API = "https://api.github.com"
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "Soolik")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "rpg-agent")
@@ -3639,16 +3662,25 @@ ZŁY OUTPUT:
 
 POPRAWNY OUTPUT (tylko JSON):
 """.strip()
-            raw2 = gemini_generate(
-                fix,
-                response_mime_type="application/json",
-                temperature=0.0,
-                max_output_tokens=1500,
-            ).strip()
-            obj2 = json.loads(extract_json_object(raw2))
-            parsed = CampaignOut.model_validate(obj2)
+            try:
+                raw2 = gemini_generate(
+                    fix,
+                    response_mime_type="application/json",
+                    temperature=0.0,
+                    max_output_tokens=1500,
+                ).strip()
+                obj2 = json.loads(extract_json_object(raw2))
+                parsed = CampaignOut.model_validate(obj2)
+            except Exception:
+                parsed = None
 
-        answer = render_campaign_out(parsed)
+        answer: Optional[str] = render_campaign_out(parsed) if parsed is not None else None
+        if answer is None:
+            answer = gemini_generate(
+                build_campaign_text_prompt(q, context),
+                temperature=0.2,
+                max_output_tokens=1800,
+            ).strip()
         if analysis_mode and answer == CAMPAIGN_NOT_FOUND_MESSAGE:
             analysis_answer = gemini_generate(
                 build_campaign_analysis_text_prompt(q, context),
