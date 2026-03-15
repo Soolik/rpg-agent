@@ -1039,6 +1039,39 @@ class ChatFlowTest(unittest.TestCase):
 
         self.assertEqual(names, ["Captain Mira", "Red Blade"])
 
+    def test_collect_canonical_names_prefers_exact_world_name_over_inflected_prompt(self):
+        original_store = main.world_model_store_v2
+
+        class FakeStore:
+            def list_entities(self, limit=100, kind=None):
+                return [
+                    WorldEntityRecord(
+                        id=1,
+                        campaign_id="kng",
+                        entity_kind="location",
+                        name="Port Peril",
+                        description="Portowe miasto Shackles",
+                        tags=[],
+                        last_session_id=None,
+                        updated_at="2026-03-15T00:00:00+00:00",
+                    )
+                ]
+
+            def list_threads(self, limit=100, status=None):
+                return []
+
+        try:
+            main.world_model_store_v2 = FakeStore()
+            names = main.collect_canonical_names(
+                "Wymysl miejsce - klify nieopodal Portu Peril.",
+                [],
+            )
+        finally:
+            main.world_model_store_v2 = original_store
+
+        self.assertIn("Port Peril", names)
+        self.assertNotIn("Portu Peril", names)
+
     def test_generate_creative_artifact_session_hooks_uses_structured_sections(self):
         original_generate = main.gemini_generate
         original_build_world_model_context = main.build_world_model_context
@@ -1447,6 +1480,92 @@ Jak ich odroznic na sesji:
         self.assertIn("Imie: Mara Flint", artifact_text)
         self.assertEqual(references[:3], ["Przewodnik po Shackles", "Places", "NPCs"])
         self.assertTrue(any("Przewodnik po Shackles" in prompt and "Places" in prompt for prompt in prompts))
+        self.assertFalse(any("Dossier Morna - sprawa Black Eel" in prompt for prompt in prompts))
+
+    def test_generate_creative_artifact_npc_brief_followup_from_pack_stays_in_setting_context(self):
+        original_generate = main.gemini_generate
+        original_build_world_model_context = main.build_world_model_context
+        original_build_recent_sessions_context = main.build_recent_sessions_context
+        original_build_context_for_planner = main.build_context_for_planner
+        original_vector_search = main.vector_search
+        original_vector_search_in_docs = main.vector_search_in_docs
+        original_leading_chunks_for_docs = main.leading_chunks_for_docs
+        original_lookup_doc_ids_by_title = main._lookup_doc_ids_by_title
+        original_render_source_labels = main.render_source_labels
+        prompts = []
+        outputs = iter(
+            [
+                "Brann Torsk",
+                "Rybak-przewodnik, ktory utrzymuje rodzine z nocnych polowow przy rafach i z cichego prowadzenia lodzi tam, gdzie inni boja sie plywac.",
+                "Pachnie sieciami, tranem i dymem z taniego ogniska, a jego rece sa poorane od lin, haczykow i soli.",
+                "Chce splacic dlug za lodz, zanim faktorzy z Port Peril odbiora mu jedyne narzedzie pracy.",
+                "Wie, ze pod klifami kursuja nocne lodzie z kontrabanda, ale boi sie wskazac winnych bez ochrony.",
+                "* Port Peril: sprzedaje ryby tanim karczmom i zna, kto kupuje po cichu towar bez pytan.\n* Shackles: czyta fale, prady i zly humor morza lepiej niz urzedowe mapy.\n* BG: moze ich przewiezc przez rafy albo ostrzec, ktory pomost tej nocy lepiej omijac.",
+                "* Moze byc lokalnym przewodnikiem do klifow, plycizn i ukrytych pomostow.\n* Moze dostarczyc BG plotke o nocnych rozladunkach, zanim dotrze ona do calego portu.\n* Moze wpakowac BG w konflikt z faktorem, jesli beda chcieli mu pomoc wyjsc z dlugu.",
+            ]
+        )
+
+        def fake_generate(prompt, **kwargs):
+            prompts.append(prompt)
+            return next(outputs)
+
+        def hit(doc_id, title, folder, text, distance):
+            return {
+                "chunk_id": f"{doc_id}-{distance}",
+                "doc_id": doc_id,
+                "doc_type": "gdoc",
+                "chunk_text": text,
+                "distance": distance,
+                "title": title,
+                "folder": folder,
+                "path_hint": f"{folder} / {title}",
+            }
+
+        wrapped = (
+            "KONTEKST ROZMOWY:\n"
+            "Uzytkownik: Wymysl mi 3 postacie do Portu Peril.\n"
+            "Asystent: Motyw przewodni:\nPortowi wyrzutkowie.\n\nPostac 1:\nImie: Mara Flint\n\n"
+            "NOWA WIADOMOSC UZYTKOWNIKA:\n"
+            "Dobra, a teraz rybak.\n\n"
+            "Odpowiedz na ostatnia wiadomosc, zachowujac ciaglosc rozmowy i kanonu."
+        )
+
+        try:
+            main.gemini_generate = fake_generate
+            main.build_world_model_context = lambda limit=30: "KNOWN ENTITIES:\n- npc: Tavin Morn\n- location: Port Peril"
+            main.build_recent_sessions_context = lambda limit=5: "RECENT SESSIONS:\n- session_id=5 | source=Session 05 | summary=Black Eel wraca w plotkach portu."
+            main.build_context_for_planner = lambda drive_store: "Campaign context about Black Eel."
+            main.vector_search = lambda message, top_k: [
+                hit("doc-morn", "Dossier Morna - sprawa Black Eel", "02 Sessions", "Black Eel i Morn dominuja ten watek.", 0.15),
+                hit("doc-r1", "Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril", "02 Sessions", "Rozdzial 1 zaczyna sie od sprawy Morna.", 0.18),
+            ]
+            main._lookup_doc_ids_by_title = lambda titles: ["doc-shackles", "doc-places", "doc-npcs"]
+            main.leading_chunks_for_docs = lambda doc_ids, limit_per_doc=2, total_limit=8: [
+                hit("doc-shackles", "Przewodnik po Shackles", "01 Bible", "Shackles to archipelag wolnych kapitanow i brutalnego handlu.", 0.71),
+                hit("doc-places", "Places", "04 Locations", "Port Peril zyje z dokow, rozladunkow, tawern i szemranych ukladow.", 0.69),
+            ]
+            main.vector_search_in_docs = lambda message, doc_ids, top_k: [
+                hit("doc-npcs", "NPCs", "03 NPC", "Portowi brokerzy, rybacy i kontrabandzisci tworza tkanke miasta.", 0.62),
+            ]
+            main.render_source_labels = lambda hits: [hit["title"] for hit in hits]
+
+            artifact_text, references = main.generate_creative_artifact(
+                message=wrapped,
+                artifact_type="npc_brief",
+            )
+        finally:
+            main.gemini_generate = original_generate
+            main.build_world_model_context = original_build_world_model_context
+            main.build_recent_sessions_context = original_build_recent_sessions_context
+            main.build_context_for_planner = original_build_context_for_planner
+            main.vector_search = original_vector_search
+            main.vector_search_in_docs = original_vector_search_in_docs
+            main.leading_chunks_for_docs = original_leading_chunks_for_docs
+            main._lookup_doc_ids_by_title = original_lookup_doc_ids_by_title
+            main.render_source_labels = original_render_source_labels
+
+        self.assertIn("Imie: Brann Torsk", artifact_text)
+        self.assertEqual(references[:3], ["Przewodnik po Shackles", "Places", "NPCs"])
         self.assertFalse(any("Dossier Morna - sprawa Black Eel" in prompt for prompt in prompts))
 
     def test_generate_creative_artifact_npc_brief_retries_story_anchor_for_setting_only_request(self):

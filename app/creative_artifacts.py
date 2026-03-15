@@ -469,6 +469,8 @@ def section_needs_fill(
         return True
     if "do doprecyzowania" in lowered:
         return True
+    if not is_bullet_section_marker(artifact_type, marker) and bullet_count(raw) > 0:
+        return True
     if artifact_type == "session_hooks":
         if marker == "Tytul:":
             return "\n" in raw or len(raw.split()) > 12

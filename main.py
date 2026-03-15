@@ -1544,15 +1544,80 @@ def extract_titlecase_phrases(text: str) -> List[str]:
     return phrases
 
 
+PROPER_NOUN_INFLECTION_SUFFIXES = (
+    "owi",
+    "ego",
+    "emu",
+    "iem",
+    "ie",
+    "u",
+)
+
+
+def proper_noun_match_keys(value: Optional[str]) -> set[str]:
+    base = normalize_world_model_key(normalize_text_artifacts(value or ""))
+    if not base:
+        return set()
+
+    token_options: List[List[str]] = []
+    for token in base.split():
+        options = {token}
+        for suffix in PROPER_NOUN_INFLECTION_SUFFIXES:
+            if len(token) <= len(suffix) + 2 or not token.endswith(suffix):
+                continue
+            stripped = token[: -len(suffix)]
+            if stripped:
+                options.add(stripped)
+        token_options.append(sorted(options))
+
+    variants = {base}
+    combos = [""]
+    for options in token_options:
+        next_combos: List[str] = []
+        for prefix in combos:
+            for option in options:
+                next_combos.append(f"{prefix} {option}".strip())
+        combos = next_combos[:16]
+    variants.update(combo for combo in combos if combo)
+    return variants
+
+
+def proper_noun_keys_overlap(left: Optional[str], right: Optional[str]) -> bool:
+    left_keys = proper_noun_match_keys(left)
+    right_keys = proper_noun_match_keys(right)
+    if not left_keys or not right_keys:
+        return False
+    return bool(left_keys & right_keys)
+
+
+def text_mentions_any_name_variant(text: str, names: List[str]) -> bool:
+    normalized_text = normalize_world_model_key(normalize_text_artifacts(text))
+    if not normalized_text or not names:
+        return False
+
+    for name in names:
+        for key in proper_noun_match_keys(name):
+            if key and key in normalized_text:
+                return True
+
+    for candidate in extract_proper_noun_candidates(text):
+        if any(proper_noun_keys_overlap(candidate, name) for name in names):
+            return True
+    return False
+
+
 def collect_canonical_names(message: str, hits: List[Dict[str, Any]], limit: int = 12) -> List[str]:
     names: List[str] = []
     seen = set()
     normalized_message = normalize_world_model_key(normalize_text_artifacts(message))
+    message_name_candidates = extract_titlecase_phrases(message)
 
     def add_name(value: Optional[str]) -> None:
         cleaned = normalize_text_artifacts(value or "").strip()
         key = normalize_world_model_key(cleaned)
         if not cleaned or not key or key in seen or key in PROPER_NOUN_IGNORE_KEYS:
+            return
+        if any(proper_noun_keys_overlap(cleaned, existing) for existing in names):
             return
         seen.add(key)
         names.append(cleaned)
@@ -1560,10 +1625,14 @@ def collect_canonical_names(message: str, hits: List[Dict[str, Any]], limit: int
     try:
         if world_model_store_v2:
             for entity in world_model_store_v2.list_entities(limit=100):
-                if normalize_world_model_key(entity.name) in normalized_message:
+                if normalize_world_model_key(entity.name) in normalized_message or any(
+                    proper_noun_keys_overlap(candidate, entity.name) for candidate in message_name_candidates
+                ):
                     add_name(entity.name)
             for thread in world_model_store_v2.list_threads(limit=100):
-                if normalize_world_model_key(thread.title) in normalized_message:
+                if normalize_world_model_key(thread.title) in normalized_message or any(
+                    proper_noun_keys_overlap(candidate, thread.title) for candidate in message_name_candidates
+                ):
                     add_name(thread.title)
     except Exception:
         pass
@@ -1573,7 +1642,10 @@ def collect_canonical_names(message: str, hits: List[Dict[str, Any]], limit: int
 
     for hit in hits:
         title = (hit.get("title") or "").strip()
-        if title and normalize_world_model_key(title) in normalized_message:
+        if title and (
+            normalize_world_model_key(title) in normalized_message
+            or any(proper_noun_keys_overlap(candidate, title) for candidate in message_name_candidates)
+        ):
             add_name(title)
 
     return names[:limit]
@@ -1724,6 +1796,8 @@ def message_requests_original_character(message: str) -> bool:
     normalized = normalize_creative_request_text(latest)
     if not normalized:
         return False
+    if infer_creative_followup_artifact_type(message) == "npc_brief":
+        return True
     if "npc brief" in normalized and any(token in normalized for token in ("nowy", "nowego", "inna", "inna postac", "wymysl", "wmymysl", "stworz")):
         return True
     return any(verb in normalized for verb in ("wymysl", "wmymysl", "pomysl", "zaproponuj", "stworz")) and any(
@@ -1858,6 +1932,31 @@ def find_unrequested_story_anchors(text: str, message: str, blocked_story_anchor
         if anchor_key in content:
             found.append(anchor)
     return found
+
+
+def section_reuses_prior_content(
+    *,
+    artifact_type: ArtifactType,
+    marker: str,
+    candidate: str,
+    prior_sections_text: str,
+) -> bool:
+    normalized_candidate = normalize_section_body(candidate)
+    if not prior_sections_text or len(normalized_candidate) < 24:
+        return False
+
+    for prior_marker, prior_content in extract_artifact_sections(prior_sections_text, artifact_type).items():
+        if prior_marker == marker:
+            continue
+        normalized_prior = normalize_section_body(prior_content)
+        if len(normalized_prior) < 24:
+            continue
+        if normalized_candidate == normalized_prior:
+            return True
+        shorter, longer = sorted((normalized_candidate, normalized_prior), key=len)
+        if len(shorter) >= 24 and shorter in longer and (len(shorter) / max(len(longer), 1)) >= 0.72:
+            return True
+    return False
 
 
 def candidate_reuses_existing_character_identity(candidate: str, disallowed_names: List[str]) -> bool:
@@ -1997,19 +2096,24 @@ def collect_allowed_proper_nouns(*parts: str, canonical_names: Optional[List[str
     for name in canonical_names or []:
         add_name(name)
     for part in parts:
-        for phrase in extract_titlecase_phrases(part):
-            add_name(phrase)
-        for phrase in extract_proper_noun_candidates(part):
-            add_name(phrase)
+        segments = [segment.strip() for segment in re.split(r"[\r\n]+", part or "") if segment.strip()]
+        for segment in segments:
+            for phrase in extract_titlecase_phrases(segment):
+                add_name(phrase)
+            for phrase in extract_proper_noun_candidates(segment):
+                add_name(phrase)
     return allowed
 
 
 def find_unknown_proper_nouns(text: str, allowed_names: List[str]) -> List[str]:
-    allowed_keys = [normalize_world_model_key(name) for name in allowed_names if name]
     unknown: List[str] = []
     for candidate in extract_proper_noun_candidates(text):
-        key = normalize_world_model_key(candidate)
-        if any(key == allowed or key in allowed or allowed in key for allowed in allowed_keys):
+        candidate_key = normalize_world_model_key(normalize_text_artifacts(candidate))
+        if any(
+            proper_noun_keys_overlap(candidate, allowed)
+            or any(allowed_key and allowed_key in candidate_key for allowed_key in proper_noun_match_keys(allowed))
+            for allowed in allowed_names
+        ):
             continue
         unknown.append(candidate)
     return unknown
@@ -2723,13 +2827,22 @@ ZWROC TYLKO TRESC SEKCJI:
         and marker == "Imie:"
         and candidate_reuses_existing_character_identity(candidate, disallowed_character_names or [])
     )
+    reused_prior_content = section_reuses_prior_content(
+        artifact_type=artifact_type,
+        marker=marker,
+        candidate=candidate,
+        prior_sections_text=prior_sections_text,
+    )
     blocked_story_anchor_hits = (
         find_unrequested_story_anchors(candidate, message, blocked_story_anchors or [])
-        if artifact_type == "npc_brief" and original_character_request and setting_only_request and marker != "Imie:"
+        if setting_only_request and blocked_story_anchors and not (
+            (artifact_type == "npc_brief" and marker == "Imie:")
+            or (artifact_type == "location_brief" and marker == "Nazwa:")
+        )
         else []
     )
-    missing_name = require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)
-    if needs_retry or missing_name or unknown_proper_nouns or reused_character_identity or blocked_story_anchor_hits:
+    missing_name = require_canonical_name and canonical_names and not text_mentions_any_name_variant(candidate, canonical_names)
+    if needs_retry or missing_name or unknown_proper_nouns or reused_character_identity or reused_prior_content or blocked_story_anchor_hits:
         retry_rule = section_retry_rule(artifact_type, marker)
         if require_canonical_name and canonical_names:
             retry_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
@@ -2737,6 +2850,8 @@ ZWROC TYLKO TRESC SEKCJI:
             retry_rule += " Usun nowe nazwy wlasne spoza dozwolonej listy, zwlaszcza: " + ", ".join(unknown_proper_nouns) + "."
         if reused_character_identity:
             retry_rule += " Imie musi nalezec do nowej, oryginalnej postaci. Nie powtarzaj zadnego istniejacego imienia ani nazwiska z kontekstu."
+        if reused_prior_content:
+            retry_rule += " Nie powtarzaj ani nie parafrazuj juz wygenerowanej tresci z wczesniejszych sekcji; daj nowy, odrebny aspekt."
         if blocked_story_anchor_hits:
             retry_rule += " Nie buduj tej sekcji wokol glownych aktywnych watkow kampanii ani tych nazw: " + ", ".join(blocked_story_anchor_hits) + "."
         try:
@@ -2758,21 +2873,29 @@ ZWROC TYLKO TRESC SEKCJI:
         if section_disallows_new_proper_nouns(artifact_type, marker)
         else []
     )
+    reused_prior_content = section_reuses_prior_content(
+        artifact_type=artifact_type,
+        marker=marker,
+        candidate=candidate,
+        prior_sections_text=prior_sections_text,
+    )
     if section_needs_fill(
         artifact_type=artifact_type,
         marker=marker,
         content=candidate,
         is_last_marker=is_last_marker,
-    ) or (require_canonical_name and canonical_names and not any(name in candidate for name in canonical_names)) or unknown_proper_nouns or (
+    ) or (require_canonical_name and canonical_names and not text_mentions_any_name_variant(candidate, canonical_names)) or unknown_proper_nouns or reused_prior_content or (
         artifact_type == "npc_brief"
         and original_character_request
         and marker == "Imie:"
         and candidate_reuses_existing_character_identity(candidate, disallowed_character_names or [])
     ) or (
-        artifact_type == "npc_brief"
-        and original_character_request
-        and setting_only_request
-        and marker != "Imie:"
+        setting_only_request
+        and blocked_story_anchors
+        and not (
+            (artifact_type == "npc_brief" and marker == "Imie:")
+            or (artifact_type == "location_brief" and marker == "Nazwa:")
+        )
         and find_unrequested_story_anchors(candidate, message, blocked_story_anchors or [])
     ):
         candidate = repair_creative_section(
@@ -2800,21 +2923,29 @@ ZWROC TYLKO TRESC SEKCJI:
                 "complete_bullets": complete_bullet_count(candidate),
             }
         )
+    reused_prior_content = section_reuses_prior_content(
+        artifact_type=artifact_type,
+        marker=marker,
+        candidate=candidate,
+        prior_sections_text=prior_sections_text,
+    )
     if section_needs_fill(
         artifact_type=artifact_type,
         marker=marker,
         content=candidate,
         is_last_marker=is_last_marker,
-    ) or (
+    ) or reused_prior_content or (
         artifact_type == "npc_brief"
         and original_character_request
         and marker == "Imie:"
         and candidate_reuses_existing_character_identity(candidate, disallowed_character_names or [])
     ) or (
-        artifact_type == "npc_brief"
-        and original_character_request
-        and setting_only_request
-        and marker != "Imie:"
+        setting_only_request
+        and blocked_story_anchors
+        and not (
+            (artifact_type == "npc_brief" and marker == "Imie:")
+            or (artifact_type == "location_brief" and marker == "Nazwa:")
+        )
         and find_unrequested_story_anchors(candidate, message, blocked_story_anchors or [])
     ):
         compact_rule = compact_retry_rule(artifact_type, marker)
@@ -2822,7 +2953,12 @@ ZWROC TYLKO TRESC SEKCJI:
             compact_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
         if artifact_type == "npc_brief" and original_character_request and marker == "Imie:":
             compact_rule += " Wygeneruj nowe imie lub imie i nazwisko, inne niz jakakolwiek znana postac z kontekstu."
-        if artifact_type == "npc_brief" and original_character_request and setting_only_request and marker != "Imie:":
+        if reused_prior_content:
+            compact_rule += " Nie powtarzaj tresci poprzednich sekcji; zwroc inny, swiezy aspekt."
+        if setting_only_request and blocked_story_anchors and not (
+            (artifact_type == "npc_brief" and marker == "Imie:")
+            or (artifact_type == "location_brief" and marker == "Nazwa:")
+        ):
             compact_rule += " Nie wracaj do aktywnego glownego plotu kampanii. Daj bardziej swiezy, lokalny i settingowy pomysl."
         try:
             compact_candidate = run_prompt(compact_rule, temperature=0.25)
@@ -2861,7 +2997,10 @@ ZWROC TYLKO TRESC SEKCJI:
             pass
     final_blocked_story_anchors = (
         find_unrequested_story_anchors(final_candidate, message, blocked_story_anchors or [])
-        if artifact_type == "npc_brief" and original_character_request and setting_only_request and marker != "Imie:"
+        if setting_only_request and blocked_story_anchors and not (
+            (artifact_type == "npc_brief" and marker == "Imie:")
+            or (artifact_type == "location_brief" and marker == "Nazwa:")
+        )
         else []
     )
     record_telemetry(
@@ -2880,9 +3019,15 @@ ZWROC TYLKO TRESC SEKCJI:
                 content=final_candidate,
                 is_last_marker=is_last_marker,
             ),
-            "contains_canonical_name": any(name in final_candidate for name in canonical_names) if canonical_names else False,
+            "contains_canonical_name": text_mentions_any_name_variant(final_candidate, canonical_names) if canonical_names else False,
             "unknown_proper_nouns": final_unknown_proper_nouns,
             "blocked_story_anchors": final_blocked_story_anchors,
+            "reused_prior_content": section_reuses_prior_content(
+                artifact_type=artifact_type,
+                marker=marker,
+                candidate=final_candidate,
+                prior_sections_text=prior_sections_text,
+            ),
             "final_preview": final_candidate[:180],
         },
     )
@@ -3002,7 +3147,7 @@ ZWROC TYLKO NOWY BULLET:
             extra_rule = "Zwroc krotsze zdanie, zakonczone kropka."
         elif attempt == 2:
             extra_rule = "Zwroc bardzo konkretne jedno zdanie, max 18 slow, zakonczone kropka."
-        if require_canonical_name and canonical_names and not any(name in " ".join(existing_items) for name in canonical_names):
+        if require_canonical_name and canonical_names and not text_mentions_any_name_variant(" ".join(existing_items), canonical_names):
             extra_rule += " Uzyj co najmniej jednej z tych nazw kanonicznych dokladnie: " + ", ".join(canonical_names) + "."
         if artifact_type == "npc_brief" and original_character_request and setting_only_request:
             extra_rule += " Nie wracaj do glownego aktywnego plotu kampanii. Daj bardziej lokalny, settingowy detal."
@@ -3030,9 +3175,8 @@ ZWROC TYLKO NOWY BULLET:
                 or not find_unknown_proper_nouns(candidate, allowed_proper_nouns)
             )
             and not (
-                artifact_type == "npc_brief"
-                and original_character_request
-                and setting_only_request
+                setting_only_request
+                and blocked_story_anchors
                 and find_unrequested_story_anchors(candidate, message, blocked_story_anchors or [])
             )
         ):
@@ -3164,10 +3308,12 @@ ZWROC TYLKO POPRAWIONA TRESC SEKCJI:
         ):
             return ""
         if (
-            artifact_type == "npc_brief"
-            and original_character_request
-            and setting_only_request
-            and marker != "Imie:"
+            setting_only_request
+            and blocked_story_anchors
+            and not (
+                (artifact_type == "npc_brief" and marker == "Imie:")
+                or (artifact_type == "location_brief" and marker == "Nazwa:")
+            )
             and find_unrequested_story_anchors(repaired, message, blocked_story_anchors or [])
         ):
             return ""
@@ -3237,7 +3383,7 @@ def generate_creative_section(
                 break
             items.append(next_item)
 
-        if require_canonical_name and canonical_names and not any(name in " ".join(items) for name in canonical_names):
+        if require_canonical_name and canonical_names and not text_mentions_any_name_variant(" ".join(items), canonical_names):
             replacement = generate_bullet_item(
                 artifact_type=artifact_type,
                 marker=marker,
@@ -3315,13 +3461,17 @@ def generate_structured_creative_artifact(
     if artifact_type == "pre_session_brief":
         section_values["# Pre-Session Brief"] = ""
     original_character_request = artifact_type == "npc_brief" and message_requests_original_character(message)
-    setting_only_request = artifact_type == "npc_brief" and should_use_setting_only_creative_context(message, canonical_names)
+    setting_only_request = should_use_setting_only_creative_context_for_artifact(
+        artifact_type,
+        message,
+        canonical_names,
+    )
     disallowed_character_names = (
         collect_disallowed_character_names(message, canonical_names, structured_context)
         if original_character_request
         else []
     )
-    blocked_story_anchors = NPC_BLOCKED_STORY_ANCHORS if setting_only_request else []
+    blocked_story_anchors = NPC_BLOCKED_STORY_ANCHORS if setting_only_request and artifact_type in {"npc_brief", "location_brief"} else []
     specs = creative_section_specs(artifact_type)
     for spec in specs:
         body = generate_creative_section(
@@ -3626,7 +3776,7 @@ def load_creative_generation_context(
     canonical_names = collect_canonical_names(search_message, hits)
     setting_only_request = should_use_setting_only_creative_context_for_artifact(
         artifact_type,
-        search_message,
+        message,
         canonical_names,
     )
     if setting_only_request:
