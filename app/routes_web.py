@@ -4,12 +4,29 @@ import json
 from textwrap import dedent
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from .request_auth import RequestAuthError, SignedSessionAuth
 
-def _page() -> str:
-    config = json.dumps({"apiBase": "/v1"}, ensure_ascii=False)
+def _page(*, authenticated: bool = False, email: Optional[str] = None) -> str:
+    config = json.dumps(
+        {
+            "apiBase": "/v1",
+            "initialSession": {
+                "authenticated": authenticated,
+                "email": email or "",
+            },
+        },
+        ensure_ascii=False,
+    )
+    auth_label = f"Zalogowano: {email or 'uzytkownik'}" if authenticated else "Nie zalogowano"
+    auth_chip_class = "ok" if authenticated else "warn"
+    auth_note = (
+        "Czat i akcje po lewej sa aktywne."
+        if authenticated
+        else "Zaloguj konto Google, aby uzywac czatu i zapisywac na Drive."
+    )
     template = """\
 <!doctype html><html lang="pl"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -37,9 +54,9 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
 </style></head><body>
 <div class="shell"><aside class="side">
 <div class="brand"><h1>AI Czat MG</h1><p>Jedno wejscie do rozmow, kanonu i zapisow na Drive.</p></div>
-<section class="card stack"><span class="label">Konto Google</span><div id="auth" class="chip warn">Nie zalogowano</div><div id="authNote" class="muted">Zaloguj konto Google, aby uzywac czatu i zapisywac na Drive.</div><div class="row"><button id="loginBtn">Polacz konto Google</button><button id="signOut" class="secondary" disabled>Wyloguj</button></div></section>
-<section class="card stack"><span class="label">Drive</span><div id="drive" class="chip warn">Brak danych</div><div id="driveEmail" class="muted">Brak aktywnego polaczenia.</div><div class="row"><button id="connectDrive" disabled>Polacz Drive</button><button id="disconnectDrive" class="secondary" disabled>Odlacz</button></div></section>
-<section class="card stack"><div class="row"><button id="newConv" disabled>Nowa rozmowa</button><button id="refreshConv" class="secondary" disabled>Odswiez</button></div><span class="label">Rozmowy</span><div id="convList" class="list"></div></section>
+<section class="card stack"><span class="label">Konto Google</span><div id="auth" class="chip __AUTH_CHIP_CLASS__">__AUTH_LABEL__</div><div id="authNote" class="muted">__AUTH_NOTE__</div><div class="row"><button id="loginBtn" type="button" onclick="window.location.assign('/v1/auth/google-drive/start'); return false;">Polacz konto Google</button><button id="signOut" class="secondary"__SIGNOUT_DISABLED__>Wyloguj</button></div></section>
+<section class="card stack"><span class="label">Drive</span><div id="drive" class="chip warn">Brak danych</div><div id="driveEmail" class="muted">Brak aktywnego polaczenia.</div><div class="row"><button id="connectDrive" type="button" onclick="window.location.assign('/v1/auth/google-drive/start'); return false;"__CONNECT_DISABLED__>Polacz Drive</button><button id="disconnectDrive" class="secondary" disabled>Odlacz</button></div></section>
+<section class="card stack"><div class="row"><button id="newConv"__NEWCONV_DISABLED__>Nowa rozmowa</button><button id="refreshConv" class="secondary"__REFRESH_DISABLED__>Odswiez</button></div><span class="label">Rozmowy</span><div id="convList" class="list"></div></section>
 </aside><main class="main">
 <header class="hero"><h2 id="heroTitle">Konsola MG</h2><p id="heroSub">Napisz normalnym jezykiem. Agent sam wybierze tryb pracy i przed trwala zmiana poprosi o potwierdzenie.</p></header>
 <section class="chat"><div id="messages" class="messages"><div class="empty">Brak aktywnej rozmowy.</div></div></section>
@@ -53,7 +70,7 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
 <label style="align-self:end"><span class="label">Zapisz wynik do Drive</span><input id="saveOutput" type="checkbox"></label>
 </div>
 </details>
-<div class="row"><button id="send" disabled>Wyslij</button><button id="clear" class="secondary">Wyczysc</button><div id="stream" class="chip ok">Streaming gotowy</div></div>
+<div class="row"><button id="send"__SEND_DISABLED__>Wyslij</button><button id="clear" class="secondary">Wyczysc</button><div id="stream" class="chip ok">Streaming gotowy</div></div>
 <div class="muted">"Tytul dokumentu" ma sens tylko wtedy, gdy zapisujesz wynik. Jesli go nie podasz, agent nada sensowna nazwe sam.</div>
 </section>
 </main></div>
@@ -61,7 +78,7 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
 <script>
 (() => {
   const cfg = JSON.parse(document.getElementById("cfg").textContent);
-  const s = { authenticated: false, email: "", convs: [], cid: null, title: "", msgs: [], pending: -1 };
+  const s = { authenticated: Boolean(cfg.initialSession?.authenticated), email: cfg.initialSession?.email || "", convs: [], cid: null, title: "", msgs: [], pending: -1 };
   const byId = (id) => document.getElementById(id);
   const e = {
     auth: byId("auth"),
@@ -294,7 +311,7 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
   }
   async function selectConv(id) { s.cid = id; await loadMsgs(id); }
   function startGoogleFlow() {
-    window.location.assign(`${cfg.apiBase}/auth/google-drive/start`);
+    window.location.assign("/v1/auth/google-drive/start");
   }
   async function disconnectDriveFlow() { await request("/auth/google-drive/disconnect", { method: "POST" }); await loadDrive(); }
   async function logoutFlow() {
@@ -408,6 +425,11 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
     if (!e.send.disabled) sendMessage();
   });
   e.clear.addEventListener("click", () => { e.message.value = ""; e.candidate.value = ""; e.outputTitle.value = ""; e.saveOutput.checked = false; });
+  window.addEventListener("focus", () => { loadSession().catch(() => {}); });
+  window.addEventListener("pageshow", () => { loadSession().catch(() => {}); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") loadSession().catch(() => {});
+  });
   renderAuth();
   renderConvs();
   renderMsgs();
@@ -416,10 +438,21 @@ button,textarea,input{font:inherit} button{border:0;padding:10px 14px;border-rad
 })();
 </script></body></html>
 """
-    return dedent(template).replace("__CONFIG__", config)
+    return (
+        dedent(template)
+        .replace("__CONFIG__", config)
+        .replace("__AUTH_CHIP_CLASS__", auth_chip_class)
+        .replace("__AUTH_LABEL__", auth_label)
+        .replace("__AUTH_NOTE__", auth_note)
+        .replace("__SIGNOUT_DISABLED__", "" if authenticated else " disabled")
+        .replace("__CONNECT_DISABLED__", "" if authenticated else " disabled")
+        .replace("__NEWCONV_DISABLED__", "" if authenticated else " disabled")
+        .replace("__REFRESH_DISABLED__", "" if authenticated else " disabled")
+        .replace("__SEND_DISABLED__", "" if authenticated else " disabled")
+    )
 
 
-def build_web_router(*, google_client_id: Optional[str] = None) -> APIRouter:
+def build_web_router(*, google_client_id: Optional[str] = None, session_auth: Optional[SignedSessionAuth] = None) -> APIRouter:
     router = APIRouter(tags=["web"])
 
     @router.get("/", include_in_schema=False)
@@ -427,7 +460,13 @@ def build_web_router(*, google_client_id: Optional[str] = None) -> APIRouter:
         return RedirectResponse(url="/gm", status_code=307)
 
     @router.get("/gm", response_class=HTMLResponse, include_in_schema=False)
-    def gm_console():
-        return HTMLResponse(_page())
+    def gm_console(request: Request):
+        identity = None
+        if session_auth:
+            try:
+                identity = session_auth.verify_cookie(request.cookies.get(session_auth.cookie_name))
+            except RequestAuthError:
+                identity = None
+        return HTMLResponse(_page(authenticated=identity is not None, email=identity.email if identity else None))
 
     return router

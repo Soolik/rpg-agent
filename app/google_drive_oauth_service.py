@@ -138,10 +138,13 @@ class GoogleDriveOAuthService:
         status = self.get_status()
         subject = html.escape(subject_email or "unknown user")
         body = (
-            "<html><body>"
+            "<html><head>"
+            '<meta http-equiv="refresh" content="0; url=/gm">'
+            "<script>window.location.replace('/gm');</script>"
+            "</head><body>"
             "<h1>Google Drive connected</h1>"
             f"<p>Writes will now use <strong>{subject}</strong>.</p>"
-            '<p><a href="/gm">Return to GM Console</a></p>'
+            '<p>Returning to <a href="/gm">GM Console</a>...</p>'
             "<p>You can close this tab.</p>"
             "</body></html>"
         )

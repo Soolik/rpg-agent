@@ -4298,7 +4298,12 @@ proposal_applier_v2 = ProposalApplier(
     reindex_fn=reindex_after_apply_default,
     consistency_service=consistency_service_v1,
 )
-app.include_router(build_web_router(google_client_id=GOOGLE_OAUTH_CLIENT_ID))
+app.include_router(
+    build_web_router(
+        google_client_id=GOOGLE_OAUTH_CLIENT_ID,
+        session_auth=WEB_SESSION_AUTH,
+    )
+)
 app.include_router(
     build_v2_router(
         drive_store=drive_store_v2,
