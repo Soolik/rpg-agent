@@ -29,6 +29,8 @@ class RoutesWebTest(unittest.TestCase):
         self.assertIn("/auth/session/status", body)
         self.assertIn('const byId = (id) => document.getElementById(id);', body)
         self.assertIn('loginBtn: byId("loginBtn")', body)
+        self.assertIn('{"apiBase": "/v1"}', body)
+        self.assertNotIn("&quot;apiBase&quot;", body)
         self.assertIn("/v1", body)
 
 

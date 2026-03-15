@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from html import escape
 from textwrap import dedent
 from typing import Optional
 
@@ -10,7 +9,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 
 def _page() -> str:
-    config = escape(json.dumps({"apiBase": "/v1"}, ensure_ascii=False))
+    config = json.dumps({"apiBase": "/v1"}, ensure_ascii=False)
     template = """\
 <!doctype html><html lang="pl"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
