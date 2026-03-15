@@ -1502,13 +1502,27 @@ def render_source_labels(sources: List[Dict[str, Any]]) -> List[str]:
 
 def extract_titlecase_phrases(text: str) -> List[str]:
     ignored = {
+        "dobra",
+        "klify",
+        "lokacja",
+        "mag",
+        "maga",
+        "miejsce",
         "wymysl",
+        "wmymysl",
+        "wojownik",
+        "wojownika",
         "przygotuj",
+        "postac",
+        "postacie",
+        "rybak",
+        "rybaka",
         "stworz",
         "potrzebny",
         "daj",
         "zrob",
         "opisz",
+        "teraz",
     }
     titlecase_word = r"[A-ZĄĆĘŁŃÓŚŹŻ][A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż0-9'_-]*"
     normalized_text = normalize_text_artifacts(text or "")
@@ -1584,6 +1598,7 @@ PROPER_NOUN_IGNORE_KEYS = {
     "active threads",
     "campaign state",
     "co przygotowac",
+    "dobra",
     "hook",
     "hooks",
     "imie",
@@ -1591,11 +1606,19 @@ PROPER_NOUN_IGNORE_KEYS = {
     "jak uzyc na sesji",
     "jak uzyc tej postaci na sesji",
     "key npcs and factions",
+    "klif",
+    "klify",
+    "lokacja",
     "mg",
+    "mag",
+    "maga",
+    "miejsce",
     "motyw przewodni",
     "nazwa",
     "npc",
     "pierwsze wrazenie",
+    "postac",
+    "postacie",
     "postac 1",
     "postac 2",
     "postac 3",
@@ -1605,15 +1628,21 @@ PROPER_NOUN_IGNORE_KEYS = {
     "relacje",
     "risks and pressure points",
     "rola w kampanii",
+    "rybak",
+    "rybaka",
     "scene opportunities",
     "sekret",
     "sekret miejsca",
     "stworz",
     "stawki",
+    "teraz",
     "typ miejsca",
     "tytul",
+    "wojownik",
+    "wojownika",
     "wymy",
     "wymysl",
+    "wmymysl",
     "pomysl",
     "zaproponuj",
 }
@@ -1656,6 +1685,38 @@ CREATIVE_NPC_SETTING_DOC_TITLES = [
 def normalize_creative_request_text(value: str) -> str:
     compact = " ".join(normalize_text_artifacts(value or "").strip().lower().split())
     return "".join(ch for ch in unicodedata.normalize("NFKD", compact) if not unicodedata.combining(ch))
+
+
+REQUESTED_ROLE_PATTERNS = (
+    ("wojownika pirata", "pirat-wojownik"),
+    ("pirata wojownika", "pirat-wojownik"),
+    ("piratke wojowniczke", "piratka-wojowniczka"),
+    ("maga", "mag"),
+    ("magini", "magini"),
+    ("czarodziejke", "czarodziejka"),
+    ("czarodzieja", "czarodziej"),
+    ("rybaka", "rybak"),
+    ("rybaczke", "rybaczka"),
+    ("kapitana", "kapitan"),
+    ("kapitanke", "kapitanka"),
+    ("nawigatora", "nawigator"),
+    ("bosmana", "bosman"),
+    ("szkutnika", "szkutnik"),
+)
+
+
+def extract_requested_role_hints(message: str, limit: int = 4) -> List[str]:
+    normalized = normalize_followup_signal_text(extract_latest_user_message(message) or message)
+    roles: List[str] = []
+    seen = set()
+    for pattern, label in REQUESTED_ROLE_PATTERNS:
+        if pattern not in normalized or label in seen:
+            continue
+        seen.add(label)
+        roles.append(label)
+        if len(roles) >= limit:
+            break
+    return roles
 
 
 def message_requests_original_character(message: str) -> bool:
@@ -1826,12 +1887,19 @@ def build_original_character_guidance(
     blocked_story_anchors: Optional[List[str]] = None,
 ) -> str:
     angle = pick_npc_fresh_angle(message)
+    requested_roles = extract_requested_role_hints(message)
     if marker == "Imie:":
         blocked = "\n".join(f"- {name}" for name in disallowed_names[:8]) if disallowed_names else "- [brak]"
         return "\n".join(
             [
                 "To ma byc nowa, oryginalna postac, a nie istniejaca postac z kanonu ani jej reskin.",
                 f"Jesli prosba jest szeroka, nadaj postaci swiezy kierunek: {angle}.",
+                (
+                    "Jesli uzytkownik wskazal fach lub archetyp, imie ma pasowac do tej roli: "
+                    + ", ".join(requested_roles[:3]) + "."
+                    if requested_roles
+                    else "Jesli uzytkownik wskazal fach lub archetyp, imie ma od razu sugerowac ten fach."
+                ),
                 "Wymysl nowe imie albo imie i nazwisko brzmiace wiarygodnie dla Shackles i Port Peril.",
                 "Nie uzywaj zadnego z tych istniejacych imion ani nazwisk:",
                 blocked,
@@ -1844,6 +1912,11 @@ def build_original_character_guidance(
             "To ma byc nowa, oryginalna postac, a nie ukryta tozsamosc ani przerobka istniejacej postaci z kanonu.",
             f"Jesli prosba jest szeroka, oprzyj postac o swiezy kierunek: {angle}.",
             "Jesli uzytkownik podal archetyp, zawod albo klase, oprzyj postac wlasnie na tym fachu zamiast uciekac w generyczny dramat.",
+            (
+                "W tej odpowiedzi trzymaj sie doslownie jednego z zadanych fachow: " + ", ".join(requested_roles[:3]) + "."
+                if requested_roles
+                else "Gdy prosba zawiera fach lub zawod, daj go wprost w nominatywie i zbuduj wokol niego codziennosc postaci."
+            ),
             "To ma byc pirackie fantasy ze Shackles: morze, port, przesady, dlugi, kontrabanda, magia i przemoc maja byc wyczuwalne w szczegolach.",
             "Uzywaj istniejacego lore jako tla, nacisku lub punktu zaczepienia, ale nie buduj calej postaci wokol jednego glownego watku z kontekstu, jesli uzytkownik tego nie zazadal.",
             "Unikaj domyslnego schematu: powracajacy swiadek, dawna zdrada, zemsta za Black Eel, ukryty krewny glownej postaci.",
@@ -1966,22 +2039,32 @@ def build_proper_noun_guardrail(
 
 def collect_section_allowed_proper_nouns(
     *,
+    artifact_type: ArtifactType,
     message: str,
     world_context: str,
     structured_context: str,
     recent_sessions_context: str,
     prior_sections_text: str,
     canonical_names: List[str],
+    setting_only_request: bool = False,
     extra_parts: Optional[List[str]] = None,
 ) -> List[str]:
-    parts = [
-        message,
-        world_context,
-        structured_context,
-        recent_sessions_context,
-        prior_sections_text,
-        *(extra_parts or []),
-    ]
+    if setting_only_request and artifact_type in {"npc_brief", "location_brief"}:
+        parts = [
+            message,
+            world_context,
+            prior_sections_text,
+            *(extra_parts or []),
+        ]
+    else:
+        parts = [
+            message,
+            world_context,
+            structured_context,
+            recent_sessions_context,
+            prior_sections_text,
+            *(extra_parts or []),
+        ]
     return collect_allowed_proper_nouns(*parts, canonical_names=canonical_names)
 
 
@@ -2521,12 +2604,14 @@ def generate_section_candidate(
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
     allowed_proper_nouns = collect_section_allowed_proper_nouns(
+        artifact_type=artifact_type,
         message=message,
         world_context=world_context,
         structured_context=structured_context,
         recent_sessions_context=recent_sessions_context,
         prior_sections_text=prior_sections_text,
         canonical_names=canonical_names,
+        setting_only_request=setting_only_request,
     )
     proper_noun_rule = build_proper_noun_guardrail(
         artifact_type,
@@ -2825,12 +2910,14 @@ def generate_bullet_item(
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
     allowed_proper_nouns = collect_section_allowed_proper_nouns(
+        artifact_type=artifact_type,
         message=message,
         world_context=world_context,
         structured_context=structured_context,
         recent_sessions_context=recent_sessions_context,
         prior_sections_text=prior_sections_text,
         canonical_names=canonical_names,
+        setting_only_request=setting_only_request,
         extra_parts=["\n".join(existing_items)],
     )
     proper_noun_rule = build_proper_noun_guardrail(
@@ -2973,12 +3060,14 @@ def repair_creative_section(
 ) -> str:
     canonical_context = build_canonical_names_context(canonical_names)
     allowed_proper_nouns = collect_section_allowed_proper_nouns(
+        artifact_type=artifact_type,
         message=message,
         world_context=world_context,
         structured_context=structured_context,
         recent_sessions_context=recent_sessions_context,
         prior_sections_text=prior_sections_text,
         canonical_names=canonical_names,
+        setting_only_request=setting_only_request,
         extra_parts=[broken_content],
     )
     proper_noun_rule = build_proper_noun_guardrail(
@@ -3722,6 +3811,7 @@ def generate_npc_pack_artifact(
     setting_only_request: bool,
 ) -> str:
     count = extract_requested_character_count(message) or 3
+    requested_roles = extract_requested_role_hints(message, limit=count)
     disallowed_character_names = collect_disallowed_character_names(message, canonical_names, structured_context)
     blocked_story_anchors = NPC_BLOCKED_STORY_ANCHORS if setting_only_request else []
     blocked_names = "\n".join(f"- {name}" for name in disallowed_character_names[:12]) if disallowed_character_names else "- [brak]"
@@ -3734,6 +3824,7 @@ CEL:
 - Stworz dokladnie {count} rozne, oryginalne postacie do kampanii.
 - Jesli uzytkownik wymienil role lub archetypy, pokryj je po jednej postaci.
 - To ma byc pirackie fantasy ze Shackles i Port Peril, a nie trzy wariacje tej samej ponurej figury z tego samego watku.
+- Jesli role zostaly podane, rozdziel je jasno i bez kombinowania: {", ".join(requested_roles) if requested_roles else "[brak jawnej listy rol]"}.
 
 ZASADY:
 1) Zwracaj tylko finalny artefakt tekstowy.
@@ -3746,11 +3837,13 @@ ZASADY:
 7) Nie wracaj do tych aktywnych nazw i watkow, jesli uzytkownik o nie nie prosil: {blocked_plots}.
 8) Pisz naturalna polszczyzna. Unikaj generycznych moralitetow i powtorzen konstrukcji zdan.
 9) W kazdej sekcji `Postac N:` uzyj podpol: `Imie:`, `Archetyp:`, `Pierwszy obraz:`, `Motywacja:`, `Komplikacja:`, `Hak na sesje:`.
+10) Pole `Archetyp:` zapisuj naturalnie w mianowniku, np. `pirat-wojownik`, `mag sztormu`, `rybak-przewodnik`, a nie w przypadkach typu `wojownika pirata`.
 
 WYTYCZNE STYLU:
 - Postacie maja byc grywalne i natychmiast rozpoznawalne glosami, fachami i problemami.
 - Nie powtarzaj tego samego nazwiska, sekretu ani motywacji.
 - Daj rozrzut miedzy przemoc, magie, prace portowa, spryt, wierzenia i biede.
+- Nie buduj postaci wokol abstrakcyjnych hasel typu `dobro`, `prawda`, `sprawiedliwosc`, jesli uzytkownik o to nie prosi. Pokazuj konkretny fach, nacisk i brud codziennosci.
 
 {canonical_names_context}
 
