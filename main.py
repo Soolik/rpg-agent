@@ -2862,7 +2862,7 @@ def is_campaign_overview_question(text: str) -> bool:
 
 def is_first_part_campaign_question(text: str) -> bool:
     normalized = normalize_match_text(text)
-    hints = ("pierwsza czesc", "pierwsza część", "pierwszy rozdzial", "rozdzial 1", "akt 1", "port peril", "shackles")
+    hints = ("pierwsza czesc", "pierwsza część", "pierwszy rozdzial", "rozdzial 1", "akt 1")
     return any(hint in normalized for hint in hints)
 
 
@@ -3005,6 +3005,248 @@ def build_campaign_source_answer(question: str, docs: List[WorldDocInfo]) -> str
         "- Jesli czegos nie ma w tych notatkach, powinienem powiedziec to wprost zamiast odpowiadac ogolnym pomyslem na kampanie."
     )
     return "\n".join(lines)
+
+
+NUMBERED_SECTION_RE = re.compile(r"(?m)^(?P<num>\d+)\.\s+(?P<title>[^\n]+)\s*$")
+
+
+def _find_campaign_doc(title: str) -> Optional[WorldDocInfo]:
+    drive_store = globals().get("drive_store_v2")
+    if drive_store is None:
+        return None
+
+    try:
+        if hasattr(drive_store, "find_doc"):
+            found = drive_store.find_doc(title=title)
+            if found:
+                return found
+    except TypeError:
+        pass
+    except Exception:
+        return None
+
+    try:
+        for doc in drive_store.list_world_docs():
+            if doc.title == title:
+                return doc
+    except Exception:
+        return None
+    return None
+
+
+def _read_campaign_doc_text(title: str) -> str:
+    drive_store = globals().get("drive_store_v2")
+    if drive_store is None or not hasattr(drive_store, "read_doc"):
+        return ""
+    doc = _find_campaign_doc(title)
+    if not doc:
+        return ""
+    try:
+        return normalize_text_artifacts(drive_store.read_doc(doc))
+    except Exception:
+        return ""
+
+
+def split_numbered_sections(text: str) -> List[tuple[str, str]]:
+    normalized = normalize_text_artifacts(text or "").strip()
+    if not normalized:
+        return []
+    matches = list(NUMBERED_SECTION_RE.finditer(normalized))
+    if not matches:
+        return []
+
+    sections: List[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+        title = match.group("title").strip()
+        body = normalized[start:end].strip()
+        sections.append((title, body))
+    return sections
+
+
+def find_numbered_section_body(text: str, *needles: str) -> str:
+    normalized_needles = [normalize_match_text(needle) for needle in needles if needle]
+    if not normalized_needles:
+        return ""
+    for title, body in split_numbered_sections(text):
+        normalized_title = normalize_match_text(title)
+        if any(needle in normalized_title for needle in normalized_needles):
+            return body
+    return ""
+
+
+def compact_doc_excerpt(text: str, *, max_sentences: int = 2, max_chars: int = 420) -> str:
+    cleaned = re.sub(r"\s+", " ", normalize_text_artifacts(text or "")).strip()
+    if not cleaned:
+        return ""
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
+    excerpt = " ".join(sentences[:max_sentences]).strip() if sentences else cleaned
+    if not excerpt:
+        excerpt = cleaned
+    if len(excerpt) <= max_chars:
+        return excerpt
+    shortened = excerpt[:max_chars].rstrip(" ,;:-")
+    last_stop = max(shortened.rfind(". "), shortened.rfind("? "), shortened.rfind("! "))
+    if last_stop >= max_chars // 2:
+        shortened = shortened[: last_stop + 1].rstrip()
+    return shortened.rstrip() + ("." if shortened and shortened[-1] not in ".!?" else "")
+
+
+def extract_named_lines(text: str, *, limit: int = 4) -> List[str]:
+    names: List[str] = []
+    seen = set()
+    for raw_line in normalize_text_artifacts(text or "").splitlines():
+        line = raw_line.strip()
+        if not line or ":" in line or line.endswith("."):
+            continue
+        if len(line) > 80 or len(line) < 4:
+            continue
+        if re.match(r"^\d+\.\s+", line):
+            continue
+        if not re.match(r"^[A-Z][A-Za-z0-9\"' -]+$", line):
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        names.append(line)
+        if len(names) >= limit:
+            break
+    return names
+
+
+def build_campaign_overview_doc_answer() -> tuple[Optional[str], List[WorldDocInfo]]:
+    bible_doc = _find_campaign_doc("Campaign Bible")
+    shackles_doc = _find_campaign_doc("Przewodnik po Shackles")
+    chapter_doc = _find_campaign_doc("Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
+    morn_doc = _find_campaign_doc("Dossier Morna - sprawa Black Eel")
+
+    bible_text = _read_campaign_doc_text("Campaign Bible")
+    shackles_text = _read_campaign_doc_text("Przewodnik po Shackles")
+    chapter_text = _read_campaign_doc_text("Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
+    morn_text = _read_campaign_doc_text("Dossier Morna - sprawa Black Eel")
+
+    if not any([bible_text, shackles_text, chapter_text, morn_text]):
+        return None, []
+
+    premise = compact_doc_excerpt(find_numbered_section_body(bible_text, "premisa"), max_sentences=2)
+    shackles_everyday = compact_doc_excerpt(find_numbered_section_body(shackles_text, "czym shackles jest"), max_sentences=2)
+    port_reality = compact_doc_excerpt(find_numbered_section_body(shackles_text, "jak wygladaja porty"), max_sentences=1)
+    chapter_start = compact_doc_excerpt(find_numbered_section_body(chapter_text, "streszczenie dla mg"), max_sentences=2)
+    central_conflict = compact_doc_excerpt(find_numbered_section_body(bible_text, "centralny konflikt"), max_sentences=2)
+    morn_core = compact_doc_excerpt(find_numbered_section_body(morn_text, "rdzen sprawy"), max_sentences=2)
+
+    bullets: List[str] = []
+    if premise:
+        bullets.append(f"- Kampania ma taki punkt wyjscia: {premise}")
+    if shackles_everyday or port_reality:
+        setting = " ".join(part for part in [shackles_everyday, port_reality] if part).strip()
+        bullets.append(f"- Realia kampanii sa mocno osadzone w Shackles i Port Peril: {setting}")
+    if chapter_start:
+        bullets.append(f"- Pierwsza konkretna czesc kampanii zaczyna sie tak: {chapter_start}")
+    if morn_core:
+        bullets.append(f"- Jednym z najwazniejszych watkow startowych jest sprawa Morna / Black Eel: {morn_core}")
+    if central_conflict:
+        bullets.append(f"- Szeroka stawka kampanii jest taka: {central_conflict}")
+    if chapter_start or central_conflict:
+        combined = " ".join(part for part in [chapter_start, central_conflict] if part).strip()
+        bullets.append(
+            f"- Dla bohaterow oznacza to wejscie w kampanie od razu przez konflikt polityczny, dlugi, przysiegi i presje publiczna: {compact_doc_excerpt(combined, max_sentences=2)}"
+        )
+
+    docs = [doc for doc in [bible_doc, shackles_doc, chapter_doc, morn_doc] if doc]
+    return ("\n".join(bullets).strip() or None), docs
+
+
+def build_first_part_doc_answer() -> tuple[Optional[str], List[WorldDocInfo]]:
+    chapter_doc = _find_campaign_doc("Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
+    shackles_doc = _find_campaign_doc("Przewodnik po Shackles")
+
+    chapter_text = _read_campaign_doc_text("Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
+    shackles_text = _read_campaign_doc_text("Przewodnik po Shackles")
+    if not chapter_text:
+        return None, []
+
+    summary = find_numbered_section_body(chapter_text, "streszczenie dla mg")
+    background = find_numbered_section_body(chapter_text, "tlo", "motywy")
+    characters = find_numbered_section_body(chapter_text, "postacie")
+    shackles_everyday = find_numbered_section_body(shackles_text, "czym shackles jest")
+    shackles_ports = find_numbered_section_body(shackles_text, "jak wygladaja porty")
+
+    names = extract_named_lines(characters, limit=4)
+    start_excerpt = compact_doc_excerpt(summary, max_sentences=2)
+    issue_excerpt = compact_doc_excerpt(background or summary, max_sentences=2)
+    location_excerpt = compact_doc_excerpt(" ".join(part for part in [shackles_everyday, shackles_ports] if part), max_sentences=2)
+    tension_excerpt = compact_doc_excerpt(background, max_sentences=2)
+
+    bullets: List[str] = []
+    if start_excerpt:
+        bullets.append(f"- Rozdzial 1 zaczyna sie w taki sposob: {start_excerpt}")
+    if issue_excerpt:
+        bullets.append(f"- Glowna sprawa startowa wyglada tak: {issue_excerpt}")
+    if names:
+        bullets.append(f"- Najwazniejsze postacie tej czesci to: {', '.join(names)}.")
+    if location_excerpt:
+        bullets.append(f"- Najwazniejsze lokacje i realia tej czesci to Port Peril i Shackles: {location_excerpt}")
+    if tension_excerpt:
+        bullets.append(f"- Najwazniejsze napiecia polityczne w pierwszej czesci to: {tension_excerpt}")
+    if start_excerpt or tension_excerpt:
+        combined = " ".join(part for part in [start_excerpt, tension_excerpt] if part).strip()
+        bullets.append(f"- Dla dalszej kampanii ta pierwsza czesc ustawia taki kierunek: {compact_doc_excerpt(combined, max_sentences=2)}")
+
+    docs = [doc for doc in [chapter_doc, shackles_doc] if doc]
+    return ("\n".join(bullets).strip() or None), docs
+
+
+def build_morn_doc_answer() -> tuple[Optional[str], List[WorldDocInfo]]:
+    morn_doc = _find_campaign_doc("Dossier Morna - sprawa Black Eel")
+    chapter_doc = _find_campaign_doc("Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
+    shackles_doc = _find_campaign_doc("Przewodnik po Shackles")
+
+    morn_text = _read_campaign_doc_text("Dossier Morna - sprawa Black Eel")
+    chapter_text = _read_campaign_doc_text("Krew Na Gwiazdach - Rozdzial 1 - Cienie w Port Peril")
+    shackles_text = _read_campaign_doc_text("Przewodnik po Shackles")
+    if not morn_text:
+        return None, []
+
+    core = find_numbered_section_body(morn_text, "rdzen sprawy")
+    cargo = find_numbered_section_body(morn_text, "ladunek")
+    target = find_numbered_section_body(morn_text, "co trzymal morn")
+    packet = find_numbered_section_body(morn_text, "pakiecie u halvine")
+    chapter_summary = find_numbered_section_body(chapter_text, "streszczenie dla mg")
+    shackles_ports = find_numbered_section_body(shackles_text, "jak wygladaja porty")
+
+    names = extract_named_lines(core, limit=4)
+
+    bullets: List[str] = []
+    if core:
+        bullets.append(f"- Sama sprawa Morna / Black Eel wyglada tak: {compact_doc_excerpt(core, max_sentences=2)}")
+    if names:
+        bullets.append(f"- Najwazniejsze osoby w tej sprawie to: {', '.join(names)}.")
+    elif core:
+        bullets.append(f"- Po stronie ludzi zaangazowanych najwazniejszy jest ten rdzen sprawy: {compact_doc_excerpt(core, max_sentences=1)}")
+    if cargo:
+        bullets.append(f"- Kluczowy ladunek i material dowodowy wyglada tak: {compact_doc_excerpt(cargo, max_sentences=2)}")
+    if packet or target:
+        combined = " ".join(part for part in [target, packet] if part).strip()
+        bullets.append(f"- Morn stal sie celem i trzymal takie dokumenty lub kopie: {compact_doc_excerpt(combined, max_sentences=2)}")
+    if chapter_summary or shackles_ports:
+        combined = " ".join(part for part in [chapter_summary, shackles_ports] if part).strip()
+        bullets.append(f"- Ta sprawa laczy sie z Shackles, Port Peril i startem kampanii tak: {compact_doc_excerpt(combined, max_sentences=2)}")
+
+    docs = [doc for doc in [morn_doc, chapter_doc, shackles_doc] if doc]
+    return ("\n".join(bullets).strip() or None), docs
+
+
+def build_doc_grounded_campaign_answer(question: str) -> tuple[Optional[str], List[WorldDocInfo]]:
+    normalized = normalize_match_text(question)
+    if is_morn_campaign_question(question):
+        return build_morn_doc_answer()
+    if is_first_part_campaign_question(question) or "pierwszej czesci" in normalized:
+        return build_first_part_doc_answer()
+    if is_campaign_overview_question(question):
+        return build_campaign_overview_doc_answer()
+    return None, []
 
 
 def boosted_doc_titles_for_question(question: str) -> List[str]:
@@ -3242,7 +3484,9 @@ def is_campaign_answer_too_thin(question: str, answer: str) -> bool:
 
     if is_campaign_overview_question(question):
         return bullet_count < 4 or char_count < 360
-    if is_morn_campaign_question(question) or is_first_part_campaign_question(question):
+    if is_morn_campaign_question(question):
+        return bullet_count < 4 or char_count < 260
+    if is_first_part_campaign_question(question):
         return bullet_count < 4 or char_count < 420
     if is_campaign_analysis_question(question):
         return char_count < 320
@@ -3312,6 +3556,115 @@ PYTANIE:
 
 ODPOWIEDZ (tylko JSON):
 """.strip()
+
+
+def build_first_part_campaign_structured_prompt(question: str, context: str) -> str:
+    return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Odpowiadasz po polsku wyłącznie na podstawie KONTEKSTU.
+
+ZWROC TYLKO JSON:
+{{
+  "start_point": "...",
+  "main_issue": "...",
+  "key_characters": "...",
+  "key_locations": "...",
+  "political_tensions": "...",
+  "campaign_impact": "..."
+}}
+
+ZASADY:
+1) Kazde pole musi byc 1-3 zdaniami i odnosic sie do konkretow z KONTEKSTU.
+2) Nie zostawiaj pustych pol. Gdy czegos brakuje, napisz "Brak danych w notatkach: ...".
+3) Nie zwracaj bulletow, markdownu ani komentarzy.
+4) Nie dopowiadaj faktow spoza KONTEKSTU.
+
+KONTEKST:
+{context}
+
+PYTANIE:
+{question}
+
+ODPOWIEDZ (tylko JSON):
+""".strip()
+
+
+def render_first_part_campaign_structured_answer(payload: Dict[str, Any]) -> str:
+    fields = [
+        payload.get("start_point", ""),
+        payload.get("main_issue", ""),
+        payload.get("key_characters", ""),
+        payload.get("key_locations", ""),
+        payload.get("political_tensions", ""),
+        payload.get("campaign_impact", ""),
+    ]
+    bullets = [f"- {normalize_text_artifacts(str(value)).strip()}" for value in fields if str(value).strip()]
+    return "\n".join(bullets).strip()
+
+
+def build_morn_campaign_structured_prompt(question: str, context: str) -> str:
+    return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Odpowiadasz po polsku wyłącznie na podstawie KONTEKSTU.
+
+ZWROC TYLKO JSON:
+{{
+  "what_happened": "...",
+  "involved_people": "...",
+  "key_documents_or_cargo": "...",
+  "connection_to_shackles": "...",
+  "political_stakes": "..."
+}}
+
+ZASADY:
+1) Kazde pole musi byc 1-3 zdaniami i odnosic sie do konkretow z KONTEKSTU.
+2) Nie zostawiaj pustych pol. Gdy czegos brakuje, napisz "Brak danych w notatkach: ...".
+3) Nie zwracaj bulletow, markdownu ani komentarzy.
+4) Nie dopowiadaj faktow spoza KONTEKSTU.
+
+KONTEKST:
+{context}
+
+PYTANIE:
+{question}
+
+ODPOWIEDZ (tylko JSON):
+""".strip()
+
+
+def render_morn_campaign_structured_answer(payload: Dict[str, Any]) -> str:
+    fields = [
+        payload.get("what_happened", ""),
+        payload.get("involved_people", ""),
+        payload.get("key_documents_or_cargo", ""),
+        payload.get("connection_to_shackles", ""),
+        payload.get("political_stakes", ""),
+    ]
+    bullets = [f"- {normalize_text_artifacts(str(value)).strip()}" for value in fields if str(value).strip()]
+    return "\n".join(bullets).strip()
+
+
+def try_structured_campaign_answer(
+    *,
+    question: str,
+    context: str,
+    prompt: str,
+    renderer,
+) -> Optional[str]:
+    try:
+        raw = gemini_generate(
+            prompt,
+            response_mime_type="application/json",
+            temperature=0.0,
+            max_output_tokens=2200,
+        ).strip()
+        payload = json.loads(extract_json_object(raw))
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    answer = renderer(payload).strip()
+    return answer or None
 
 
 def is_campaign_analysis_question(text: str) -> bool:
@@ -3954,6 +4307,9 @@ def ask(req: AskRequest):
         raw_question = normalize_text_artifacts(req.question or "").strip()
         q = extract_latest_user_message(raw_question) or raw_question
         source_question = is_campaign_source_question(q)
+        morn_question = is_morn_campaign_question(q)
+        first_part_question = is_first_part_campaign_question(q) or "pierwszej czesci" in normalize_match_text(q)
+        overview_question = is_campaign_overview_question(q)
         hits: List[Dict[str, Any]] = []
         analysis_mode = False
 
@@ -3968,7 +4324,7 @@ def ask(req: AskRequest):
         elif req.mode == "general":
             campaign_mode = False
         else:
-            campaign_mode = source_question or is_campaign_question(q)
+            campaign_mode = source_question or overview_question or first_part_question or morn_question or is_campaign_question(q)
             if not campaign_mode:
                 hits = vector_search(q, req.top_k)
                 campaign_mode = has_likely_campaign_hits(hits)
@@ -3976,6 +4332,12 @@ def ask(req: AskRequest):
         if not campaign_mode:
             answer = gemini_generate(build_general_prompt(q)).strip()
             return AskResponse(answer=answer, sources=[])
+
+        if not source_question and not analysis_mode and (overview_question or first_part_question or morn_question):
+            doc_answer, doc_answer_docs = build_doc_grounded_campaign_answer(q)
+            if doc_answer:
+                sources = source_records_from_docs(doc_answer_docs) if req.include_sources else []
+                return AskResponse(answer=doc_answer, sources=sources)
 
         if not hits:
             hits = vector_search(q, req.top_k)
@@ -3990,8 +4352,24 @@ def ask(req: AskRequest):
             prompt_builder = build_campaign_prompt
         prompt = prompt_builder(q, context)
 
+        answer: Optional[str] = None
+        if morn_question:
+            answer = try_structured_campaign_answer(
+                question=q,
+                context=context,
+                prompt=build_morn_campaign_structured_prompt(q, context),
+                renderer=render_morn_campaign_structured_answer,
+            )
+        elif first_part_question:
+            answer = try_structured_campaign_answer(
+                question=q,
+                context=context,
+                prompt=build_first_part_campaign_structured_prompt(q, context),
+                renderer=render_first_part_campaign_structured_answer,
+            )
+
         parsed: Optional[CampaignOut] = None
-        if not is_morn_campaign_question(q):
+        if answer is None and not morn_question and not first_part_question:
             raw = gemini_generate(
                 prompt,
                 response_mime_type="application/json",
@@ -4023,7 +4401,8 @@ POPRAWNY OUTPUT (tylko JSON):
                 except Exception:
                     parsed = None
 
-        answer: Optional[str] = render_campaign_out(parsed) if parsed is not None else None
+        if answer is None:
+            answer = render_campaign_out(parsed) if parsed is not None else None
         if answer is None:
             answer = gemini_generate(
                 build_campaign_text_prompt(q, context),
