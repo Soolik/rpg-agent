@@ -149,6 +149,61 @@ class ChatFlowTest(unittest.TestCase):
         self.assertIn("Analizujesz spojnosci, napiecia i ryzyka kampanii", seen["prompt"])
         self.assertIn("Najwiekszym ryzykiem", response.answer)
 
+    def test_ask_analysis_falls_back_to_text_synthesis_when_json_says_brak_w_notatkach(self):
+        original_vector_search = main.vector_search
+        original_gemini_generate = main.gemini_generate
+        seen = {"calls": []}
+
+        def fake_vector_search(question, top_k):
+            return [
+                {
+                    "chunk_id": 1,
+                    "doc_id": "doc-1",
+                    "doc_type": "gdoc",
+                    "chunk_text": "W porcie narastaja dlugi, przysiegi i walka o dokumenty po zamachu na Morna.",
+                    "distance": 0.82,
+                    "title": "Campaign Bible",
+                    "folder": "01 Bible",
+                    "path_hint": "01 Bible / Campaign Bible",
+                }
+            ]
+
+        def fake_gemini_generate(prompt, **kwargs):
+            seen["calls"].append(prompt)
+            if len(seen["calls"]) == 1:
+                return main.json.dumps(
+                    {
+                        "format": "bullets",
+                        "bullets": ["brak w notatkach"],
+                        "used_context": [1],
+                    },
+                    ensure_ascii=False,
+                )
+            return (
+                "## Co dziala\n"
+                "- Zamach na Morna daje jasny punkt zapalny dla polityki dlugow i dokumentow.\n\n"
+                "## Ryzyka i napiecia\n"
+                "- Eskalacja przemocy i walka o dokumenty wymagaja doprecyzowania, kto realnie kontroluje kolejne ruchy.\n\n"
+                "## Co doprecyzowac\n"
+                "- Warto dopiac zaleznosc miedzy Red Blade, dlugami i bezposrednimi wykonawcami presji."
+            )
+
+        try:
+            main.vector_search = fake_vector_search
+            main.gemini_generate = fake_gemini_generate
+            response = main.ask(
+                main.AskRequest(
+                    question="Sprawdz mi zgodnosc logiczna kampanii Krew Na Gwiazdach.",
+                    include_sources=False,
+                )
+            )
+        finally:
+            main.vector_search = original_vector_search
+            main.gemini_generate = original_gemini_generate
+
+        self.assertEqual(len(seen["calls"]), 2)
+        self.assertIn("## Co dziala", response.answer)
+
     def test_chat_answer_returns_human_text_with_sources(self):
         original_ask = main.ask
         try:

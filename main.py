@@ -2645,28 +2645,29 @@ def has_likely_campaign_hits(hits: List[Dict[str, Any]], threshold: float = 0.88
     return best_distance <= threshold
 
 
-def render_campaign_out(out: CampaignOut) -> str:
-    not_found = "W notatkach kampanii nie znalazlem bezposredniej odpowiedzi na to pytanie."
+CAMPAIGN_NOT_FOUND_MESSAGE = "W notatkach kampanii nie znalazlem bezposredniej odpowiedzi na to pytanie."
 
+
+def render_campaign_out(out: CampaignOut) -> str:
     if out.format == "table" and out.table:
         cols = out.table.get("columns") or []
         rows = out.table.get("rows") or []
         if not cols or not isinstance(cols, list):
-            return not_found
+            return CAMPAIGN_NOT_FOUND_MESSAGE
         header = "| " + " | ".join(str(c) for c in cols) + " |"
         sep = "| " + " | ".join(["---"] * len(cols)) + " |"
         body_lines = []
         for row in rows:
             if isinstance(row, list):
                 body_lines.append("| " + " | ".join(str(item) for item in row) + " |")
-        return "\n".join([header, sep] + body_lines).strip() or not_found
+        return "\n".join([header, sep] + body_lines).strip() or CAMPAIGN_NOT_FOUND_MESSAGE
 
     bullets = [bullet.strip() for bullet in (out.bullets or []) if bullet and bullet.strip()]
     if not bullets:
-        return not_found
+        return CAMPAIGN_NOT_FOUND_MESSAGE
     normalized_bullets = [normalize_match_text(bullet) for bullet in bullets]
     if all("brak w notatkach" in bullet for bullet in normalized_bullets):
-        return not_found
+        return CAMPAIGN_NOT_FOUND_MESSAGE
     if len(bullets) == 1:
         return bullets[0]
     return "\n".join(f"- {bullet}" for bullet in bullets)
@@ -2752,6 +2753,28 @@ PYTANIE:
 {question}
 
 ODPOWIEDZ (tylko JSON):
+""".strip()
+
+
+def build_campaign_analysis_text_prompt(question: str, context: str) -> str:
+    return f"""
+Jestes asystentem MG kampanii "Krew Na Gwiazdach". Na podstawie notatek przygotuj analize po polsku.
+
+ZASADY:
+1) Uzywaj tylko faktow z KONTEKSTU.
+2) Mozesz laczyc fakty z kilku blokow, jesli zwiazek wynika bezposrednio z notatek.
+3) Odpowiedz w 3 sekcjach: "Co dziala", "Ryzyka i napiecia", "Co doprecyzowac".
+4) W kazdym punkcie odwoluj sie do konkretow kampanii: postaci, watkow, lokacji, zdarzen albo dokumentow.
+5) Jesli kontekst jest ograniczony, napisz wprost czego brakuje, zamiast odpowiadac ogolnikami.
+6) Nie dopowiadaj faktow spoza KONTEKSTU.
+
+KONTEKST:
+{context}
+
+PYTANIE:
+{question}
+
+ODPOWIEDZ:
 """.strip()
 
 
@@ -3138,6 +3161,7 @@ def ask(req: AskRequest):
     try:
         q = req.question.strip()
         hits: List[Dict[str, Any]] = []
+        analysis_mode = False
 
         if req.mode in ("campaign", "scene"):
             campaign_mode = True
@@ -3156,7 +3180,8 @@ def ask(req: AskRequest):
         if not hits:
             hits = vector_search(q, req.top_k)
         context = build_campaign_context(hits)
-        prompt_builder = build_campaign_analysis_prompt if is_campaign_analysis_question(q) else build_campaign_prompt
+        analysis_mode = is_campaign_analysis_question(q)
+        prompt_builder = build_campaign_analysis_prompt if analysis_mode else build_campaign_prompt
         prompt = prompt_builder(q, context)
 
         raw = gemini_generate(
@@ -3190,6 +3215,14 @@ POPRAWNY OUTPUT (tylko JSON):
             parsed = CampaignOut.model_validate(obj2)
 
         answer = render_campaign_out(parsed)
+        if analysis_mode and answer == CAMPAIGN_NOT_FOUND_MESSAGE:
+            analysis_answer = gemini_generate(
+                build_campaign_analysis_text_prompt(q, context),
+                temperature=0.2,
+                max_output_tokens=1400,
+            ).strip()
+            if analysis_answer:
+                answer = analysis_answer
 
         sources: List[Dict[str, Any]] = []
         if req.include_sources:
