@@ -136,6 +136,7 @@ class GoogleDriveOAuthService:
             "<html><body>"
             "<h1>Google Drive connected</h1>"
             f"<p>Writes will now use <strong>{subject}</strong>.</p>"
+            '<p><a href="/gm">Return to GM Console</a></p>'
             "<p>You can close this tab.</p>"
             "</body></html>"
         )

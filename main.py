@@ -83,6 +83,7 @@ from app.models_v2 import (
 from app.planner import PlannerService
 from app.request_auth import GCLOUD_CLIENT_ID, GoogleRequestAuth, RequestAuthMiddleware
 from app.routed_drive_store import RoutedDriveStore
+from app.routes_web import build_web_router
 from app.routes_v1 import build_v1_router
 from app.routes_v2 import build_context_for_planner, build_v2_router
 from app.text_normalization import normalize_text_artifacts
@@ -115,9 +116,12 @@ GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
 GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET")
 GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY = os.getenv("GOOGLE_OAUTH_TOKEN_ENCRYPTION_KEY")
 AUTH_ALLOWED_EMAILS = [item.strip() for item in os.getenv("AUTH_ALLOWED_EMAILS", "soolik1990@gmail.com").split(",") if item.strip()]
+_DEFAULT_AUTH_AUDIENCES = ",".join(
+    [item for item in [GCLOUD_CLIENT_ID, GOOGLE_OAUTH_CLIENT_ID or ""] if item]
+)
 AUTH_ALLOWED_GOOGLE_AUDIENCES = [
     item.strip()
-    for item in os.getenv("AUTH_ALLOWED_GOOGLE_AUDIENCES", GCLOUD_CLIENT_ID).split(",")
+    for item in os.getenv("AUTH_ALLOWED_GOOGLE_AUDIENCES", _DEFAULT_AUTH_AUDIENCES).split(",")
     if item.strip()
 ]
 
@@ -128,6 +132,8 @@ app.add_middleware(
         allowed_audiences=AUTH_ALLOWED_GOOGLE_AUDIENCES,
     ),
     public_paths=(
+        "/",
+        "/gm",
         "/health",
         "/v1/health",
         "/v1/auth/google-drive/callback",
@@ -2864,6 +2870,7 @@ conversation_store_v1 = build_conversation_store()
 planner_v2 = PlannerService(generate_text_fn=planner_generate_json)
 consistency_planner_v2 = PlannerService(generate_text_fn=planner_generate_text)
 proposal_applier_v2 = ProposalApplier(drive_store=drive_store_v2, reindex_fn=reindex_after_apply_default)
+app.include_router(build_web_router(google_client_id=GOOGLE_OAUTH_CLIENT_ID))
 app.include_router(
     build_v2_router(
         drive_store=drive_store_v2,
